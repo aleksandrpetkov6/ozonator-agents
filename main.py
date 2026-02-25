@@ -1,3 +1,4 @@
+from db.seed import seed_core_data
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -115,6 +116,22 @@ def admin_tables():
         "status": "ok" if ok else "error",
         "message": message,
         "tables": tables if ok else [],
+    }
+
+    return JSONResponse(status_code=200 if ok else 503, content=payload)
+
+
+@app.post("/admin/seed-core")
+def admin_seed_core():
+    settings = get_settings()
+    ok, details, message = seed_core_data(settings.database_url)
+
+    payload = {
+        "service": "AA",
+        "operation": "seed_core_data",
+        "status": "ok" if ok else "error",
+        "message": message,
+        "details": details if ok else {},
     }
 
     return JSONResponse(status_code=200 if ok else 503, content=payload)
