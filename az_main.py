@@ -381,9 +381,9 @@ def az_run_task(task_id: int):
             settings.database_url,
             task_id=task_id,
             actor_agent="AZ",
-            event_type="task_run_finished",
+            event_type="az_brief_ready",
             level="info",
-            message="AZ завершил обработку задачи",
+            message="AZ подготовил brief (BRIEF_READY)",
             meta={
                 "mode": "az_fix_plan_v1",
                 "task_id": task_id,
