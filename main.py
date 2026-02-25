@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 from app.config import get_settings
 from db.health import check_postgres, check_redis
 from db.init_schema import init_schema
+from db.inspect import list_public_tables
 
 app = FastAPI(title="Ozonator Agents AA")
 
@@ -98,6 +99,22 @@ def admin_init_db():
         "operation": "init_db_schema",
         "status": "ok" if ok else "error",
         "message": message,
+    }
+
+    return JSONResponse(status_code=200 if ok else 503, content=payload)
+
+
+@app.get("/admin/tables")
+def admin_tables():
+    settings = get_settings()
+    ok, tables, message = list_public_tables(settings.database_url)
+
+    payload = {
+        "service": "AA",
+        "operation": "list_public_tables",
+        "status": "ok" if ok else "error",
+        "message": message,
+        "tables": tables if ok else [],
     }
 
     return JSONResponse(status_code=200 if ok else 503, content=payload)
