@@ -259,3 +259,53 @@ def write_orchestration_log(
 
     except Exception as e:
         return False, f"Ошибка записи лога: {e.__class__.__name__}"
+
+
+def get_task_logs(
+    database_url: str | None,
+    task_id: int,
+) -> tuple[bool, list[dict[str, Any]] | None, str]:
+    if not database_url:
+        return False, None, "DATABASE_URL не задан"
+
+    try:
+        with psycopg.connect(database_url, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        task_id,
+                        actor_agent,
+                        event_type,
+                        level,
+                        message,
+                        meta,
+                        created_at
+                    FROM orchestration_logs
+                    WHERE task_id = %s
+                    ORDER BY id ASC;
+                    """,
+                    (task_id,),
+                )
+                rows = cur.fetchall()
+
+        logs = []
+        for row in rows:
+            logs.append(
+                {
+                    "id": row[0],
+                    "task_id": row[1],
+                    "actor_agent": row[2],
+                    "event_type": row[3],
+                    "level": row[4],
+                    "message": row[5],
+                    "meta": row[6] if row[6] is not None else {},
+                    "created_at": row[7].isoformat() if row[7] else None,
+                }
+            )
+
+        return True, logs, "OK"
+
+    except Exception as e:
+        return False, None, f"Ошибка чтения логов: {e.__class__.__name__}"
