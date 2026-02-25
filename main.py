@@ -3,6 +3,7 @@ from db.tasks import (
     get_task_record,
     update_task_status,
     write_orchestration_log,
+    get_task_logs,
 )
 from db.tasks import create_task_record
 from schemas.tasks import TaskCreateRequest
@@ -314,5 +315,81 @@ def aa_run_task(task_id: int):
             "message": "Задача обработана",
             "task": task,
             "execution_result": execution_result,
+        },
+    )
+
+
+@app.get("/tasks/{task_id}")
+def get_task(task_id: int):
+    settings = get_settings()
+    ok, task, message = get_task_record(settings.database_url, task_id)
+
+    if not ok:
+        return JSONResponse(
+            status_code=404 if message == "Задача не найдена" else 503,
+            content={
+                "service": "AA",
+                "operation": "get_task",
+                "status": "error",
+                "message": message,
+                "task": None,
+            },
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "service": "AA",
+            "operation": "get_task",
+            "status": "ok",
+            "message": "OK",
+            "task": task,
+        },
+    )
+
+
+@app.get("/tasks/{task_id}/logs")
+def get_task_logs_endpoint(task_id: int):
+    settings = get_settings()
+
+    # сначала убедимся, что задача существует
+    ok, task, message = get_task_record(settings.database_url, task_id)
+    if not ok:
+        return JSONResponse(
+            status_code=404 if message == "Задача не найдена" else 503,
+            content={
+                "service": "AA",
+                "operation": "get_task_logs",
+                "status": "error",
+                "message": message,
+                "task_id": task_id,
+                "logs": None,
+            },
+        )
+
+    ok, logs, message = get_task_logs(settings.database_url, task_id)
+    if not ok:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "service": "AA",
+                "operation": "get_task_logs",
+                "status": "error",
+                "message": message,
+                "task_id": task_id,
+                "logs": None,
+            },
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "service": "AA",
+            "operation": "get_task_logs",
+            "status": "ok",
+            "message": "OK",
+            "task_id": task_id,
+            "count": len(logs),
+            "logs": logs,
         },
     )
