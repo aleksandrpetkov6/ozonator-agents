@@ -329,6 +329,8 @@ def az_run_task(task_id: int):
             "az_status": "brief_ready",
             "az_completed_at": _now_iso(),
             "next_action": "az_fix_plan_ready",
+            "handoff_ready": True,
+            "next_agent": "AS",
         }
 
         write_orchestration_log(
@@ -381,17 +383,13 @@ def az_run_task(task_id: int):
             settings.database_url,
             task_id=task_id,
             actor_agent="AZ",
-            event_type="az_brief_ready",
+            event_type="task_run_finished",
             level="info",
-            message="AZ подготовил brief (BRIEF_READY)",
+            message="AZ завершил обработку задачи",
             meta={
                 "mode": "az_fix_plan_v1",
                 "task_id": task_id,
                 "next_action": "az_fix_plan_ready",
-                "from_status": "in_progress",
-                "to_status": "BRIEF_READY",
-                "az_status": "brief_ready",
-                "next_agent": "AS",
             },
         )
 
