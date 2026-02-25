@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from db.health import check_postgres, check_redis
+from db.init_schema import init_schema
 
 app = FastAPI(title="Ozonator Agents AA")
 
@@ -85,3 +86,18 @@ def health_all():
     }
 
     return JSONResponse(status_code=200 if all_ok else 503, content=payload)
+
+
+@app.post("/admin/init-db")
+def admin_init_db():
+    settings = get_settings()
+    ok, message = init_schema(settings.database_url)
+
+    payload = {
+        "service": "AA",
+        "operation": "init_db_schema",
+        "status": "ok" if ok else "error",
+        "message": message,
+    }
+
+    return JSONResponse(status_code=200 if ok else 503, content=payload)
