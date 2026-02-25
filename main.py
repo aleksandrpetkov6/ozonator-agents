@@ -5,7 +5,11 @@ from fastapi.responses import JSONResponse
 from app.config import get_settings
 from db.health import check_postgres, check_redis
 from db.init_schema import init_schema
-from db.inspect import list_public_tables, list_agent_instructions
+from db.inspect import (
+    list_public_tables,
+    list_agent_instructions,
+    list_communication_rules,
+)
 
 app = FastAPI(title="Ozonator Agents AA")
 
@@ -145,6 +149,22 @@ def admin_agent_instructions():
     payload = {
         "service": "AA",
         "operation": "list_agent_instructions",
+        "status": "ok" if ok else "error",
+        "message": message,
+        "items": items if ok else [],
+    }
+
+    return JSONResponse(status_code=200 if ok else 503, content=payload)
+
+
+@app.get("/admin/communication-rules")
+def admin_communication_rules():
+    settings = get_settings()
+    ok, items, message = list_communication_rules(settings.database_url)
+
+    payload = {
+        "service": "AA",
+        "operation": "list_communication_rules",
         "status": "ok" if ok else "error",
         "message": message,
         "items": items if ok else [],
