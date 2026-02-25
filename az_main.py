@@ -388,6 +388,10 @@ def az_run_task(task_id: int):
                 "mode": "az_fix_plan_v1",
                 "task_id": task_id,
                 "next_action": "az_fix_plan_ready",
+                "from_status": "in_progress",
+                "to_status": "BRIEF_READY",
+                "az_status": "brief_ready",
+                "next_agent": "AS",
             },
         )
 
