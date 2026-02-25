@@ -360,7 +360,24 @@ else:
         "mode": "stub",
         "note": "Дальше здесь будет реальная логика маршрутизации и выполнения",
     }
-
+# Сохраняем execution_result в tasks.result
+ok_set, task, message_set = set_task_result(
+    settings.database_url,
+    task_id=task_id,
+    result=execution_result,
+    error_message=None,
+)
+if not ok_set:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "service": "AA",
+            "operation": "aa_run_task",
+            "status": "error",
+            "message": message_set,
+            "task": None,
+        },
+    )
     # Статус -> done
     ok, task, message = update_task_status(settings.database_url, task_id, "done")
     if not ok:
