@@ -334,32 +334,32 @@ def aa_run_task(task_id: int):
             },
         )
 
-    # MVP: для боевой задачи формируем brief для АЗ, для остальных пока оставляем stub
-payload = task.get("payload") or {}
+        # MVP: для боевой задачи формируем brief для АЗ, для остальных пока оставляем stub
+    payload = task.get("payload") or {}
 
-if task.get("task_type") == "ozonator_inventory_locations_fix":
-    execution_result = _build_az_brief_for_inventory_locations_fix(task_id, payload)
+    if task.get("task_type") == "ozonator_inventory_locations_fix":
+        execution_result = _build_az_brief_for_inventory_locations_fix(task_id, payload)
 
-    write_orchestration_log(
-        settings.database_url,
-        task_id=task_id,
-        actor_agent="AA",
-        event_type="task_routed_to_az",
-        level="info",
-        message="AA сформировал brief и маршрутизировал задачу в AZ",
-        meta={
-            "mode": "az_brief_v1",
-            "task_type": "ozonator_inventory_locations_fix",
-            "screen": execution_result.get("az_brief", {}).get("screen"),
-            "target_columns": execution_result.get("az_brief", {}).get("target_columns", []),
-        },
-    )
-else:
-    execution_result = {
-        "routed_to": task["target_agent"],
-        "mode": "stub",
-        "note": "Дальше здесь будет реальная логика маршрутизации и выполнения",
-    }
+        write_orchestration_log(
+            settings.database_url,
+            task_id=task_id,
+            actor_agent="AA",
+            event_type="task_routed_to_az",
+            level="info",
+            message="AA сформировал brief и маршрутизировал задачу в AZ",
+            meta={
+                "mode": "az_brief_v1",
+                "task_type": "ozonator_inventory_locations_fix",
+                "screen": execution_result.get("az_brief", {}).get("screen"),
+                "target_columns": execution_result.get("az_brief", {}).get("target_columns", []),
+            },
+        )
+    else:
+        execution_result = {
+            "routed_to": task["target_agent"],
+            "mode": "stub",
+            "note": "Дальше здесь будет реальная логика маршрутизации и выполнения",
+        }
 # Сохраняем execution_result в tasks.result
 ok_set, task, message_set = set_task_result(
     settings.database_url,
