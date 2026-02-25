@@ -2,10 +2,10 @@ from db.tasks import (
     create_task_record,
     get_task_record,
     update_task_status,
+    set_task_result,
     write_orchestration_log,
     get_task_logs,
 )
-from db.tasks import create_task_record
 from schemas.tasks import TaskCreateRequest
 import os
 from typing import Annotated
@@ -228,7 +228,67 @@ def tasks_create(body: TaskCreateRequest):
         },
     )
 
+def _build_az_brief_for_inventory_locations_fix(task_id: int, payload: dict | None) -> dict:
+    """
+    Формирует brief для АЗ по боевой задаче:
+    вкладка 'Остатки' -> корректный вывод колонок 'Склад' и 'Зона размещения'.
+    """
+    payload = payload or {}
 
+    screen = payload.get("screen") or "Остатки"
+    title = payload.get("title") or "Вывод склада и зоны размещения на вкладке Остатки"
+    user_request = str(payload.get("user_request") or "").strip()
+
+    target_columns = payload.get("target_columns") or ["Склад", "Зона размещения"]
+    acceptance_criteria = payload.get("acceptance_criteria") or []
+    notes_for_az = payload.get("notes_for_az") or []
+
+    # Нормализуем в списки строк (на случай если в payload пришло что-то кривое)
+    if not isinstance(target_columns, list):
+        target_columns = [str(target_columns)]
+    target_columns = [str(x) for x in target_columns]
+
+    if not isinstance(acceptance_criteria, list):
+        acceptance_criteria = [str(acceptance_criteria)]
+    acceptance_criteria = [str(x) for x in acceptance_criteria]
+
+    if not isinstance(notes_for_az, list):
+        notes_for_az = [str(notes_for_az)]
+    notes_for_az = [str(x) for x in notes_for_az]
+
+    az_brief = {
+        "brief_version": "v1",
+        "task_id": task_id,
+        "task_type": "ozonator_inventory_locations_fix",
+        "screen": screen,
+        "title": title,
+        "problem_summary": user_request,
+        "target_columns": target_columns,
+        "acceptance_criteria": acceptance_criteria,
+        "notes_for_az": notes_for_az,
+        "expected_output_from_az": {
+            "must_define": [
+                "Источник данных для поля 'Зона размещения' в текущем коде",
+                "Источник данных для поля 'Склад' в текущем коде",
+                "Место в коде, где формируются строки вкладки 'Остатки'",
+                "Логика группировки строк, если у товара несколько зон размещения"
+            ],
+            "must_return": [
+                "Короткий технический план исправления",
+                "Список файлов/модулей, которые нужно менять",
+                "Риски и что проверить после правки"
+            ]
+        }
+    }
+
+    return {
+        "routed_to": "AZ",
+        "mode": "az_brief_v1",
+        "task_type": "ozonator_inventory_locations_fix",
+        "task_id": task_id,
+        "az_brief": az_brief,
+        "next_action": "az_prepare_fix_plan"
+    }
 @app.post("/aa/run-task/{task_id}")
 def aa_run_task(task_id: int):
     settings = get_settings()
