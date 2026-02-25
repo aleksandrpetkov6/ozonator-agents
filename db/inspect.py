@@ -56,3 +56,38 @@ def list_agent_instructions(database_url: str | None) -> tuple[bool, list[dict] 
         return True, items, "OK"
     except Exception as e:
         return False, None, f"Ошибка чтения agent_instructions: {e.__class__.__name__}"
+
+
+def list_communication_rules(database_url: str | None) -> tuple[bool, list[dict] | None, str]:
+    if not database_url:
+        return False, None, "DATABASE_URL не задан"
+
+    sql = """
+    SELECT id, rule_key, rule_text, scope, is_active, created_at, updated_at
+    FROM communication_rules
+    ORDER BY rule_key;
+    """
+
+    try:
+        with psycopg.connect(database_url, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+
+        items = []
+        for row in rows:
+            items.append(
+                {
+                    "id": row[0],
+                    "rule_key": row[1],
+                    "rule_text": row[2],
+                    "scope": row[3],
+                    "is_active": row[4],
+                    "created_at": row[5].isoformat() if row[5] else None,
+                    "updated_at": row[6].isoformat() if row[6] else None,
+                }
+            )
+
+        return True, items, "OK"
+    except Exception as e:
+        return False, None, f"Ошибка чтения communication_rules: {e.__class__.__name__}"
