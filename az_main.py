@@ -326,7 +326,7 @@ def az_run_task(task_id: int):
             **prev_result,
             "az_executor": "AZ",
             "az_fix_plan": az_fix_plan,
-            "az_status": "done",
+            "az_status": "brief_ready",
             "az_completed_at": _now_iso(),
             "next_action": "az_fix_plan_ready",
         }
