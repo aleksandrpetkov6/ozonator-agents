@@ -1,3 +1,5 @@
+from db.tasks import create_task_record
+from schemas.tasks import TaskCreateRequest
 import os
 from typing import Annotated
 
@@ -189,3 +191,32 @@ def admin_communication_rules():
         "items": items if ok else [],
     }
     return JSONResponse(status_code=200 if ok else 503, content=payload)
+
+
+@app.post("/tasks/create")
+def tasks_create(body: TaskCreateRequest):
+    settings = get_settings()
+    ok, task, message = create_task_record(settings.database_url, body.model_dump())
+
+    if not ok and message == "external_task_id уже существует":
+        return JSONResponse(
+            status_code=409,
+            content={
+                "service": "AA",
+                "operation": "create_task",
+                "status": "error",
+                "message": message,
+                "task": None,
+            },
+        )
+
+    return JSONResponse(
+        status_code=200 if ok else 503,
+        content={
+            "service": "AA",
+            "operation": "create_task",
+            "status": "ok" if ok else "error",
+            "message": message,
+            "task": task if ok else None,
+        },
+    )
