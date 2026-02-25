@@ -364,7 +364,7 @@ def az_run_task(task_id: int):
                 },
             )
 
-        ok, task, message = update_task_status(settings.database_url, task_id, "done")
+        ok, task, message = update_task_status(settings.database_url, task_id, "BRIEF_READY")
         if not ok:
             return JSONResponse(
                 status_code=503,
