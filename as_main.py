@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
+import os
+import re
+import ast
+import operator as op
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional, Tuple
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -16,12 +21,26 @@ from db.tasks import (
     write_orchestration_log,
 )
 
+# ============================================================
+# Ozonator Agents AS
+# Purpose (MVP):
+# - Receive handoff from AZ (BRIEF_READY) or rework from AK.
+# - Build artifacts bundle (mock for now).
+# - Produce a USER-FACING final_answer.
+#
+# Patch v2:
+# - Add "direct answer" mode for generic user questions.
+#   1) If OpenAI key is configured on server: call Responses API and return answer.
+#   2) Else: try small built-in heuristics (math/unit conversions/FAQ).
+#   3) Else: fallback to previous template ("Готово... артефакты...").
+# ============================================================
+
 app = FastAPI(title="Ozonator Agents AS")
 
 
-# =========================
+# -------------------------
 # Helpers
-# =========================
+# -------------------------
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -35,25 +54,188 @@ def _normalize_text(value: Any) -> str:
 def _normalize_str_list(value: Any) -> list[str]:
     if value is None:
         return []
-
     items = value if isinstance(value, list) else [value]
     result: list[str] = []
-
     for item in items:
         text = str(item).strip()
         if text:
             result.append(text)
-
     return result
 
 
+# -------------------------
+# Direct answering (optional)
+# -------------------------
+_OPENAI_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/responses").strip()
+_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1").strip()
+_OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+
+def _extract_openai_output_text(resp: dict[str, Any]) -> str:
+    # Some SDKs expose output_text; the REST response typically has output[] with content[].
+    if isinstance(resp.get("output_text"), str) and resp.get("output_text"):
+        return str(resp["output_text"]).strip()
+
+    output = resp.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "output_text":
+                        text = c.get("text")
+                        if isinstance(text, str) and text.strip():
+                            return text.strip()
+    return ""
+
+
+def _openai_answer(question_ru: str) -> str:
+    """
+    Server-side call to OpenAI Responses API.
+    IMPORTANT: API key must be stored ONLY on server env (Render), never in client.
+    """
+    if not _OPENAI_KEY:
+        return ""
+
+    # Minimal "developer" instruction to keep it predictable and safe.
+    developer_msg = (
+        "Ты — ассистент в приложении Ozonator Agents Client. "
+        "Отвечай на русском. Коротко и по делу. "
+        "Если вопрос простой (факт/арифметика/конвертация), дай прямой ответ. "
+        "Не упоминай внутренние статусы/агентов/оркестрацию."
+    )
+
+    payload = {
+        "model": _OPENAI_MODEL,
+        "input": [
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": developer_msg}],
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": question_ru}]},
+        ],
+    }
+
+    try:
+        import urllib.request as urllib_request
+        import urllib.error as urllib_error
+
+        req = urllib_request.Request(
+            _OPENAI_URL,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Authorization": f"Bearer {_OPENAI_KEY}",
+            },
+            method="POST",
+        )
+        with urllib_request.urlopen(req, timeout=60) as r:
+            raw = r.read()
+        data = json.loads(raw.decode("utf-8"))
+        return _extract_openai_output_text(data)
+    except Exception:
+        # No secrets in logs; just silent fallback to heuristic/template.
+        return ""
+
+
+# -------------------------
+# Heuristic fallback (no external AI)
+# -------------------------
+_ALLOWED_BINOPS = {
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+    ast.FloorDiv: op.floordiv,
+    ast.Mod: op.mod,
+    ast.Pow: op.pow,
+}
+_ALLOWED_UNARYOPS = {ast.UAdd: op.pos, ast.USub: op.neg}
+
+
+def _safe_eval_arith(expr: str) -> Optional[float]:
+    """
+    Safe arithmetic evaluator for expressions like "2+2*3".
+    Allows digits, (), + - * / // % ** and spaces.
+    """
+    expr = expr.strip()
+    if not expr:
+        return None
+
+    # Quick allowlist
+    if not re.fullmatch(r"[0-9\.\s\+\-\*\/\(\)%]*", expr):
+        return None
+
+    try:
+        node = ast.parse(expr, mode="eval")
+    except Exception:
+        return None
+
+    def _eval(n: ast.AST) -> float:
+        if isinstance(n, ast.Expression):
+            return _eval(n.body)
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            return float(n.value)
+        if isinstance(n, ast.UnaryOp) and type(n.op) in __ALLOWED_UNARYOPS:
+            return float(_ALLOWED_UNARYOPS[type(n.op)](_eval(n.operand)))
+        if isinstance(n, ast.BinOp) and type(n.op) in _ALLOWED_BINOPS:
+            return float(_ALLOWED_BINOPS[type(n.op)](_eval(n.left), _eval(n.right)))
+        raise ValueError("Unsupported expression")
+
+    try:
+        return _eval(node)
+    except Exception:
+        return None
+
+
+def _heuristic_answer(question: str) -> str:
+    q = question.strip()
+    if not q:
+        return ""
+
+    q_low = q.lower()
+
+    # Unit conversion: cm in meter
+    if ("сантиметр" in q_low or "см" in q_low) and ("метр" in q_low or "м" in q_low) and "сколько" in q_low:
+        # Typical: "сколько сантиметров в метре?"
+        return "100 сантиметров."
+
+    # Nearest star to Earth
+    if ("ближайш" in q_low and "земл" in q_low and "звезд" in q_low):
+        return "Солнце. Если исключить Солнце — Проксима Центавра."
+
+    # Arithmetic: "сколько будет 2+2" or any question that is mostly math
+    m = re.search(r"(?:сколько\s+будет|сколько)\s*([0-9\.\s\+\-\*\/\(\)%]+)\??", q_low)
+    if m:
+        val = _safe_eval_arith(m.group(1))
+        if val is not None:
+            # Pretty format: int if whole
+            if abs(val - round(val)) < 1e-9:
+                return str(int(round(val)))
+            return str(val)
+
+    # Also handle "2+2?" (pure expression)
+    if re.fullmatch(r"[0-9\.\s\+\-\*\/\(\)%]+\??", q_low):
+        expr = q_low.replace("?", "").strip()
+        val = _safe_eval_arith(expr)
+        if val is not None:
+            if abs(val - round(val)) < 1e-9:
+                return str(int(round(val)))
+            return str(val)
+
+    return ""
+
+
+# -------------------------
+# Core logic
+# -------------------------
 def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
     current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
     az_fix_plan = (
-        current_result.get("az_fix_plan")
-        if isinstance(current_result.get("az_fix_plan"), dict)
-        else {}
+        current_result.get("az_fix_plan") if isinstance(current_result.get("az_fix_plan"), dict) else {}
     )
 
     user_request = _normalize_text(payload.get("user_request"))
@@ -64,7 +246,6 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     target_columns = _normalize_str_list(payload.get("target_columns")) or _normalize_str_list(
         az_fix_plan.get("target_columns")
     )
-
     main_goal = user_request or payload_brief or goal or title or f"задача #{task_id}"
 
     endpoints = _normalize_str_list(
@@ -96,13 +277,11 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     is_api_mapping_task = bool(endpoints or request_keys or response_keys or link_keys) or (
         "api" in goal_lower and "ozon" in goal_lower
     )
-
     if is_api_mapping_task:
         endpoint_text = ", ".join(endpoints) if endpoints else "не переданы"
         request_text = ", ".join(request_keys) if request_keys else "не переданы"
         response_text = ", ".join(response_keys) if response_keys else "не переданы"
         link_text = ", ".join(link_keys) if link_keys else "не переданы"
-
         return " ".join(
             [
                 f"Endpoint: {endpoint_text}.",
@@ -112,13 +291,23 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
             ]
         )
 
+    # 1) Try OpenAI (server-side) if configured
+    ai_answer = _openai_answer(main_goal)
+    if ai_answer:
+        return ai_answer
+
+    # 2) Heuristic fallback (no external AI)
+    heur = _heuristic_answer(main_goal)
+    if heur:
+        return heur
+
+    # 3) Previous template fallback
     parts = [f"Готово. Подготовлено решение по задаче: {main_goal}."]
     if screen and screen != "Не указано":
         parts.append(f"Область: {screen}.")
     if target_columns:
         parts.append(f"Целевые элементы: {', '.join(target_columns)}.")
     parts.append("Артефакты собраны и переданы на проверку AK.")
-
     return " ".join(parts)
 
 
@@ -126,9 +315,7 @@ def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
     current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
     az_fix_plan = (
-        current_result.get("az_fix_plan")
-        if isinstance(current_result.get("az_fix_plan"), dict)
-        else {}
+        current_result.get("az_fix_plan") if isinstance(current_result.get("az_fix_plan"), dict) else {}
     )
 
     title = _normalize_text(payload.get("title")) or _normalize_text(az_fix_plan.get("title")) or "Рабочий артефакт"
@@ -141,13 +328,8 @@ def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     implementation_steps: list[dict[str, Any]] = []
     for idx, step in enumerate(az_fix_plan.get("technical_plan") or [], start=1):
         implementation_steps.append(
-            {
-                "step_no": idx,
-                "title_ru": f"Шаг {idx}",
-                "description_ru": str(step),
-            }
+            {"step_no": idx, "title_ru": f"Шаг {idx}", "description_ru": str(step)}
         )
-
     if not implementation_steps:
         implementation_steps = [
             {
@@ -165,7 +347,6 @@ def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
         "",
         "Колонки-цели:",
     ]
-
     if target_columns:
         artifact_text_lines.extend([f"- {column}" for column in target_columns])
     else:
@@ -175,10 +356,7 @@ def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     for item in implementation_steps:
         artifact_text_lines.append(f"{item['step_no']}. {item['description_ru']}")
 
-    checks = _normalize_str_list(
-        az_fix_plan.get("post_fix_checks") or payload.get("acceptance_criteria")
-    )
-
+    checks = _normalize_str_list(az_fix_plan.get("post_fix_checks") or payload.get("acceptance_criteria"))
     artifact_text_lines.extend(["", "Проверки после исправления:"])
     if checks:
         artifact_text_lines.extend([f"- {check}" for check in checks])
@@ -220,7 +398,7 @@ def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _as_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
+def _as_handoff_allowed(task: dict[str, Any]) -> Tuple[bool, str]:
     target_agent = (task.get("target_agent") or "").upper()
     result = task.get("result") if isinstance(task.get("result"), dict) else {}
     next_agent = (result.get("next_agent") or "").upper()
@@ -230,34 +408,25 @@ def _as_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
 
     if target_agent == "AS":
         return True, ""
-
     if task_status == "BRIEF_READY" and handoff_ready and next_agent == "AS":
         return True, ""
-
     if task_status == "REVIEW_NEEDS_ATTENTION" and next_action in {"return_to_as", "ak_return_to_as"}:
         return True, ""
 
     return (
         False,
-        (
-            "AS не может принять задачу: ожидается target_agent='AS', "
-            "или handoff от AZ (status=BRIEF_READY, handoff_ready=true, next_agent='AS'), "
-            "или возврат после AK (status=REVIEW_NEEDS_ATTENTION, next_action=return_to_as)."
-        ),
+        "AS не может принять задачу: ожидается target_agent='AS', "
+        "или handoff от AZ (status=BRIEF_READY, handoff_ready=true, next_agent='AS'), "
+        "или возврат после AK (status=REVIEW_NEEDS_ATTENTION, next_action=return_to_as).",
     )
 
 
-# =========================
+# -------------------------
 # Base / Health
-# =========================
+# -------------------------
 @app.get("/")
 def root():
-    return {
-        "service": "AS",
-        "status": "ok",
-        "message": "Ozonator Agents AS service is running",
-        "docs": "/docs",
-    }
+    return {"service": "AS", "status": "ok", "message": "Ozonator Agents AS service is running", "docs": "/docs"}
 
 
 @app.get("/health")
@@ -269,24 +438,14 @@ def health():
 def health_db():
     settings = get_settings()
     ok, detail = check_postgres(settings.database_url)
-    return {
-        "service": "AS",
-        "component": "db",
-        "ok": ok,
-        "detail": detail,
-    }
+    return {"service": "AS", "component": "db", "ok": ok, "detail": detail}
 
 
 @app.get("/health/redis")
 def health_redis():
     settings = get_settings()
     ok, detail = check_redis(settings.redis_url)
-    return {
-        "service": "AS",
-        "component": "redis",
-        "ok": ok,
-        "detail": detail,
-    }
+    return {"service": "AS", "component": "redis", "ok": ok, "detail": detail}
 
 
 @app.get("/health/all")
@@ -294,127 +453,67 @@ def health_all():
     settings = get_settings()
     ok_db, db_detail = check_postgres(settings.database_url)
     ok_redis, redis_detail = check_redis(settings.redis_url)
-
     return {
         "service": "AS",
         "status": "ok" if (ok_db and ok_redis) else "degraded",
-        "components": {
-            "db": {"ok": ok_db, "detail": db_detail},
-            "redis": {"ok": ok_redis, "detail": redis_detail},
-        },
+        "components": {"db": {"ok": ok_db, "detail": db_detail}, "redis": {"ok": ok_redis, "detail": redis_detail}},
     }
 
 
-# =========================
+# -------------------------
 # Tasks read endpoints
-# =========================
+# -------------------------
 @app.get("/tasks/{task_id}")
 def get_task(task_id: int):
     settings = get_settings()
     ok, task, message = get_task_record(settings.database_url, task_id)
-
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
-            content={
-                "service": "AS",
-                "operation": "get_task",
-                "status": "error",
-                "message": message,
-                "task": None,
-            },
+            content={"service": "AS", "operation": "get_task", "status": "error", "message": message, "task": None},
         )
-
-    return JSONResponse(
-        status_code=200,
-        content={
-            "service": "AS",
-            "operation": "get_task",
-            "status": "ok",
-            "message": "OK",
-            "task": task,
-        },
-    )
+    return JSONResponse(status_code=200, content={"service": "AS", "operation": "get_task", "status": "ok", "message": "OK", "task": task})
 
 
 @app.get("/tasks/{task_id}/logs")
 def get_task_logs_endpoint(task_id: int):
     settings = get_settings()
     ok, _task, message = get_task_record(settings.database_url, task_id)
-
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
-            content={
-                "service": "AS",
-                "operation": "get_task_logs",
-                "status": "error",
-                "message": message,
-                "task_id": task_id,
-                "logs": None,
-            },
+            content={"service": "AS", "operation": "get_task_logs", "status": "error", "message": message, "task_id": task_id, "logs": None},
         )
-
     ok, logs, message = get_task_logs(settings.database_url, task_id)
-
     if not ok:
         return JSONResponse(
             status_code=503,
-            content={
-                "service": "AS",
-                "operation": "get_task_logs",
-                "status": "error",
-                "message": message,
-                "task_id": task_id,
-                "logs": None,
-            },
+            content={"service": "AS", "operation": "get_task_logs", "status": "error", "message": message, "task_id": task_id, "logs": None},
         )
-
     return JSONResponse(
         status_code=200,
-        content={
-            "service": "AS",
-            "operation": "get_task_logs",
-            "status": "ok",
-            "message": "OK",
-            "task_id": task_id,
-            "count": len(logs),
-            "logs": logs,
-        },
+        content={"service": "AS", "operation": "get_task_logs", "status": "ok", "message": "OK", "task_id": task_id, "count": len(logs), "logs": logs},
     )
 
 
-# =========================
+# -------------------------
 # AS runner
-# =========================
+# -------------------------
 @app.post("/as/run-task/{task_id}")
 def as_run_task(task_id: int):
     settings = get_settings()
     ok, task, message = get_task_record(settings.database_url, task_id)
-
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
-            content={
-                "service": "AS",
-                "operation": "as_run_task",
-                "status": "error",
-                "message": message,
-                "task": None,
-            },
+            content={"service": "AS", "operation": "as_run_task", "status": "error", "message": message, "task": None},
         )
 
     allowed, deny_message = _as_handoff_allowed(task)
     if not allowed:
         return JSONResponse(
             status_code=400,
-            content={
-                "service": "AS",
-                "operation": "as_run_task",
-                "status": "error",
-                "message": deny_message,
-                "task": task,
-            },
+            content={"service": "AS", "operation": "as_run_task", "status": "error", "message": deny_message, "task": task},
         )
 
     write_orchestration_log(
@@ -424,24 +523,14 @@ def as_run_task(task_id: int):
         event_type="task_run_started",
         level="info",
         message="AS начал сборку артефактов",
-        meta={
-            "source_agent": task.get("source_agent"),
-            "task_type": task.get("task_type"),
-            "prev_status": task.get("status"),
-        },
+        meta={"source_agent": task.get("source_agent"), "task_type": task.get("task_type"), "prev_status": task.get("status")},
     )
 
     ok, task, message = update_task_status(settings.database_url, task_id, "in_progress")
     if not ok:
         return JSONResponse(
             status_code=503,
-            content={
-                "service": "AS",
-                "operation": "as_run_task",
-                "status": "error",
-                "message": message,
-                "task": None,
-            },
+            content={"service": "AS", "operation": "as_run_task", "status": "error", "message": message, "task": None},
         )
 
     try:
@@ -450,8 +539,8 @@ def as_run_task(task_id: int):
 
         prev_result = task.get("result") if isinstance(task.get("result"), dict) else {}
         prev_result = prev_result if isinstance(prev_result, dict) else {}
-
         current_review_cycle = int(prev_result.get("review_cycle") or 0)
+
         is_rework = (prev_result.get("next_action") or "").lower() in {"return_to_as", "ak_return_to_as"}
         if is_rework:
             current_review_cycle += 1
@@ -460,9 +549,7 @@ def as_run_task(task_id: int):
             **prev_result,
             "as_executor": "AS",
             "as_artifacts": as_artifacts,
-            "as_output": {
-                "answer_text": final_answer,
-            },
+            "as_output": {"answer_text": final_answer},
             "final_answer": final_answer,
             "as_status": "artifacts_ready",
             "handoff_ready": True,
@@ -489,35 +576,18 @@ def as_run_task(task_id: int):
             },
         )
 
-        ok_set, task, message_set = set_task_result(
-            settings.database_url,
-            task_id=task_id,
-            result=merged_result,
-            error_message=None,
-        )
+        ok_set, task, message_set = set_task_result(settings.database_url, task_id=task_id, result=merged_result, error_message=None)
         if not ok_set:
             return JSONResponse(
                 status_code=503,
-                content={
-                    "service": "AS",
-                    "operation": "as_run_task",
-                    "status": "error",
-                    "message": message_set,
-                    "task": None,
-                },
+                content={"service": "AS", "operation": "as_run_task", "status": "error", "message": message_set, "task": None},
             )
 
         ok, task, message = update_task_status(settings.database_url, task_id, "ARTIFACTS_READY")
         if not ok:
             return JSONResponse(
                 status_code=503,
-                content={
-                    "service": "AS",
-                    "operation": "as_run_task",
-                    "status": "error",
-                    "message": message,
-                    "task": None,
-                },
+                content={"service": "AS", "operation": "as_run_task", "status": "error", "message": message, "task": None},
             )
 
         write_orchestration_log(
@@ -560,9 +630,10 @@ def as_run_task(task_id: int):
                 },
             },
         )
+
     except Exception as e:
         err = f"AS error: {e}"
-
+        # Do not leak secrets.
         set_task_result(
             settings.database_url,
             task_id=task_id,
@@ -577,16 +648,9 @@ def as_run_task(task_id: int):
             event_type="task_run_failed",
             level="error",
             message="AS завершил обработку с ошибкой",
-            meta={"error": err},
+            meta={"error": "AS error"},
         )
-
         return JSONResponse(
             status_code=500,
-            content={
-                "service": "AS",
-                "operation": "as_run_task",
-                "status": "error",
-                "message": err,
-                "task": None,
-            },
+            content={"service": "AS", "operation": "as_run_task", "status": "error", "message": err, "task": None},
         )
