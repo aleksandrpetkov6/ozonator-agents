@@ -106,15 +106,26 @@ def _az_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
     target_agent = (task.get("target_agent") or "").upper()
     task_status = (task.get("status") or "").upper()
 
+    result = task.get("result") or {}
+    result = result if isinstance(result, dict) else {}
+
+    handoff_ready = bool(result.get("handoff_ready"))
+    next_agent = (result.get("next_agent") or "").upper()
+
     if target_agent == "AZ":
         return True, ""
 
     if task_status in {"NEW", "IN_PROGRESS"}:
         return True, ""
 
+    if task_status == "AA_ROUTED" and handoff_ready and next_agent == "AZ":
+        return True, ""
+
     return (
         False,
-        "AZ не может принять задачу: ожидается target_agent='AZ' или статус NEW/IN_PROGRESS.",
+        "AZ не может принять задачу: ожидается target_agent='AZ', "
+        "или статус NEW/IN_PROGRESS, "
+        "или handoff от AA со статусом AA_ROUTED и next_agent='AZ'.",
     )
 
 
