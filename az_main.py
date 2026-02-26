@@ -31,10 +31,14 @@ def _build_az_brief(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     current_result = task.get("result") or {}
     current_result = current_result if isinstance(current_result, dict) else {}
 
-    title = str(payload.get("title") or "Рабочая задача")
+    brief = str(payload.get("brief") or "").strip()
+    raw_title = str(payload.get("title") or "").strip()
+    title = raw_title or brief or "Рабочая задача"
     screen = str(payload.get("screen") or "Не указано")
     task_type = str(task.get("task_type") or "unknown")
+
     user_request = str(payload.get("user_request") or "").strip()
+    normalized_user_request = user_request or brief
 
     acceptance_criteria = payload.get("acceptance_criteria") or []
     if not isinstance(acceptance_criteria, list):
@@ -51,8 +55,8 @@ def _build_az_brief(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
         restrictions = [str(restrictions)]
     restrictions = [str(x) for x in restrictions]
 
-    known_inputs = []
-    for key in ("title", "screen", "user_request", "acceptance_criteria", "notes"):
+    known_inputs: list[str] = []
+    for key in ("title", "screen", "user_request", "brief", "acceptance_criteria", "notes"):
         if payload.get(key):
             known_inputs.append(key)
 
@@ -68,8 +72,8 @@ def _build_az_brief(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
         "Проверить, что артефакты AS можно применить/использовать без дополнительных догадок.",
     ]
 
-    missing_inputs = []
-    if not user_request:
+    missing_inputs: list[str] = []
+    if not normalized_user_request:
         missing_inputs.append("Не заполнено payload.user_request")
 
     if not acceptance_criteria:
@@ -84,7 +88,7 @@ def _build_az_brief(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
         "task_type": task_type,
         "title": title,
         "screen": screen,
-        "goal": user_request or title,
+        "goal": normalized_user_request or title,
         "scope": screen,
         "done_definition": acceptance_criteria,
         "restrictions": restrictions,
@@ -106,26 +110,15 @@ def _az_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
     target_agent = (task.get("target_agent") or "").upper()
     task_status = (task.get("status") or "").upper()
 
-    result = task.get("result") or {}
-    result = result if isinstance(result, dict) else {}
-
-    handoff_ready = bool(result.get("handoff_ready"))
-    next_agent = (result.get("next_agent") or "").upper()
-
     if target_agent == "AZ":
         return True, ""
 
     if task_status in {"NEW", "IN_PROGRESS"}:
         return True, ""
 
-    if task_status == "AA_ROUTED" and handoff_ready and next_agent == "AZ":
-        return True, ""
-
     return (
         False,
-        "AZ не может принять задачу: ожидается target_agent='AZ', "
-        "или статус NEW/IN_PROGRESS, "
-        "или handoff от AA со статусом AA_ROUTED и next_agent='AZ'.",
+        "AZ не может принять задачу: ожидается target_agent='AZ' или статус NEW/IN_PROGRESS.",
     )
 
 
@@ -324,7 +317,6 @@ def az_run_task(task_id: int):
     try:
         az_brief = _build_az_brief(task_id, task)
         prev_result = task.get("result") if isinstance(task.get("result"), dict) else {}
-
         merged_result = {
             **prev_result,
             "az_executor": "AZ",
@@ -417,6 +409,7 @@ def az_run_task(task_id: int):
                 },
             },
         )
+
     except Exception as e:
         err = f"AZ error: {e}"
         set_task_result(
