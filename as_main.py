@@ -61,18 +61,50 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     goal = _normalize_text(az_fix_plan.get("goal"))
     title = _normalize_text(payload.get("title")) or _normalize_text(az_fix_plan.get("title"))
     screen = _normalize_text(payload.get("screen")) or _normalize_text(az_fix_plan.get("screen"))
+    scope = _normalize_text(az_fix_plan.get("scope"))
     target_columns = _normalize_str_list(payload.get("target_columns")) or _normalize_str_list(
         az_fix_plan.get("target_columns")
     )
+    technical_steps = _normalize_str_list(az_fix_plan.get("technical_plan"))
+    checks = _normalize_str_list(
+        az_fix_plan.get("post_fix_checks") or payload.get("acceptance_criteria")
+    )
+    missing_inputs = _normalize_str_list(az_fix_plan.get("missing_inputs"))
 
     main_goal = user_request or payload_brief or goal or title or f"задача #{task_id}"
+    goal_lower = main_goal.lower()
 
-    parts = [f"Готово. Подготовлено решение по задаче: {main_goal}."]
-    if screen and screen != "Не указано":
-        parts.append(f"Область: {screen}.")
+    parts: list[str] = []
+
+    if "api" in goal_lower and "ozon" in goal_lower:
+        parts.append(
+            f"По задаче «{main_goal}» зафиксирована логика анализа передачи данных: "
+            "нужно сопоставить endpoint, ключи запроса/ответа и идентификаторы сущностей "
+            "между связанными вызовами."
+        )
+    else:
+        parts.append(f"По задаче «{main_goal}» сформирован рабочий результат на текущем наборе входных данных.")
+
+    work_scope = screen if screen and screen != "Не указано" else scope
+    if work_scope and work_scope != "Не указано":
+        parts.append(f"Область работы: {work_scope}.")
+
     if target_columns:
         parts.append(f"Целевые элементы: {', '.join(target_columns)}.")
-    parts.append("Артефакты собраны и переданы на проверку AK.")
+
+    if technical_steps:
+        steps_preview = "; ".join(technical_steps[:3])
+        parts.append(f"Ключевые шаги: {steps_preview}.")
+
+    if checks:
+        checks_preview = "; ".join(checks[:3])
+        parts.append(f"Проверка готовности: {checks_preview}.")
+
+    if missing_inputs:
+        parts.append(
+            "Текущий вывод предварительный, потому что в исходных данных не хватает: "
+            f"{', '.join(missing_inputs)}."
+        )
 
     return " ".join(parts)
 
