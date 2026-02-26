@@ -47,6 +47,74 @@ def _normalize_str_list(value: Any) -> list[str]:
     return result
 
 
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+
+    for item in items:
+        text = _normalize_text(item)
+        if not text:
+            continue
+
+        marker = text.casefold()
+        if marker in seen:
+            continue
+
+        seen.add(marker)
+        result.append(text)
+
+    return result
+
+
+def _limit_items(items: list[str], limit: int) -> list[str]:
+    if limit <= 0:
+        return []
+    return items[:limit]
+
+
+def _inline_list(items: list[str], limit: int = 3) -> str:
+    prepared: list[str] = []
+
+    for item in items:
+        text = _normalize_text(item).rstrip(" .;:")
+        if text:
+            prepared.append(text)
+
+    prepared = _limit_items(_dedupe_keep_order(prepared), limit)
+    return "; ".join(prepared)
+
+
+def _collect_named_items(*sources: Any, keys: list[str]) -> list[str]:
+    collected: list[str] = []
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+
+        for key in keys:
+            collected.extend(_normalize_str_list(source.get(key)))
+
+    return _dedupe_keep_order(collected)
+
+
+def _is_api_mapping_task(main_goal: str, task: dict[str, Any], az_fix_plan: dict[str, Any]) -> bool:
+    haystack = " ".join(
+        [
+            main_goal,
+            _normalize_text(task.get("task_type")),
+            _normalize_text(az_fix_plan.get("scope")),
+            _normalize_text(az_fix_plan.get("title")),
+        ]
+    ).casefold()
+
+    api_markers = ["api", "endpoint", "эндпоинт"]
+    mapping_markers = ["ключ", "связ", "payload", "response", "ozon"]
+
+    return any(marker in haystack for marker in api_markers) and any(
+        marker in haystack for marker in mapping_markers
+    )
+
+
 def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
     current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
@@ -61,50 +129,121 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     goal = _normalize_text(az_fix_plan.get("goal"))
     title = _normalize_text(payload.get("title")) or _normalize_text(az_fix_plan.get("title"))
     screen = _normalize_text(payload.get("screen")) or _normalize_text(az_fix_plan.get("screen"))
-    scope = _normalize_text(az_fix_plan.get("scope"))
-    target_columns = _normalize_str_list(payload.get("target_columns")) or _normalize_str_list(
-        az_fix_plan.get("target_columns")
+    target_columns = _dedupe_keep_order(
+        _normalize_str_list(payload.get("target_columns"))
+        or _normalize_str_list(az_fix_plan.get("target_columns"))
     )
-    technical_steps = _normalize_str_list(az_fix_plan.get("technical_plan"))
-    checks = _normalize_str_list(
-        az_fix_plan.get("post_fix_checks") or payload.get("acceptance_criteria")
+    technical_plan = _dedupe_keep_order(_normalize_str_list(az_fix_plan.get("technical_plan")))
+    checks = _dedupe_keep_order(
+        _normalize_str_list(az_fix_plan.get("post_fix_checks"))
+        or _normalize_str_list(payload.get("acceptance_criteria"))
     )
-    missing_inputs = _normalize_str_list(az_fix_plan.get("missing_inputs"))
+    restrictions = _dedupe_keep_order(
+        _normalize_str_list(payload.get("restrictions"))
+        or _normalize_str_list(az_fix_plan.get("restrictions"))
+    )
+    missing_inputs = _dedupe_keep_order(_normalize_str_list(az_fix_plan.get("missing_inputs")))
+    known_inputs = _dedupe_keep_order(_normalize_str_list(az_fix_plan.get("known_inputs")))
 
     main_goal = user_request or payload_brief or goal or title or f"задача #{task_id}"
-    goal_lower = main_goal.lower()
 
-    parts: list[str] = []
+    endpoints = _collect_named_items(
+        payload,
+        az_fix_plan,
+        keys=["endpoint", "endpoints", "api_endpoint", "api_endpoints", "target_endpoints"],
+    )
+    request_keys = _collect_named_items(
+        payload,
+        az_fix_plan,
+        keys=["request_keys", "input_keys", "query_keys", "body_keys", "payload_keys"],
+    )
+    response_keys = _collect_named_items(
+        payload,
+        az_fix_plan,
+        keys=["response_keys", "output_keys", "result_keys", "field_keys"],
+    )
+    link_keys = _collect_named_items(
+        payload,
+        az_fix_plan,
+        keys=["link_keys", "binding_keys", "relation_keys", "entity_keys", "join_keys", "id_keys"],
+    )
 
-    if "api" in goal_lower and "ozon" in goal_lower:
-        parts.append(
-            f"По задаче «{main_goal}» зафиксирована логика анализа передачи данных: "
-            "нужно сопоставить endpoint, ключи запроса/ответа и идентификаторы сущностей "
-            "между связанными вызовами."
-        )
-    else:
-        parts.append(f"По задаче «{main_goal}» сформирован рабочий результат на текущем наборе входных данных.")
+    if _is_api_mapping_task(main_goal, task, az_fix_plan):
+        parts = [
+            f"По задаче «{main_goal}» итоговый результат должен дать карту передачи данных от Ozon по API.",
+        ]
 
-    work_scope = screen if screen and screen != "Не указано" else scope
-    if work_scope and work_scope != "Не указано":
-        parts.append(f"Область работы: {work_scope}.")
+        if endpoints:
+            parts.append(f"Endpoint: {', '.join(_limit_items(endpoints, 6))}.")
+        else:
+            parts.append(
+                "Нужно зафиксировать конкретные endpoint и методы вызова, через которые данные приходят от Ozon."
+            )
+
+        if request_keys:
+            parts.append(f"Ключи запроса: {', '.join(_limit_items(request_keys, 8))}.")
+        else:
+            parts.append(
+                "Нужно перечислить ключи запроса, которыми данные передаются в вызов."
+            )
+
+        if response_keys:
+            parts.append(f"Ключи ответа: {', '.join(_limit_items(response_keys, 8))}.")
+        else:
+            parts.append(
+                "Нужно перечислить ключи ответа, в которых Ozon возвращает нужные данные."
+            )
+
+        if link_keys:
+            parts.append(f"Связка между вызовами: {', '.join(_limit_items(link_keys, 8))}.")
+        else:
+            parts.append(
+                "Нужно указать связующие идентификаторы между вызовами и сущностями (например, ID товара, оффера, SKU, отправления или запроса)."
+            )
+
+        if screen and screen != "Не указано":
+            parts.append(f"Контекст проверки: {screen}.")
+
+        if technical_plan:
+            parts.append(f"Рабочий фокус: {_inline_list(technical_plan, limit=2)}.")
+
+        if restrictions:
+            parts.append(f"Ограничения: {_inline_list(restrictions, limit=2)}.")
+
+        if missing_inputs:
+            parts.append(
+                "Чтобы назвать конкретные endpoint и ключи без догадок, нужно дополнительно получить: "
+                f"{', '.join(_limit_items(missing_inputs, 4))}."
+            )
+        elif known_inputs:
+            parts.append(f"Опорные входные данные: {', '.join(_limit_items(known_inputs, 4))}.")
+
+        return " ".join(parts)
+
+    parts = [f"По задаче «{main_goal}» подготовлен воспроизводимый результат."]
+
+    if title and title != main_goal:
+        parts.append(f"Рабочее название: {title}.")
+
+    if screen and screen != "Не указано":
+        parts.append(f"Область: {screen}.")
 
     if target_columns:
-        parts.append(f"Целевые элементы: {', '.join(target_columns)}.")
+        parts.append(f"Целевые элементы: {', '.join(_limit_items(target_columns, 8))}.")
 
-    if technical_steps:
-        steps_preview = "; ".join(technical_steps[:3])
-        parts.append(f"Ключевые шаги: {steps_preview}.")
+    if technical_plan:
+        parts.append(f"Основа решения: {_inline_list(technical_plan, limit=3)}.")
 
     if checks:
-        checks_preview = "; ".join(checks[:3])
-        parts.append(f"Проверка готовности: {checks_preview}.")
+        parts.append(f"Критерий готовности: {_inline_list(checks, limit=2)}.")
+
+    if restrictions:
+        parts.append(f"Ограничения: {_inline_list(restrictions, limit=2)}.")
 
     if missing_inputs:
-        parts.append(
-            "Текущий вывод предварительный, потому что в исходных данных не хватает: "
-            f"{', '.join(missing_inputs)}."
-        )
+        parts.append(f"Пока не хватает: {', '.join(_limit_items(missing_inputs, 4))}.")
+    elif known_inputs:
+        parts.append(f"Опора: {', '.join(_limit_items(known_inputs, 4))}.")
 
     return " ".join(parts)
 
