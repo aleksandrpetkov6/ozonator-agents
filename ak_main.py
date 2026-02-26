@@ -259,14 +259,28 @@ def ak_run_task(task_id: int):
         )
 
     target_agent = (task.get("target_agent") or "").upper()
-    if target_agent and target_agent != "AK":
+
+    # Allow AK to accept handoff even if the original target_agent is different (e.g., AZ).
+    # Handoff contract: status=ARTIFACTS_READY + result.handoff_ready=true + result.next_agent='AK'
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    next_agent = (result.get("next_agent") or "").upper()
+    handoff_ready = bool(result.get("handoff_ready"))
+    task_status = (task.get("status") or "").upper()
+
+    allowed_handoff = (task_status == "ARTIFACTS_READY" and handoff_ready and next_agent == "AK")
+
+    if target_agent and target_agent != "AK" and not allowed_handoff:
         return JSONResponse(
             status_code=400,
             content={
                 "service": "AK",
                 "operation": "ak_run_task",
                 "status": "error",
-                "message": f"Задача предназначена для {target_agent}, а не для AK",
+                "message": (
+                    f"AK не может принять задачу: target_agent={target_agent}. "
+                    "Ожидается target_agent='AK' или handoff от AS "
+                    "(status=ARTIFACTS_READY, handoff_ready=true, next_agent='AK')."
+                ),
                 "task": task,
             },
         )
