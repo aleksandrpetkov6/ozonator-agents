@@ -22,35 +22,31 @@ app = FastAPI(title="Ozonator Agents AS")
 # =========================
 # Helpers
 # =========================
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 
 def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     payload = task.get("payload") or {}
     current_result = task.get("result") or {}
     current_result = current_result if isinstance(current_result, dict) else {}
-
     az_fix_plan = current_result.get("az_fix_plan") if isinstance(current_result.get("az_fix_plan"), dict) else {}
-    title = (
-        payload.get("title")
-        or az_fix_plan.get("title")
-        or "Рабочий артефакт"
-    )
+
+    title = payload.get("title") or az_fix_plan.get("title") or "Рабочий артефакт"
     screen = payload.get("screen") or az_fix_plan.get("screen") or "Не указано"
     target_columns = payload.get("target_columns") or az_fix_plan.get("target_columns") or []
     task_type = task.get("task_type") or "unknown"
 
-    # MVP-артефакт: AS не правит внешний репозиторий, а собирает пакет для следующего этапа (AK/AA)
-    # с понятной структурой и трассировкой на brief от AZ.
-    implementation_steps = []
+    implementation_steps: list[dict[str, Any]] = []
     for idx, step in enumerate(az_fix_plan.get("technical_plan") or [], start=1):
-        implementation_steps.append({
-            "step_no": idx,
-            "title_ru": f"Шаг {idx}",
-            "description_ru": str(step),
-        })
+        implementation_steps.append(
+            {
+                "step_no": idx,
+                "title_ru": f"Шаг {idx}",
+                "description_ru": str(step),
+            }
+        )
 
     if not implementation_steps:
         implementation_steps = [
@@ -74,18 +70,12 @@ def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     else:
         artifact_text_lines.append("- (не указаны)")
 
-    artifact_text_lines.extend([
-        "",
-        "План реализации (из brief AZ):",
-    ])
+    artifact_text_lines.extend(["", "План реализации (из brief AZ):"])
     for item in implementation_steps:
         artifact_text_lines.append(f"{item['step_no']}. {item['description_ru']}")
 
     checks = az_fix_plan.get("post_fix_checks") or payload.get("acceptance_criteria") or []
-    artifact_text_lines.extend([
-        "",
-        "Проверки после исправления:",
-    ])
+    artifact_text_lines.extend(["", "Проверки после исправления:"])
     if checks:
         artifact_text_lines.extend([f"- {c}" for c in checks])
     else:
@@ -121,24 +111,19 @@ def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
         "acceptance_checks": checks,
         "notes": [
             "AS собрал mock-артефакты внутри ozonator-agents (MVP-контур).",
-            "Следующий этап — AK проверяет полноту, риски и соответствие brief/чек-листу.",
+            "Следующий этап - AK проверяет полноту, риски и соответствие brief/чек-листу.",
         ],
     }
 
 
-def _as_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
-    """
-    В MVP допускаем запуск AS в двух случаях:
-    1) target_agent == AS
-    2) после AZ уже стоит BRIEF_READY и в result есть handoff_ready + next_agent=AS
 
-    Это уменьшает ручные действия и не требует отдельного метода смены target_agent.
-    """
+def _as_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
     target_agent = (task.get("target_agent") or "").upper()
     result = task.get("result") if isinstance(task.get("result"), dict) else {}
     next_agent = (result.get("next_agent") or "").upper()
     handoff_ready = bool(result.get("handoff_ready"))
     task_status = (task.get("status") or "").upper()
+    next_action = (result.get("next_action") or "").lower()
 
     if target_agent == "AS":
         return True, ""
@@ -146,11 +131,15 @@ def _as_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
     if task_status == "BRIEF_READY" and handoff_ready and next_agent == "AS":
         return True, ""
 
+    if task_status == "REVIEW_NEEDS_ATTENTION" and next_action in {"return_to_as", "ak_return_to_as"}:
+        return True, ""
+
     return (
         False,
         (
-            "AS не может принять задачу: ожидается target_agent='AS' "
-            "или handoff от AZ (status=BRIEF_READY, handoff_ready=true, next_agent='AS')."
+            "AS не может принять задачу: ожидается target_agent='AS', "
+            "или handoff от AZ (status=BRIEF_READY, handoff_ready=true, next_agent='AS'), "
+            "или возврат после AK (status=REVIEW_NEEDS_ATTENTION, next_action=return_to_as)."
         ),
     )
 
@@ -158,7 +147,6 @@ def _as_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
 # =========================
 # Base / Health
 # =========================
-
 @app.get("/")
 def root():
     return {
@@ -203,7 +191,6 @@ def health_all():
     settings = get_settings()
     ok_db, db_detail = check_postgres(settings.database_url)
     ok_redis, redis_detail = check_redis(settings.redis_url)
-
     return {
         "service": "AS",
         "status": "ok" if (ok_db and ok_redis) else "degraded",
@@ -217,12 +204,10 @@ def health_all():
 # =========================
 # Tasks read endpoints
 # =========================
-
 @app.get("/tasks/{task_id}")
 def get_task(task_id: int):
     settings = get_settings()
     ok, task, message = get_task_record(settings.database_url, task_id)
-
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
@@ -250,7 +235,6 @@ def get_task(task_id: int):
 @app.get("/tasks/{task_id}/logs")
 def get_task_logs_endpoint(task_id: int):
     settings = get_settings()
-
     ok, _task, message = get_task_record(settings.database_url, task_id)
     if not ok:
         return JSONResponse(
@@ -296,11 +280,9 @@ def get_task_logs_endpoint(task_id: int):
 # =========================
 # AS runner
 # =========================
-
 @app.post("/as/run-task/{task_id}")
 def as_run_task(task_id: int):
     settings = get_settings()
-
     ok, task, message = get_task_record(settings.database_url, task_id)
     if not ok:
         return JSONResponse(
@@ -327,7 +309,6 @@ def as_run_task(task_id: int):
             },
         )
 
-    # Лог: старт обработки
     write_orchestration_log(
         settings.database_url,
         task_id=task_id,
@@ -342,7 +323,6 @@ def as_run_task(task_id: int):
         },
     )
 
-    # Статус -> in_progress
     ok, task, message = update_task_status(settings.database_url, task_id, "in_progress")
     if not ok:
         return JSONResponse(
@@ -358,8 +338,14 @@ def as_run_task(task_id: int):
 
     try:
         as_artifacts = _build_as_artifacts(task_id, task)
-
         prev_result = task.get("result") if isinstance(task.get("result"), dict) else {}
+        prev_result = prev_result if isinstance(prev_result, dict) else {}
+
+        current_review_cycle = int(prev_result.get("review_cycle") or 0)
+        is_rework = (prev_result.get("next_action") or "").lower() in {"return_to_as", "ak_return_to_as"}
+        if is_rework:
+            current_review_cycle += 1
+
         merged_result = {
             **prev_result,
             "as_executor": "AS",
@@ -369,6 +355,7 @@ def as_run_task(task_id: int):
             "next_agent": "AK",
             "as_completed_at": _now_iso(),
             "next_action": "as_artifacts_ready",
+            "review_cycle": current_review_cycle,
         }
 
         write_orchestration_log(
@@ -383,6 +370,7 @@ def as_run_task(task_id: int):
                 "task_type": task.get("task_type"),
                 "artifact_count": len(as_artifacts.get("artifact_bundle") or []),
                 "next_agent": "AK",
+                "review_cycle": current_review_cycle,
             },
         )
 
@@ -433,6 +421,7 @@ def as_run_task(task_id: int):
                 "as_status": "artifacts_ready",
                 "next_agent": "AK",
                 "handoff_ready": True,
+                "review_cycle": current_review_cycle,
             },
         )
 
@@ -450,13 +439,12 @@ def as_run_task(task_id: int):
                     "next_action": "as_artifacts_ready",
                     "handoff_ready": True,
                     "next_agent": "AK",
+                    "review_cycle": current_review_cycle,
                 },
             },
         )
-
     except Exception as e:
         err = f"AS error: {e}"
-
         set_task_result(
             settings.database_url,
             task_id=task_id,
@@ -464,7 +452,6 @@ def as_run_task(task_id: int):
             error_message=err,
         )
         update_task_status(settings.database_url, task_id, "failed")
-
         write_orchestration_log(
             settings.database_url,
             task_id=task_id,
@@ -474,7 +461,6 @@ def as_run_task(task_id: int):
             message="AS завершил обработку с ошибкой",
             meta={"error": err},
         )
-
         return JSONResponse(
             status_code=500,
             content={
