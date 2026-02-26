@@ -109,6 +109,14 @@ def _build_az_brief(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
 def _az_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
     target_agent = (task.get("target_agent") or "").upper()
     task_status = (task.get("status") or "").upper()
+    current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
+
+    routed_to = str(
+        current_result.get("routed_to")
+        or current_result.get("next_agent")
+        or ""
+    ).upper()
+    handoff_ready = bool(current_result.get("handoff_ready"))
 
     if target_agent == "AZ":
         return True, ""
@@ -116,9 +124,12 @@ def _az_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
     if task_status in {"NEW", "IN_PROGRESS"}:
         return True, ""
 
+    if task_status == "AA_ROUTED" and handoff_ready and routed_to == "AZ":
+        return True, ""
+
     return (
         False,
-        "AZ не может принять задачу: ожидается target_agent='AZ' или статус NEW/IN_PROGRESS.",
+        "AZ не может принять задачу: ожидается прямой вход в AZ, статус NEW/IN_PROGRESS или валидный handoff от AA (AA_ROUTED + handoff_ready + routed_to=AZ).",
     )
 
 
