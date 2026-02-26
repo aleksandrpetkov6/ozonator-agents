@@ -16,162 +16,124 @@ from db.tasks import (
     write_orchestration_log,
 )
 
-app = FastAPI(title="Ozonator Agents AS")
+app = FastAPI(title="Ozonator Agents AZ")
 
 
 # =========================
 # Helpers
 # =========================
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
+def _build_az_brief(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     payload = task.get("payload") or {}
     current_result = task.get("result") or {}
     current_result = current_result if isinstance(current_result, dict) else {}
 
-    az_fix_plan = current_result.get("az_fix_plan") if isinstance(current_result.get("az_fix_plan"), dict) else {}
-    title = (
-        payload.get("title")
-        or az_fix_plan.get("title")
-        or "Рабочий артефакт"
-    )
-    screen = payload.get("screen") or az_fix_plan.get("screen") or "Не указано"
-    target_columns = payload.get("target_columns") or az_fix_plan.get("target_columns") or []
-    task_type = task.get("task_type") or "unknown"
+    title = str(payload.get("title") or "Рабочая задача")
+    screen = str(payload.get("screen") or "Не указано")
+    task_type = str(task.get("task_type") or "unknown")
+    user_request = str(payload.get("user_request") or "").strip()
 
-    # MVP-артефакт: AS не правит внешний репозиторий, а собирает пакет для следующего этапа (AK/AA)
-    # с понятной структурой и трассировкой на brief от AZ.
-    implementation_steps = []
-    for idx, step in enumerate(az_fix_plan.get("technical_plan") or [], start=1):
-        implementation_steps.append({
-            "step_no": idx,
-            "title_ru": f"Шаг {idx}",
-            "description_ru": str(step),
-        })
+    acceptance_criteria = payload.get("acceptance_criteria") or []
+    if not isinstance(acceptance_criteria, list):
+        acceptance_criteria = [str(acceptance_criteria)]
+    acceptance_criteria = [str(x) for x in acceptance_criteria]
 
-    if not implementation_steps:
-        implementation_steps = [
-            {
-                "step_no": 1,
-                "title_ru": "Подготовка",
-                "description_ru": "AS не получил технический план от AZ и собрал универсальную заготовку артефакта.",
-            }
+    notes = payload.get("notes") or []
+    if not isinstance(notes, list):
+        notes = [str(notes)]
+    notes = [str(x) for x in notes]
+
+    restrictions = payload.get("restrictions") or payload.get("do_not_touch") or []
+    if not isinstance(restrictions, list):
+        restrictions = [str(restrictions)]
+    restrictions = [str(x) for x in restrictions]
+
+    known_inputs = []
+    for key in ("title", "screen", "user_request", "acceptance_criteria", "notes"):
+        if payload.get(key):
+            known_inputs.append(key)
+
+    technical_plan = [
+        "Проверить входные данные задачи и зафиксировать цель на языке результата.",
+        "Определить область изменений (файл/модуль/экран/endpoint), не выходя за ограничения.",
+        "Подготовить постановку для AS: что именно нужно сделать и как проверить, что готово.",
+    ]
+
+    qa_checklist = [
+        "Проверить, что результат соответствует цели и acceptance criteria.",
+        "Проверить, что ограничения не нарушены.",
+        "Проверить, что артефакты AS можно применить/использовать без дополнительных догадок.",
+    ]
+
+    missing_inputs = []
+    if not user_request:
+        missing_inputs.append("Не заполнено payload.user_request")
+
+    if not acceptance_criteria:
+        acceptance_criteria = [
+            "Результат соответствует задаче пользователя.",
+            "Нет явных конфликтов с указанными ограничениями.",
         ]
 
-    artifact_text_lines = [
-        f"Задача #{task_id}",
-        f"Тип: {task_type}",
-        f"Экран: {screen}",
-        f"Название: {title}",
-        "",
-        "Колонки-цели:",
-    ]
-    if target_columns:
-        artifact_text_lines.extend([f"- {c}" for c in target_columns])
-    else:
-        artifact_text_lines.append("- (не указаны)")
-
-    artifact_text_lines.extend([
-        "",
-        "План реализации (из brief AZ):",
-    ])
-    for item in implementation_steps:
-        artifact_text_lines.append(f"{item['step_no']}. {item['description_ru']}")
-
-    checks = az_fix_plan.get("post_fix_checks") or payload.get("acceptance_criteria") or []
-    artifact_text_lines.extend([
-        "",
-        "Проверки после исправления:",
-    ])
-    if checks:
-        artifact_text_lines.extend([f"- {c}" for c in checks])
-    else:
-        artifact_text_lines.append("- Проверки не заданы")
-
     return {
-        "artifacts_version": "as_artifacts_v1",
+        "brief_version": "az_brief_v1",
         "task_id": task_id,
         "task_type": task_type,
-        "generated_at": _now_iso(),
-        "source_brief": {
-            "az_status": current_result.get("az_status"),
-            "brief_version": az_fix_plan.get("brief_version"),
-            "handoff_ready": current_result.get("handoff_ready"),
-            "next_agent_before_as": current_result.get("next_agent"),
+        "title": title,
+        "screen": screen,
+        "goal": user_request or title,
+        "scope": screen,
+        "done_definition": acceptance_criteria,
+        "restrictions": restrictions,
+        "known_inputs": known_inputs,
+        "missing_inputs": missing_inputs,
+        "questions_for_user": [],
+        "technical_plan": technical_plan,
+        "post_fix_checks": qa_checklist,
+        "notes": notes,
+        "previous_state": {
+            "prev_status": task.get("status"),
+            "has_result": bool(current_result),
         },
-        "artifact_bundle": [
-            {
-                "artifact_name": "implementation_plan.txt",
-                "artifact_kind": "text/mock",
-                "produced_by": "AS",
-                "description_ru": "Пакет AS для AK: план реализации и чек-лист по brief от AZ.",
-                "content_text": "\n".join(artifact_text_lines),
-            },
-            {
-                "artifact_name": "implementation_steps.json",
-                "artifact_kind": "json/mock",
-                "produced_by": "AS",
-                "description_ru": "Структурированный список шагов реализации для дальнейшей проверки AK.",
-                "content_json": implementation_steps,
-            },
-        ],
-        "acceptance_checks": checks,
-        "notes": [
-            "AS собрал mock-артефакты внутри ozonator-agents (MVP-контур).",
-            "Следующий этап — AK проверяет полноту, риски и соответствие brief/чек-листу.",
-        ],
+        "generated_at": _now_iso(),
     }
 
 
-def _as_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
-    """
-    В MVP допускаем запуск AS в двух случаях:
-    1) target_agent == AS
-    2) после AZ уже стоит BRIEF_READY и в result есть handoff_ready + next_agent=AS
-
-    Это уменьшает ручные действия и не требует отдельного метода смены target_agent.
-    """
+def _az_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
     target_agent = (task.get("target_agent") or "").upper()
-    result = task.get("result") if isinstance(task.get("result"), dict) else {}
-    next_agent = (result.get("next_agent") or "").upper()
-    handoff_ready = bool(result.get("handoff_ready"))
     task_status = (task.get("status") or "").upper()
 
-    if target_agent == "AS":
+    if target_agent == "AZ":
         return True, ""
 
-    if task_status == "BRIEF_READY" and handoff_ready and next_agent == "AS":
+    if task_status in {"NEW", "IN_PROGRESS"}:
         return True, ""
 
     return (
         False,
-        (
-            "AS не может принять задачу: ожидается target_agent='AS' "
-            "или handoff от AZ (status=BRIEF_READY, handoff_ready=true, next_agent='AS')."
-        ),
+        "AZ не может принять задачу: ожидается target_agent='AZ' или статус NEW/IN_PROGRESS.",
     )
 
 
 # =========================
 # Base / Health
 # =========================
-
 @app.get("/")
 def root():
     return {
-        "service": "AS",
+        "service": "AZ",
         "status": "ok",
-        "message": "Ozonator Agents AS service is running",
+        "message": "Ozonator Agents AZ service is running",
         "docs": "/docs",
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "AS"}
+    return {"status": "ok", "service": "AZ"}
 
 
 @app.get("/health/db")
@@ -179,7 +141,7 @@ def health_db():
     settings = get_settings()
     ok, detail = check_postgres(settings.database_url)
     return {
-        "service": "AS",
+        "service": "AZ",
         "component": "db",
         "ok": ok,
         "detail": detail,
@@ -191,7 +153,7 @@ def health_redis():
     settings = get_settings()
     ok, detail = check_redis(settings.redis_url)
     return {
-        "service": "AS",
+        "service": "AZ",
         "component": "redis",
         "ok": ok,
         "detail": detail,
@@ -203,9 +165,8 @@ def health_all():
     settings = get_settings()
     ok_db, db_detail = check_postgres(settings.database_url)
     ok_redis, redis_detail = check_redis(settings.redis_url)
-
     return {
-        "service": "AS",
+        "service": "AZ",
         "status": "ok" if (ok_db and ok_redis) else "degraded",
         "components": {
             "db": {"ok": ok_db, "detail": db_detail},
@@ -217,17 +178,15 @@ def health_all():
 # =========================
 # Tasks read endpoints
 # =========================
-
 @app.get("/tasks/{task_id}")
 def get_task(task_id: int):
     settings = get_settings()
     ok, task, message = get_task_record(settings.database_url, task_id)
-
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
             content={
-                "service": "AS",
+                "service": "AZ",
                 "operation": "get_task",
                 "status": "error",
                 "message": message,
@@ -238,7 +197,7 @@ def get_task(task_id: int):
     return JSONResponse(
         status_code=200,
         content={
-            "service": "AS",
+            "service": "AZ",
             "operation": "get_task",
             "status": "ok",
             "message": "OK",
@@ -250,13 +209,12 @@ def get_task(task_id: int):
 @app.get("/tasks/{task_id}/logs")
 def get_task_logs_endpoint(task_id: int):
     settings = get_settings()
-
     ok, _task, message = get_task_record(settings.database_url, task_id)
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
             content={
-                "service": "AS",
+                "service": "AZ",
                 "operation": "get_task_logs",
                 "status": "error",
                 "message": message,
@@ -270,7 +228,7 @@ def get_task_logs_endpoint(task_id: int):
         return JSONResponse(
             status_code=503,
             content={
-                "service": "AS",
+                "service": "AZ",
                 "operation": "get_task_logs",
                 "status": "error",
                 "message": message,
@@ -282,7 +240,7 @@ def get_task_logs_endpoint(task_id: int):
     return JSONResponse(
         status_code=200,
         content={
-            "service": "AS",
+            "service": "AZ",
             "operation": "get_task_logs",
             "status": "ok",
             "message": "OK",
@@ -294,47 +252,44 @@ def get_task_logs_endpoint(task_id: int):
 
 
 # =========================
-# AS runner
+# AZ runner
 # =========================
-
-@app.post("/as/run-task/{task_id}")
-def as_run_task(task_id: int):
+@app.post("/az/run-task/{task_id}")
+def az_run_task(task_id: int):
     settings = get_settings()
-
     ok, task, message = get_task_record(settings.database_url, task_id)
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
             content={
-                "service": "AS",
-                "operation": "as_run_task",
+                "service": "AZ",
+                "operation": "az_run_task",
                 "status": "error",
                 "message": message,
                 "task": None,
             },
         )
 
-    allowed, deny_message = _as_handoff_allowed(task)
+    allowed, deny_message = _az_handoff_allowed(task)
     if not allowed:
         return JSONResponse(
             status_code=400,
             content={
-                "service": "AS",
-                "operation": "as_run_task",
+                "service": "AZ",
+                "operation": "az_run_task",
                 "status": "error",
                 "message": deny_message,
                 "task": task,
             },
         )
 
-    # Лог: старт обработки
     write_orchestration_log(
         settings.database_url,
         task_id=task_id,
-        actor_agent="AS",
+        actor_agent="AZ",
         event_type="task_run_started",
         level="info",
-        message="AS начал сборку артефактов",
+        message="AZ начал подготовку brief",
         meta={
             "source_agent": task.get("source_agent"),
             "task_type": task.get("task_type"),
@@ -342,14 +297,13 @@ def as_run_task(task_id: int):
         },
     )
 
-    # Статус -> in_progress
     ok, task, message = update_task_status(settings.database_url, task_id, "in_progress")
     if not ok:
         return JSONResponse(
             status_code=503,
             content={
-                "service": "AS",
-                "operation": "as_run_task",
+                "service": "AZ",
+                "operation": "az_run_task",
                 "status": "error",
                 "message": message,
                 "task": None,
@@ -357,32 +311,31 @@ def as_run_task(task_id: int):
         )
 
     try:
-        as_artifacts = _build_as_artifacts(task_id, task)
-
+        az_brief = _build_az_brief(task_id, task)
         prev_result = task.get("result") if isinstance(task.get("result"), dict) else {}
+
         merged_result = {
             **prev_result,
-            "as_executor": "AS",
-            "as_artifacts": as_artifacts,
-            "as_status": "artifacts_ready",
+            "az_executor": "AZ",
+            "az_fix_plan": az_brief,
+            "az_status": "brief_ready",
             "handoff_ready": True,
-            "next_agent": "AK",
-            "as_completed_at": _now_iso(),
-            "next_action": "as_artifacts_ready",
+            "next_agent": "AS",
+            "az_completed_at": _now_iso(),
+            "next_action": "az_brief_ready",
         }
 
         write_orchestration_log(
             settings.database_url,
             task_id=task_id,
-            actor_agent="AS",
-            event_type="task_artifacts_prepared",
+            actor_agent="AZ",
+            event_type="task_brief_prepared",
             level="info",
-            message="AS собрал артефакты по brief от AZ",
+            message="AZ подготовил brief для AS",
             meta={
-                "mode": "as_artifacts_v1",
+                "mode": "az_brief_v1",
                 "task_type": task.get("task_type"),
-                "artifact_count": len(as_artifacts.get("artifact_bundle") or []),
-                "next_agent": "AK",
+                "next_agent": "AS",
             },
         )
 
@@ -396,21 +349,21 @@ def as_run_task(task_id: int):
             return JSONResponse(
                 status_code=503,
                 content={
-                    "service": "AS",
-                    "operation": "as_run_task",
+                    "service": "AZ",
+                    "operation": "az_run_task",
                     "status": "error",
                     "message": message_set,
                     "task": None,
                 },
             )
 
-        ok, task, message = update_task_status(settings.database_url, task_id, "ARTIFACTS_READY")
+        ok, task, message = update_task_status(settings.database_url, task_id, "BRIEF_READY")
         if not ok:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "service": "AS",
-                    "operation": "as_run_task",
+                    "service": "AZ",
+                    "operation": "az_run_task",
                     "status": "error",
                     "message": message,
                     "task": None,
@@ -420,18 +373,18 @@ def as_run_task(task_id: int):
         write_orchestration_log(
             settings.database_url,
             task_id=task_id,
-            actor_agent="AS",
-            event_type="as_artifacts_ready",
+            actor_agent="AZ",
+            event_type="az_brief_ready",
             level="info",
-            message="AS завершил сборку артефактов (ARTIFACTS_READY)",
+            message="AZ завершил подготовку brief (BRIEF_READY)",
             meta={
-                "mode": "as_artifacts_v1",
+                "mode": "az_brief_v1",
                 "task_id": task_id,
-                "next_action": "as_artifacts_ready",
+                "next_action": "az_brief_ready",
                 "from_status": "in_progress",
-                "to_status": "ARTIFACTS_READY",
-                "as_status": "artifacts_ready",
-                "next_agent": "AK",
+                "to_status": "BRIEF_READY",
+                "az_status": "brief_ready",
+                "next_agent": "AS",
                 "handoff_ready": True,
             },
         )
@@ -439,24 +392,22 @@ def as_run_task(task_id: int):
         return JSONResponse(
             status_code=200,
             content={
-                "service": "AS",
-                "operation": "as_run_task",
+                "service": "AZ",
+                "operation": "az_run_task",
                 "status": "ok",
                 "message": "Задача обработана",
                 "task": task,
                 "execution_result": {
-                    "mode": "as_artifacts_v1",
+                    "mode": "az_brief_v1",
                     "task_id": task_id,
-                    "next_action": "as_artifacts_ready",
+                    "next_action": "az_brief_ready",
                     "handoff_ready": True,
-                    "next_agent": "AK",
+                    "next_agent": "AS",
                 },
             },
         )
-
     except Exception as e:
-        err = f"AS error: {e}"
-
+        err = f"AZ error: {e}"
         set_task_result(
             settings.database_url,
             task_id=task_id,
@@ -464,22 +415,20 @@ def as_run_task(task_id: int):
             error_message=err,
         )
         update_task_status(settings.database_url, task_id, "failed")
-
         write_orchestration_log(
             settings.database_url,
             task_id=task_id,
-            actor_agent="AS",
+            actor_agent="AZ",
             event_type="task_run_failed",
             level="error",
-            message="AS завершил обработку с ошибкой",
+            message="AZ завершил обработку с ошибкой",
             meta={"error": err},
         )
-
         return JSONResponse(
             status_code=500,
             content={
-                "service": "AS",
-                "operation": "as_run_task",
+                "service": "AZ",
+                "operation": "az_run_task",
                 "status": "error",
                 "message": err,
                 "task": None,
