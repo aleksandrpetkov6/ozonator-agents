@@ -301,7 +301,7 @@ def _post_json(url: str, payload: dict[str, Any] | None = None) -> tuple[bool, i
         method="POST",
     )
     try:
-        with urllib_request.urlopen(req, timeout=30) as response:
+        with urllib_request.urlopen(req, timeout=120) as response:
             raw = response.read()
             return True, response.getcode(), _read_json_response(raw), None
     except urllib_error.HTTPError as e:
