@@ -66,9 +66,62 @@ def _normalize_str_list(value: Any) -> list[str]:
 # -------------------------
 # Direct answering (optional)
 # -------------------------
-_OPENAI_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/responses").strip()
-_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1").strip()
-_OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+# IMPORTANT:
+# - Secrets (API keys) must be stored ONLY on server env (Render), never in client.
+# - This module supports BOTH:
+#   1) OpenAI Responses API (default for OpenAI)
+#   2) OpenAI-compatible Chat Completions (required for Groq)
+#
+# How to switch to Groq (server-side):
+# - Set API key in Render env (AS service):
+#     GROQ_API_KEY   (recommended)  OR  OPENAI_API_KEY  OR  Agents (legacy name)
+# - Optionally set:
+#     OPENAI_MODEL   (e.g. "llama-3.3-70b-versatile")
+#     OPENAI_API_URL (e.g. "https://api.groq.com/openai/v1/chat/completions")
+#
+# Defaults:
+# - If OPENAI_API_URL is not provided, we default to Groq Chat Completions endpoint.
+
+_LLM_URL = os.getenv("OPENAI_API_URL", "").strip() or "https://api.groq.com/openai/v1/chat/completions"
+_LLM_MODEL = os.getenv("OPENAI_MODEL", "").strip() or "llama-3.3-70b-versatile"
+
+# Prefer explicit Groq key, then OpenAI-style, then legacy "Agents" env var (as in your screenshot).
+_LLM_KEY = (
+    os.getenv("GROQ_API_KEY")
+    or os.getenv("OPENAI_API_KEY")
+    or os.getenv("Agents")
+    or ""
+).strip()
+
+
+def _is_chat_completions(url: str) -> bool:
+    u = (url or "").lower()
+    return "/chat/completions" in u
+
+
+def _extract_chat_completion_text(resp: dict[str, Any]) -> str:
+    choices = resp.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0] if isinstance(choices[0], dict) else None
+        if first:
+            message = first.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+                # Some providers may return list-like content; try to join.
+                if isinstance(content, list):
+                    parts: list[str] = []
+                    for c in content:
+                        if isinstance(c, str) and c.strip():
+                            parts.append(c.strip())
+                        elif isinstance(c, dict):
+                            text = c.get("text") or c.get("content")
+                            if isinstance(text, str) and text.strip():
+                                parts.append(text.strip())
+                    if parts:
+                        return "\n".join(parts).strip()
+    return ""
 
 
 def _extract_openai_output_text(resp: dict[str, Any]) -> str:
@@ -91,53 +144,78 @@ def _extract_openai_output_text(resp: dict[str, Any]) -> str:
     return ""
 
 
-def _openai_answer(question_ru: str) -> str:
+def _llm_answer(question_ru: str) -> str:
     """
-    Server-side call to OpenAI Responses API.
-    IMPORTANT: API key must be stored ONLY on server env (Render), never in client.
+    Server-side call to an LLM endpoint.
+    - For Groq use OPENAI-compatible Chat Completions.
+    - For OpenAI you can still use Responses API if OPENAI_API_URL points there.
     """
-    if not _OPENAI_KEY:
+    if not _LLM_KEY:
         return ""
 
-    # Minimal "developer" instruction to keep it predictable and safe.
-    developer_msg = (
+    # Minimal instruction to keep it predictable and safe.
+    system_msg = (
         "Ты — ассистент в приложении Ozonator Agents Client. "
         "Отвечай на русском. Коротко и по делу. "
         "Если вопрос простой (факт/арифметика/конвертация), дай прямой ответ. "
         "Не упоминай внутренние статусы/агентов/оркестрацию."
     )
 
-    payload = {
-        "model": _OPENAI_MODEL,
-        "input": [
-            {
-                "role": "developer",
-                "content": [{"type": "input_text", "text": developer_msg}],
-            },
-            {"role": "user", "content": [{"type": "input_text", "text": question_ru}]},
-        ],
-    }
-
     try:
         import urllib.request as urllib_request
-        import urllib.error as urllib_error
+
+        if _is_chat_completions(_LLM_URL):
+            payload = {
+                "model": _LLM_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": question_ru},
+                ],
+            }
+        else:
+            # OpenAI Responses API format
+            payload = {
+                "model": _LLM_MODEL,
+                "input": [
+                    {
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": system_msg}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": question_ru}],
+                    },
+                ],
+            }
 
         req = urllib_request.Request(
-            _OPENAI_URL,
+            _LLM_URL,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={
                 "Content-Type": "application/json; charset=utf-8",
-                "Authorization": f"Bearer {_OPENAI_KEY}",
+                "Authorization": f"Bearer {_LLM_KEY}",
             },
             method="POST",
         )
+
         with urllib_request.urlopen(req, timeout=60) as r:
             raw = r.read()
+
         data = json.loads(raw.decode("utf-8"))
+
+        if _is_chat_completions(_LLM_URL):
+            return _extract_chat_completion_text(data)
+
         return _extract_openai_output_text(data)
+
     except Exception:
         # No secrets in logs; just silent fallback to heuristic/template.
         return ""
+
+
+# Backward compatible alias (old name used by code below)
+def _openai_answer(question_ru: str) -> str:
+    return _llm_answer(question_ru)
 
 
 # -------------------------
