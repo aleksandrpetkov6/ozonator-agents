@@ -26,17 +26,72 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+
+    items = value if isinstance(value, list) else [value]
+    result: list[str] = []
+
+    for item in items:
+        text = str(item).strip()
+        if text:
+            result.append(text)
+
+    return result
+
+
+def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
+    payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    az_fix_plan = (
+        current_result.get("az_fix_plan")
+        if isinstance(current_result.get("az_fix_plan"), dict)
+        else {}
+    )
+
+    user_request = _normalize_text(payload.get("user_request"))
+    payload_brief = _normalize_text(payload.get("brief"))
+    goal = _normalize_text(az_fix_plan.get("goal"))
+    title = _normalize_text(payload.get("title")) or _normalize_text(az_fix_plan.get("title"))
+    screen = _normalize_text(payload.get("screen")) or _normalize_text(az_fix_plan.get("screen"))
+    target_columns = _normalize_str_list(payload.get("target_columns")) or _normalize_str_list(
+        az_fix_plan.get("target_columns")
+    )
+
+    main_goal = user_request or payload_brief or goal or title or f"задача #{task_id}"
+
+    parts = [f"Готово. Подготовлено решение по задаче: {main_goal}."]
+    if screen and screen != "Не указано":
+        parts.append(f"Область: {screen}.")
+    if target_columns:
+        parts.append(f"Целевые элементы: {', '.join(target_columns)}.")
+    parts.append("Артефакты собраны и переданы на проверку AK.")
+
+    return " ".join(parts)
+
 
 def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
-    payload = task.get("payload") or {}
-    current_result = task.get("result") or {}
-    current_result = current_result if isinstance(current_result, dict) else {}
-    az_fix_plan = current_result.get("az_fix_plan") if isinstance(current_result.get("az_fix_plan"), dict) else {}
+    payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    az_fix_plan = (
+        current_result.get("az_fix_plan")
+        if isinstance(current_result.get("az_fix_plan"), dict)
+        else {}
+    )
 
-    title = payload.get("title") or az_fix_plan.get("title") or "Рабочий артефакт"
-    screen = payload.get("screen") or az_fix_plan.get("screen") or "Не указано"
-    target_columns = payload.get("target_columns") or az_fix_plan.get("target_columns") or []
-    task_type = task.get("task_type") or "unknown"
+    title = _normalize_text(payload.get("title")) or _normalize_text(az_fix_plan.get("title")) or "Рабочий артефакт"
+    screen = _normalize_text(payload.get("screen")) or _normalize_text(az_fix_plan.get("screen")) or "Не указано"
+    target_columns = _normalize_str_list(payload.get("target_columns")) or _normalize_str_list(
+        az_fix_plan.get("target_columns")
+    )
+    task_type = _normalize_text(task.get("task_type")) or "unknown"
 
     implementation_steps: list[dict[str, Any]] = []
     for idx, step in enumerate(az_fix_plan.get("technical_plan") or [], start=1):
@@ -65,8 +120,9 @@ def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
         "",
         "Колонки-цели:",
     ]
+
     if target_columns:
-        artifact_text_lines.extend([f"- {c}" for c in target_columns])
+        artifact_text_lines.extend([f"- {column}" for column in target_columns])
     else:
         artifact_text_lines.append("- (не указаны)")
 
@@ -74,10 +130,13 @@ def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     for item in implementation_steps:
         artifact_text_lines.append(f"{item['step_no']}. {item['description_ru']}")
 
-    checks = az_fix_plan.get("post_fix_checks") or payload.get("acceptance_criteria") or []
+    checks = _normalize_str_list(
+        az_fix_plan.get("post_fix_checks") or payload.get("acceptance_criteria")
+    )
+
     artifact_text_lines.extend(["", "Проверки после исправления:"])
     if checks:
-        artifact_text_lines.extend([f"- {c}" for c in checks])
+        artifact_text_lines.extend([f"- {check}" for check in checks])
     else:
         artifact_text_lines.append("- Проверки не заданы")
 
@@ -114,7 +173,6 @@ def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
             "Следующий этап - AK проверяет полноту, риски и соответствие brief/чек-листу.",
         ],
     }
-
 
 
 def _as_handoff_allowed(task: dict[str, Any]) -> tuple[bool, str]:
@@ -191,6 +249,7 @@ def health_all():
     settings = get_settings()
     ok_db, db_detail = check_postgres(settings.database_url)
     ok_redis, redis_detail = check_redis(settings.redis_url)
+
     return {
         "service": "AS",
         "status": "ok" if (ok_db and ok_redis) else "degraded",
@@ -208,6 +267,7 @@ def health_all():
 def get_task(task_id: int):
     settings = get_settings()
     ok, task, message = get_task_record(settings.database_url, task_id)
+
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
@@ -236,6 +296,7 @@ def get_task(task_id: int):
 def get_task_logs_endpoint(task_id: int):
     settings = get_settings()
     ok, _task, message = get_task_record(settings.database_url, task_id)
+
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
@@ -250,6 +311,7 @@ def get_task_logs_endpoint(task_id: int):
         )
 
     ok, logs, message = get_task_logs(settings.database_url, task_id)
+
     if not ok:
         return JSONResponse(
             status_code=503,
@@ -284,6 +346,7 @@ def get_task_logs_endpoint(task_id: int):
 def as_run_task(task_id: int):
     settings = get_settings()
     ok, task, message = get_task_record(settings.database_url, task_id)
+
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
@@ -338,6 +401,8 @@ def as_run_task(task_id: int):
 
     try:
         as_artifacts = _build_as_artifacts(task_id, task)
+        final_answer = _build_final_answer(task_id, task)
+
         prev_result = task.get("result") if isinstance(task.get("result"), dict) else {}
         prev_result = prev_result if isinstance(prev_result, dict) else {}
 
@@ -350,6 +415,10 @@ def as_run_task(task_id: int):
             **prev_result,
             "as_executor": "AS",
             "as_artifacts": as_artifacts,
+            "as_output": {
+                "answer_text": final_answer,
+            },
+            "final_answer": final_answer,
             "as_status": "artifacts_ready",
             "handoff_ready": True,
             "next_agent": "AK",
@@ -371,6 +440,7 @@ def as_run_task(task_id: int):
                 "artifact_count": len(as_artifacts.get("artifact_bundle") or []),
                 "next_agent": "AK",
                 "review_cycle": current_review_cycle,
+                "has_final_answer": bool(final_answer),
             },
         )
 
@@ -422,6 +492,7 @@ def as_run_task(task_id: int):
                 "next_agent": "AK",
                 "handoff_ready": True,
                 "review_cycle": current_review_cycle,
+                "has_final_answer": bool(final_answer),
             },
         )
 
@@ -440,11 +511,13 @@ def as_run_task(task_id: int):
                     "handoff_ready": True,
                     "next_agent": "AK",
                     "review_cycle": current_review_cycle,
+                    "has_final_answer": bool(final_answer),
                 },
             },
         )
     except Exception as e:
         err = f"AS error: {e}"
+
         set_task_result(
             settings.database_url,
             task_id=task_id,
@@ -461,6 +534,7 @@ def as_run_task(task_id: int):
             message="AS завершил обработку с ошибкой",
             meta={"error": err},
         )
+
         return JSONResponse(
             status_code=500,
             content={

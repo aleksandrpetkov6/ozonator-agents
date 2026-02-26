@@ -26,6 +26,12 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 def _build_ak_review(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     result = task.get("result") if isinstance(task.get("result"), dict) else {}
     as_artifacts = result.get("as_artifacts") if isinstance(result.get("as_artifacts"), dict) else {}
@@ -61,7 +67,11 @@ def _build_ak_review(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
         {
             "check": "as_handoff_ready_flag",
             "ok": bool(result.get("handoff_ready")),
-            "details": "AS пометил handoff_ready=true" if result.get("handoff_ready") else "AS не пометил handoff_ready=true",
+            "details": (
+                "AS пометил handoff_ready=true"
+                if result.get("handoff_ready")
+                else "AS не пометил handoff_ready=true"
+            ),
         },
         {
             "check": "as_next_agent_is_ak",
@@ -77,11 +87,11 @@ def _build_ak_review(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     all_ok = all(bool(item.get("ok")) for item in checks)
 
     target_columns = az_fix_plan.get("target_columns", [])
-    artifacts_preview = {}
+    artifacts_preview: dict[str, Any] = {}
     if as_artifacts:
-        for k, v in as_artifacts.items():
-            if isinstance(v, (str, int, float, bool)) or v is None:
-                artifacts_preview[k] = v
+        for key, value in as_artifacts.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                artifacts_preview[key] = value
 
     return {
         "review_version": "ak_review_v1",
@@ -104,6 +114,40 @@ def _build_ak_review(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
             "На следующем шаге можно добавить более строгую валидацию содержимого артефактов (patch/file checks).",
         ],
     }
+
+
+def _resolve_final_answer(task_id: int, task: dict[str, Any], ak_review: dict[str, Any]) -> str:
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+
+    direct_final_answer = _normalize_text(result.get("final_answer"))
+    if direct_final_answer:
+        return direct_final_answer
+
+    as_output = result.get("as_output") if isinstance(result.get("as_output"), dict) else {}
+    as_output_answer = _normalize_text(as_output.get("answer_text"))
+    if as_output_answer:
+        return as_output_answer
+
+    payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    az_fix_plan = result.get("az_fix_plan") if isinstance(result.get("az_fix_plan"), dict) else {}
+
+    main_goal = (
+        _normalize_text(payload.get("user_request"))
+        or _normalize_text(az_fix_plan.get("goal"))
+        or _normalize_text(payload.get("title"))
+        or _normalize_text(az_fix_plan.get("title"))
+        or f"задача #{task_id}"
+    )
+
+    review_summary = _normalize_text(ak_review.get("summary"))
+    if review_summary:
+        prefix = "Готово." if ak_review.get("decision") == "approved" else "Требуется доработка."
+        return f"{prefix} {main_goal}. {review_summary}"
+
+    if ak_review.get("decision") == "approved":
+        return f"Готово. Задача обработана: {main_goal}."
+
+    return f"Требуется доработка по задаче: {main_goal}."
 
 
 # =========================
@@ -153,6 +197,7 @@ def health_all():
     settings = get_settings()
     ok_db, db_detail = check_postgres(settings.database_url)
     ok_redis, redis_detail = check_redis(settings.redis_url)
+
     return {
         "service": "AK",
         "status": "ok" if (ok_db and ok_redis) else "degraded",
@@ -170,6 +215,7 @@ def health_all():
 def get_task(task_id: int):
     settings = get_settings()
     ok, task, message = get_task_record(settings.database_url, task_id)
+
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
@@ -181,6 +227,7 @@ def get_task(task_id: int):
                 "task": None,
             },
         )
+
     return JSONResponse(
         status_code=200,
         content={
@@ -197,6 +244,7 @@ def get_task(task_id: int):
 def get_task_logs_endpoint(task_id: int):
     settings = get_settings()
     ok, _task, message = get_task_record(settings.database_url, task_id)
+
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
@@ -211,6 +259,7 @@ def get_task_logs_endpoint(task_id: int):
         )
 
     ok, logs, message = get_task_logs(settings.database_url, task_id)
+
     if not ok:
         return JSONResponse(
             status_code=503,
@@ -244,8 +293,8 @@ def get_task_logs_endpoint(task_id: int):
 @app.post("/ak/run-task/{task_id}")
 def ak_run_task(task_id: int):
     settings = get_settings()
-
     ok, task, message = get_task_record(settings.database_url, task_id)
+
     if not ok:
         return JSONResponse(
             status_code=404 if message == "Задача не найдена" else 503,
@@ -266,7 +315,6 @@ def ak_run_task(task_id: int):
     next_agent = (result.get("next_agent") or "").upper()
     handoff_ready = bool(result.get("handoff_ready"))
     task_status = (task.get("status") or "").upper()
-
     allowed_handoff = (task_status == "ARTIFACTS_READY" and handoff_ready and next_agent == "AK")
 
     if target_agent and target_agent != "AK" and not allowed_handoff:
@@ -298,7 +346,6 @@ def ak_run_task(task_id: int):
             },
         )
 
-    # Лог: старт обработки
     write_orchestration_log(
         settings.database_url,
         task_id=task_id,
@@ -313,7 +360,6 @@ def ak_run_task(task_id: int):
         },
     )
 
-    # Статус -> in_progress (короткий рабочий статус на время проверки)
     ok, task, message = update_task_status(settings.database_url, task_id, "in_progress")
     if not ok:
         return JSONResponse(
@@ -330,6 +376,8 @@ def ak_run_task(task_id: int):
     try:
         ak_review = _build_ak_review(task_id, task)
         prev_result = task.get("result") if isinstance(task.get("result"), dict) else {}
+        prev_result = prev_result if isinstance(prev_result, dict) else {}
+        final_answer = _resolve_final_answer(task_id, task, ak_review)
 
         write_orchestration_log(
             settings.database_url,
@@ -351,6 +399,7 @@ def ak_run_task(task_id: int):
 
         merged_result = {
             **prev_result,
+            "final_answer": final_answer,
             "ak_executor": "AK",
             "ak_review": ak_review,
             "ak_status": final_ak_status,
@@ -411,6 +460,7 @@ def ak_run_task(task_id: int):
                 "ak_status": final_ak_status,
                 "next_agent": None,
                 "handoff_ready": False,
+                "has_final_answer": bool(final_answer),
             },
         )
 
@@ -430,10 +480,10 @@ def ak_run_task(task_id: int):
                     "task_status": final_task_status,
                     "handoff_ready": False,
                     "next_agent": None,
+                    "has_final_answer": bool(final_answer),
                 },
             },
         )
-
     except Exception as e:
         err = f"AK error: {e}"
 
@@ -444,7 +494,6 @@ def ak_run_task(task_id: int):
             error_message=err,
         )
         update_task_status(settings.database_url, task_id, "failed")
-
         write_orchestration_log(
             settings.database_url,
             task_id=task_id,
