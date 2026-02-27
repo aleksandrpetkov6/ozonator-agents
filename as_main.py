@@ -67,155 +67,151 @@ def _normalize_str_list(value: Any) -> list[str]:
 # Direct answering (optional)
 # -------------------------
 # IMPORTANT:
-# - Secrets (API keys) must be stored ONLY on server env (Render), never in client.
-# - This module supports BOTH:
-#   1) OpenAI Responses API (default for OpenAI)
-#   2) OpenAI-compatible Chat Completions (required for Groq)
+# - Секреты (API keys) должны храниться ТОЛЬКО в env сервиса (Render), никогда в клиенте.
+# - Groq использует OpenAI-совместимый Chat Completions.
+# - Код нормализует URL до рабочего /chat/completions и НЕ логирует секреты.
 #
-# How to switch to Groq (server-side):
-# - Set API key in Render env (AS service):
-#     GROQ_API_KEY   (recommended)  OR  OPENAI_API_KEY  OR  Agents (legacy name)
-# - Optionally set:
-#     OPENAI_MODEL   (e.g. "llama-3.3-70b-versatile")
-#     OPENAI_API_URL (e.g. "https://api.groq.com/openai/v1/chat/completions")
-#
-# Defaults:
-# - If OPENAI_API_URL is not provided, we default to Groq Chat Completions endpoint.
+# Поддерживаемые переменные окружения (на сервисе AS):
+#   GROQ_API_KEY  (рекомендуется)
+#   OPENAI_API_KEY (fallback)
+#   Agents        (legacy, как на вашем скрине)
+# Опционально:
+#   OPENAI_MODEL или GROQ_MODEL (например: llama-3.3-70b-versatile)
+#   OPENAI_API_URL (можно указывать базу /v1 или полный /chat/completions)
 
-_LLM_URL = os.getenv("OPENAI_API_URL", "").strip() or "https://api.groq.com/openai/v1/chat/completions"
-_LLM_MODEL = os.getenv("OPENAI_MODEL", "").strip() or "llama-3.3-70b-versatile"
-
-# Prefer explicit Groq key, then OpenAI-style, then legacy "Agents" env var (as in your screenshot).
-_LLM_KEY = (
-    os.getenv("GROQ_API_KEY")
-    or os.getenv("OPENAI_API_KEY")
-    or os.getenv("Agents")
-    or ""
-).strip()
+_DEFAULT_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+_DEFAULT_OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
 
-def _is_chat_completions(url: str) -> bool:
-    u = (url or "").lower()
-    return "/chat/completions" in u
+def _pick_llm_key(provider: str) -> str:
+    provider = (provider or "").strip().lower()
+    # Prefer explicit provider keys, then fallbacks.
+    if provider == "openai":
+        return (os.getenv("OPENAI_API_KEY") or os.getenv("Agents") or "").strip()
+    # default: groq
+    return (os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("Agents") or "").strip()
 
 
-def _extract_chat_completion_text(resp: dict[str, Any]) -> str:
-    choices = resp.get("choices")
-    if isinstance(choices, list) and choices:
-        first = choices[0] if isinstance(choices[0], dict) else None
-        if first:
-            message = first.get("message")
-            if isinstance(message, dict):
-                content = message.get("content")
-                if isinstance(content, str) and content.strip():
-                    return content.strip()
-                # Some providers may return list-like content; try to join.
-                if isinstance(content, list):
-                    parts: list[str] = []
-                    for c in content:
-                        if isinstance(c, str) and c.strip():
-                            parts.append(c.strip())
-                        elif isinstance(c, dict):
-                            text = c.get("text") or c.get("content")
-                            if isinstance(text, str) and text.strip():
-                                parts.append(text.strip())
-                    if parts:
-                        return "\n".join(parts).strip()
-    return ""
+def _pick_llm_model(payload: dict) -> str:
+    # Priority: payload -> GROQ_MODEL/OPENAI_MODEL -> default Groq model
+    m = str((payload or {}).get("llm_model") or "").strip()
+    if m:
+        return m
+    return (os.getenv("GROQ_MODEL") or os.getenv("OPENAI_MODEL") or "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 
 
-def _extract_openai_output_text(resp: dict[str, Any]) -> str:
-    # Some SDKs expose output_text; the REST response typically has output[] with content[].
-    if isinstance(resp.get("output_text"), str) and resp.get("output_text"):
-        return str(resp["output_text"]).strip()
-
-    output = resp.get("output")
-    if isinstance(output, list):
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content")
-            if isinstance(content, list):
-                for c in content:
-                    if isinstance(c, dict) and c.get("type") == "output_text":
-                        text = c.get("text")
-                        if isinstance(text, str) and text.strip():
-                            return text.strip()
-    return ""
+def _pick_llm_provider(payload: dict) -> str:
+    p = str((payload or {}).get("llm_provider") or "").strip().lower()
+    if p:
+        return p
+    return (os.getenv("LLM_PROVIDER") or "groq").strip().lower() or "groq"
 
 
-def _llm_answer(question_ru: str) -> str:
-    """
-    Server-side call to an LLM endpoint.
-    - For Groq use OPENAI-compatible Chat Completions.
-    - For OpenAI you can still use Responses API if OPENAI_API_URL points there.
-    """
-    if not _LLM_KEY:
-        return ""
+def _normalize_llm_url(raw_url: str, provider: str) -> str:
+    url = (raw_url or "").strip()
+    provider = (provider or "").strip().lower() or "groq"
 
-    # Minimal instruction to keep it predictable and safe.
+    if not url:
+        return _DEFAULT_OPENAI_URL if provider == "openai" else _DEFAULT_GROQ_URL
+
+    low = url.lower().rstrip("/")
+
+    # If user passed a base like ".../v1" or ".../openai/v1" → append /chat/completions
+    if low.endswith("/v1") or low.endswith("/openai/v1"):
+        return url.rstrip("/") + "/chat/completions"
+
+    # If points to /responses → rewrite to /chat/completions (Groq doesn't support Responses API)
+    if "/responses" in low and "/chat/completions" not in low:
+        return re.sub(r"/responses.*$", "/chat/completions", url, flags=re.IGNORECASE)
+
+    # If contains provider base but missing /chat/completions
+    if ("groq.com" in low or "api.openai.com" in low) and ("/chat/completions" not in low):
+        return url.rstrip("/") + "/chat/completions"
+
+    return url
+
+
+def _llm_chat_complete(question_ru: str, *, provider: str, model: str, url: str, key: str) -> tuple[str, dict]:
+    # Returns (answer_text, diag). diag is safe (no secrets).
+    if not key:
+        return "", {"ok": False, "error": "missing_api_key", "provider": provider}
+
     system_msg = (
-        "Ты — ассистент в приложении Ozonator Agents Client. "
+        "Ты — ассистент в приложении Ozonator Agents. "
         "Отвечай на русском. Коротко и по делу. "
-        "Если вопрос простой (факт/арифметика/конвертация), дай прямой ответ. "
         "Не упоминай внутренние статусы/агентов/оркестрацию."
     )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": question_ru},
+        ],
+        "temperature": 0.2,
+    }
 
     try:
         import urllib.request as urllib_request
 
-        if _is_chat_completions(_LLM_URL):
-            payload = {
-                "model": _LLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": question_ru},
-                ],
-            }
-        else:
-            # OpenAI Responses API format
-            payload = {
-                "model": _LLM_MODEL,
-                "input": [
-                    {
-                        "role": "developer",
-                        "content": [{"type": "input_text", "text": system_msg}],
-                    },
-                    {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": question_ru}],
-                    },
-                ],
-            }
-
         req = urllib_request.Request(
-            _LLM_URL,
+            url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={
                 "Content-Type": "application/json; charset=utf-8",
-                "Authorization": f"Bearer {_LLM_KEY}",
+                "Authorization": f"Bearer {key}",
             },
             method="POST",
         )
 
         with urllib_request.urlopen(req, timeout=60) as r:
             raw = r.read()
+            status = getattr(r, "status", 200)
 
-        data = json.loads(raw.decode("utf-8"))
+        data = json.loads(raw.decode("utf-8")) if raw else {}
 
-        if _is_chat_completions(_LLM_URL):
-            return _extract_chat_completion_text(data)
+        # OpenAI-compatible Chat Completions parsing
+        text = ""
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            msg = first.get("message") if isinstance(first.get("message"), dict) else {}
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                text = content.strip()
 
-        return _extract_openai_output_text(data)
+        return text, {"ok": bool(text), "http_status": int(status or 0), "provider": provider, "model": model, "url": url}
 
-    except Exception:
-        # No secrets in logs; just silent fallback to heuristic/template.
-        return ""
+    except Exception as e:
+        kind = e.__class__.__name__
+        http_status = None
+        if hasattr(e, "code"):
+            try:
+                http_status = int(getattr(e, "code") or 0)
+            except Exception:
+                http_status = None
+        return "", {"ok": False, "error": kind, "http_status": http_status, "provider": provider, "model": model, "url": url}
 
 
-# Backward compatible alias (old name used by code below)
+def _llm_answer_task(task: dict[str, Any], question_ru: str) -> tuple[str, dict]:
+    payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    provider = _pick_llm_provider(payload)
+    model = _pick_llm_model(payload)
+    env_url = os.getenv("OPENAI_API_URL", "")
+    url = _normalize_llm_url(env_url, provider)
+    key = _pick_llm_key(provider)
+
+    return _llm_chat_complete(question_ru, provider=provider, model=model, url=url, key=key)
+
+
+# Backward compatible alias (old name used by some code)
 def _openai_answer(question_ru: str) -> str:
-    return _llm_answer(question_ru)
+    provider = (os.getenv("LLM_PROVIDER") or "groq").strip().lower() or "groq"
+    model = (os.getenv("GROQ_MODEL") or os.getenv("OPENAI_MODEL") or "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
+    url = _normalize_llm_url(os.getenv("OPENAI_API_URL", ""), provider)
+    key = _pick_llm_key(provider)
+    text, _diag = _llm_chat_complete(question_ru, provider=provider, model=model, url=url, key=key)
+    return text
 
 
 # -------------------------
@@ -368,9 +364,8 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
                 f"Связка между вызовами: {link_text}.",
             ]
         )
-
-    # 1) Try OpenAI (server-side) if configured
-    ai_answer = _openai_answer(main_goal)
+    # 1) LLM (server-side) if configured
+    ai_answer, ai_diag = _llm_answer_task(task, main_goal)
     if ai_answer:
         return ai_answer
 
@@ -379,7 +374,33 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     if heur:
         return heur
 
-    # 3) Previous template fallback
+    # 3) Если LLM не ответил — вернуть понятную причину и 1 следующий шаг
+    if isinstance(ai_diag, dict) and not ai_diag.get('ok'):
+        err = str(ai_diag.get('error') or '').strip()
+        code = ai_diag.get('http_status')
+        if err == 'missing_api_key':
+            return (
+                'Ошибка: на сервере AS не настроен ключ LLM (нет GROQ_API_KEY/OPENAI_API_KEY/Agents). '
+                'Следующий шаг: в Render → ozonator-as-dev → Environment добавь GROQ_API_KEY (рекомендуется) '
+                'или Agents, дождись деплоя.'
+            )
+        if code == 401 or code == 403:
+            return (
+                'Ошибка: LLM отклонил запрос (unauthorized). '
+                'Следующий шаг: в Render → ozonator-as-dev проверь, что GROQ_API_KEY (или Agents) указан верно и без пробелов, дождись деплоя.'
+            )
+        if code == 404:
+            return (
+                'Ошибка: неверный LLM URL (HTTP 404). '
+                'Следующий шаг: в Render → ozonator-as-dev удали/исправь OPENAI_API_URL или поставь https://api.groq.com/openai/v1/chat/completions, дождись деплоя.'
+            )
+        if code == 429:
+            return (
+                'Ошибка: LLM временно перегружен/лимит (HTTP 429). '
+                'Следующий шаг: повтори запрос позже или переключи модель/провайдера.'
+            )
+
+    # 4) Previous template fallback
     parts = [f"Готово. Подготовлено решение по задаче: {main_goal}."]
     if screen and screen != "Не указано":
         parts.append(f"Область: {screen}.")
