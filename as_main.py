@@ -79,8 +79,8 @@ def _normalize_str_list(value: Any) -> list[str]:
 #   OPENAI_MODEL или GROQ_MODEL (например: llama-3.3-70b-versatile)
 #   OPENAI_API_URL (можно указывать базу /v1 или полный /chat/completions)
 
-_DEFAULT_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-_DEFAULT_OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+_DEFAULT_GROQ_URL = "https://api.groq.com/openai/v1"
+_DEFAULT_OPENAI_URL = "https://api.openai.com/v1"
 
 
 def _pick_llm_key(provider: str) -> str:
@@ -427,7 +427,7 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
         # Универсальная подсказка для сервиса AS
         common_next = (
             "Следующий шаг: в Render → ozonator-as-dev → Environment проверь ключ (GROQ_API_KEY или Agents) "
-            "и что OPENAI_API_URL пустой или равен https://api.groq.com/openai/v1/chat/completions; затем дождись деплоя."
+            "и что OPENAI_API_URL пустой или равен https://api.groq.com/openai/v1; затем дождись деплоя."
         )
 
         if err == 'missing_api_key':
