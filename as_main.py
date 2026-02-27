@@ -83,13 +83,53 @@ _DEFAULT_GROQ_URL = "https://api.groq.com/openai/v1"
 _DEFAULT_OPENAI_URL = "https://api.openai.com/v1"
 
 
-def _pick_llm_key(provider: str) -> str:
+def _clean_api_key(raw: str) -> tuple[str, dict]:
+    """Sanitize API key pasted into env.
+
+    - removes leading 'Bearer '
+    - removes surrounding quotes
+    - strips whitespace
+
+    Returns (clean_key, flags)
+    """
+    flags = {"had_bearer": False, "had_quotes": False}
+    s = (raw or "").strip()
+    if not s:
+        return "", flags
+
+    if s.lower().startswith("bearer "):
+        flags["had_bearer"] = True
+        s = s[7:].strip()
+
+    # Remove surrounding quotes if user pasted them
+    if (len(s) >= 2) and ((s[0] == s[-1]) and s[0] in {"\"", "'"}):
+        flags["had_quotes"] = True
+        s = s[1:-1].strip()
+
+    return s, flags
+
+
+def _pick_llm_key(provider: str) -> tuple[str, str, dict]:
+    """Return (key, source_env_name, flags). Never returns the secret in logs."""
     provider = (provider or "").strip().lower()
-    # Prefer explicit provider keys, then fallbacks.
+
+    candidates: list[tuple[str, str]]
     if provider == "openai":
-        return (os.getenv("OPENAI_API_KEY") or os.getenv("Agents") or "").strip()
-    # default: groq
-    return (os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("Agents") or "").strip()
+        candidates = [("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY") or ""), ("Agents", os.getenv("Agents") or "")]
+    else:
+        # default: groq
+        candidates = [
+            ("GROQ_API_KEY", os.getenv("GROQ_API_KEY") or ""),
+            ("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY") or ""),
+            ("Agents", os.getenv("Agents") or ""),
+        ]
+
+    for name, raw in candidates:
+        cleaned, flags = _clean_api_key(raw)
+        if cleaned:
+            return cleaned, name, flags
+
+    return "", "", {"had_bearer": False, "had_quotes": False}
 
 
 def _pick_llm_model(payload: dict) -> str:
@@ -131,10 +171,29 @@ def _normalize_llm_url(raw_url: str, provider: str) -> str:
     return url
 
 
-def _llm_chat_complete(question_ru: str, *, provider: str, model: str, url: str, key: str) -> tuple[str, dict]:
+def _llm_chat_complete(
+    question_ru: str,
+    *,
+    provider: str,
+    model: str,
+    url: str,
+    key: str,
+    key_source: str,
+    key_flags: dict,
+) -> tuple[str, dict]:
     # Returns (answer_text, diag). diag is safe (no secrets).
     if not key:
-        return "", {"ok": False, "error": "missing_api_key", "provider": provider}
+        return "", {"ok": False, "error": "missing_api_key", "provider": provider, "key_source": key_source}
+
+    key_prefix = key[:4] if key else ""
+    key_len = len(key)
+
+    # Quick sanity: users sometimes paste OpenAI keys into Groq.
+    key_kind = "unknown"
+    if key.startswith("gsk_"):
+        key_kind = "groq"
+    elif key.startswith("sk-"):
+        key_kind = "openai"
 
     system_msg = (
         "Ты — ассистент в приложении Ozonator Agents. "
@@ -203,6 +262,11 @@ def _llm_chat_complete(question_ru: str, *, provider: str, model: str, url: str,
                 "model": model,
                 "url": url,
                 "message": err_msg,
+                "key_source": key_source,
+                "key_prefix": key_prefix,
+                "key_len": key_len,
+                "key_kind": key_kind,
+                "key_flags": key_flags or {},
             }
 
         data = json.loads(raw.decode("utf-8")) if raw else {}
@@ -223,7 +287,18 @@ def _llm_chat_complete(question_ru: str, *, provider: str, model: str, url: str,
             if isinstance(t, str) and t.strip():
                 text = t.strip()
 
-        return text, {"ok": bool(text), "http_status": int(status or 0), "provider": provider, "model": model, "url": url}
+        return text, {
+            "ok": bool(text),
+            "http_status": int(status or 0),
+            "provider": provider,
+            "model": model,
+            "url": url,
+            "key_source": key_source,
+            "key_prefix": key_prefix,
+            "key_len": key_len,
+            "key_kind": key_kind,
+            "key_flags": key_flags or {},
+        }
 
     except Exception as e:
         kind = e.__class__.__name__
@@ -233,7 +308,20 @@ def _llm_chat_complete(question_ru: str, *, provider: str, model: str, url: str,
                 http_status = int(getattr(e, "code") or 0)
             except Exception:
                 http_status = None
-        return "", {"ok": False, "error": kind, "http_status": http_status, "provider": provider, "model": model, "url": url, "message": str(e)[:300]}
+        return "", {
+            "ok": False,
+            "error": kind,
+            "http_status": http_status,
+            "provider": provider,
+            "model": model,
+            "url": url,
+            "message": str(e)[:300],
+            "key_source": key_source,
+            "key_prefix": key_prefix,
+            "key_len": key_len,
+            "key_kind": key_kind,
+            "key_flags": key_flags or {},
+        }
 
 def _llm_answer_task(task: dict[str, Any], question_ru: str) -> tuple[str, dict]:
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
@@ -241,9 +329,17 @@ def _llm_answer_task(task: dict[str, Any], question_ru: str) -> tuple[str, dict]
     model = _pick_llm_model(payload)
     env_url = os.getenv("OPENAI_API_URL", "")
     url = _normalize_llm_url(env_url, provider)
-    key = _pick_llm_key(provider)
+    key, key_source, key_flags = _pick_llm_key(provider)
 
-    return _llm_chat_complete(question_ru, provider=provider, model=model, url=url, key=key)
+    return _llm_chat_complete(
+        question_ru,
+        provider=provider,
+        model=model,
+        url=url,
+        key=key,
+        key_source=key_source,
+        key_flags=key_flags,
+    )
 
 
 # Backward compatible alias (old name used by some code)
@@ -251,8 +347,16 @@ def _openai_answer(question_ru: str) -> str:
     provider = (os.getenv("LLM_PROVIDER") or "groq").strip().lower() or "groq"
     model = (os.getenv("GROQ_MODEL") or os.getenv("OPENAI_MODEL") or "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
     url = _normalize_llm_url(os.getenv("OPENAI_API_URL", ""), provider)
-    key = _pick_llm_key(provider)
-    text, _diag = _llm_chat_complete(question_ru, provider=provider, model=model, url=url, key=key)
+    key, key_source, key_flags = _pick_llm_key(provider)
+    text, _diag = _llm_chat_complete(
+        question_ru,
+        provider=provider,
+        model=model,
+        url=url,
+        key=key,
+        key_source=key_source,
+        key_flags=key_flags,
+    )
     return text
 
 
@@ -423,6 +527,31 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
         msg = str(ai_diag.get('message') or '').strip()
         provider = str(ai_diag.get('provider') or '').strip() or 'groq'
         model = str(ai_diag.get('model') or '').strip()
+        key_source = str(ai_diag.get('key_source') or '').strip()
+        key_prefix = str(ai_diag.get('key_prefix') or '').strip()
+        key_len = ai_diag.get('key_len')
+        key_kind = str(ai_diag.get('key_kind') or '').strip()
+        key_flags = ai_diag.get('key_flags') if isinstance(ai_diag.get('key_flags'), dict) else {}
+
+        diag_short = ""
+        try:
+            parts = []
+            if key_source:
+                parts.append(f"key={key_source}")
+            if key_kind:
+                parts.append(f"kind={key_kind}")
+            if key_prefix:
+                parts.append(f"pref={key_prefix}")
+            if isinstance(key_len, int) and key_len > 0:
+                parts.append(f"len={key_len}")
+            if key_flags.get('had_bearer'):
+                parts.append("bearer=1")
+            if key_flags.get('had_quotes'):
+                parts.append("quotes=1")
+            if parts:
+                diag_short = " Диагн.: " + ", ".join(parts) + "."
+        except Exception:
+            diag_short = ""
 
         # Универсальная подсказка для сервиса AS
         common_next = (
@@ -437,9 +566,21 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
             )
 
         if code in (401, 403):
+            # Частая причина: в env лежит OpenAI key (sk-...) вместо Groq (gsk_...)
+            if provider == 'groq' and key_kind == 'openai':
+                return (
+                    "Ошибка: LLM отклонил запрос (unauthorized). "
+                    f"Похоже, в {key_source or 'переменной'} лежит OpenAI-ключ (sk-...), а нужен Groq-ключ (gsk_...)."
+                    + diag_short
+                    + " "
+                    + common_next
+                )
+
             return (
-                "Ошибка: LLM отклонил запрос (unauthorized). "
-                "" + common_next
+                "Ошибка: LLM отклонил запрос (unauthorized)."
+                + diag_short
+                + " "
+                + common_next
             )
 
         if code == 404:
