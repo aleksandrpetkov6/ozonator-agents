@@ -149,10 +149,13 @@ def _llm_chat_complete(question_ru: str, *, provider: str, model: str, url: str,
             {"role": "user", "content": question_ru},
         ],
         "temperature": 0.2,
+        # Groq/OpenAI-compatible параметр. Добавляем, чтобы избежать 400 на некоторых прокси/обвязках.
+        "max_tokens": 512,
     }
 
     try:
         import urllib.request as urllib_request
+        import urllib.error as urllib_error
 
         req = urllib_request.Request(
             url,
@@ -164,9 +167,43 @@ def _llm_chat_complete(question_ru: str, *, provider: str, model: str, url: str,
             method="POST",
         )
 
-        with urllib_request.urlopen(req, timeout=60) as r:
-            raw = r.read()
-            status = getattr(r, "status", 200)
+        try:
+            with urllib_request.urlopen(req, timeout=60) as r:
+                raw = r.read()
+                status = getattr(r, "status", 200)
+        except urllib_error.HTTPError as e:
+            # Read body to understand root cause (still safe — no secrets).
+            status = int(getattr(e, "code", 0) or 0)
+            raw = b""
+            try:
+                raw = e.read() or b""
+            except Exception:
+                raw = b""
+
+            data = {}
+            err_msg = ""
+            try:
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+            except Exception:
+                err_msg = raw.decode("utf-8", errors="replace")[:500] if raw else ""
+
+            if isinstance(data, dict):
+                # OpenAI-style error
+                err = data.get("error")
+                if isinstance(err, dict):
+                    err_msg = str(err.get("message") or err.get("type") or "")[:500]
+                elif isinstance(data.get("detail"), str):
+                    err_msg = str(data.get("detail"))[:500]
+
+            return "", {
+                "ok": False,
+                "error": "HTTPError",
+                "http_status": status,
+                "provider": provider,
+                "model": model,
+                "url": url,
+                "message": err_msg,
+            }
 
         data = json.loads(raw.decode("utf-8")) if raw else {}
 
@@ -180,6 +217,12 @@ def _llm_chat_complete(question_ru: str, *, provider: str, model: str, url: str,
             if isinstance(content, str) and content.strip():
                 text = content.strip()
 
+        # Иногда обвязки кладут ответ в `choices[0].text`
+        if not text and isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            t = choices[0].get("text")
+            if isinstance(t, str) and t.strip():
+                text = t.strip()
+
         return text, {"ok": bool(text), "http_status": int(status or 0), "provider": provider, "model": model, "url": url}
 
     except Exception as e:
@@ -190,8 +233,7 @@ def _llm_chat_complete(question_ru: str, *, provider: str, model: str, url: str,
                 http_status = int(getattr(e, "code") or 0)
             except Exception:
                 http_status = None
-        return "", {"ok": False, "error": kind, "http_status": http_status, "provider": provider, "model": model, "url": url}
-
+        return "", {"ok": False, "error": kind, "http_status": http_status, "provider": provider, "model": model, "url": url, "message": str(e)[:300]}
 
 def _llm_answer_task(task: dict[str, Any], question_ru: str) -> tuple[str, dict]:
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
@@ -378,27 +420,60 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     if isinstance(ai_diag, dict) and not ai_diag.get('ok'):
         err = str(ai_diag.get('error') or '').strip()
         code = ai_diag.get('http_status')
+        msg = str(ai_diag.get('message') or '').strip()
+        provider = str(ai_diag.get('provider') or '').strip() or 'groq'
+        model = str(ai_diag.get('model') or '').strip()
+
+        # Универсальная подсказка для сервиса AS
+        common_next = (
+            "Следующий шаг: в Render → ozonator-as-dev → Environment проверь ключ (GROQ_API_KEY или Agents) "
+            "и что OPENAI_API_URL пустой или равен https://api.groq.com/openai/v1/chat/completions; затем дождись деплоя."
+        )
+
         if err == 'missing_api_key':
             return (
-                'Ошибка: на сервере AS не настроен ключ LLM (нет GROQ_API_KEY/OPENAI_API_KEY/Agents). '
-                'Следующий шаг: в Render → ozonator-as-dev → Environment добавь GROQ_API_KEY (рекомендуется) '
-                'или Agents, дождись деплоя.'
+                "Ошибка: на сервере AS не настроен ключ LLM (нет GROQ_API_KEY/OPENAI_API_KEY/Agents). "
+                "" + common_next
             )
-        if code == 401 or code == 403:
+
+        if code in (401, 403):
             return (
-                'Ошибка: LLM отклонил запрос (unauthorized). '
-                'Следующий шаг: в Render → ozonator-as-dev проверь, что GROQ_API_KEY (или Agents) указан верно и без пробелов, дождись деплоя.'
+                "Ошибка: LLM отклонил запрос (unauthorized). "
+                "" + common_next
             )
+
         if code == 404:
             return (
-                'Ошибка: неверный LLM URL (HTTP 404). '
-                'Следующий шаг: в Render → ozonator-as-dev удали/исправь OPENAI_API_URL или поставь https://api.groq.com/openai/v1/chat/completions, дождись деплоя.'
+                "Ошибка: неверный LLM URL (HTTP 404). "
+                "" + common_next
             )
+
         if code == 429:
             return (
-                'Ошибка: LLM временно перегружен/лимит (HTTP 429). '
-                'Следующий шаг: повтори запрос позже или переключи модель/провайдера.'
+                "Ошибка: лимит/перегрузка LLM (HTTP 429). "
+                "Следующий шаг: повтори запрос позже или временно смени модель на llama-3.1-8b-instant."
             )
+
+        if code == 400:
+            extra = f" ({msg})" if msg else ""
+            return (
+                f"Ошибка: LLM вернул HTTP 400{extra}. "
+                "Следующий шаг: проверь модель (llm_model) и endpoint; для Groq модель должна быть из списка GroqDocs (например llama-3.3-70b-versatile)."
+            )
+
+        # Таймауты/сетевые ошибки
+        if err.lower() in {'timeouterror', 'sockettimeout', 'urlerror'} or (code is None and err):
+            extra = f" ({err}: {msg})" if msg else f" ({err})"
+            return (
+                f"Ошибка: LLM не ответил (сеть/таймаут){extra}. "
+                "Следующий шаг: проверь в Render, что сервис AS имеет доступ в интернет и повтори запрос."
+            )
+
+        extra = f" ({err}{': ' + msg if msg else ''})" if err or msg else ""
+        return (
+            f"Ошибка: LLM не дал ответ{extra}. "
+            + common_next
+        )
 
     # 4) Previous template fallback
     parts = [f"Готово. Подготовлено решение по задаче: {main_goal}."]
