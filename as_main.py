@@ -382,6 +382,96 @@ def _safe_eval_arith(expr: str) -> Optional[float]:
         return None
 
 
+def _parse_ru_number(raw: str) -> Optional[float]:
+    s = (raw or "").strip().lower().replace(" ", "")
+    if not s:
+        return None
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _format_mass_value_kg(total_grams: float) -> str:
+    if total_grams >= 1000:
+        kg = total_grams / 1000.0
+        if abs(kg - round(kg)) < 1e-9:
+            return f"{int(round(kg))} кг"
+        return f"{kg:.3f}".rstrip("0").rstrip(".").replace(".", ",") + " кг"
+    if abs(total_grams - round(total_grams)) < 1e-9:
+        return f"{int(round(total_grams))} г"
+    return f"{total_grams:.3f}".rstrip("0").rstrip(".").replace(".", ",") + " г"
+
+
+def _is_weight_question_text(text: str) -> bool:
+    q_low = (text or "").lower()
+    return any(token in q_low for token in ("вес", "весит", "масса"))
+
+
+def _is_explicit_cm_in_meter_question(q_low: str) -> bool:
+    s = re.sub(r"\s+", " ", q_low)
+    patterns = [
+        r"(?:сколько|чему\s+равн(?:о|а))\s+(?:сантиметр(?:ов|а)?|см)\s+в\s+(?:одном\s+)?метр(?:е|у)\b",
+        r"(?:сколько|чему\s+равн(?:о|а))\s+(?:в\s+)?(?:одном\s+)?метр(?:е|у)\s+(?:сантиметр(?:ов|а)?|см)\b",
+    ]
+    return any(re.search(pattern, s) for pattern in patterns)
+
+
+def _extract_water_mass_grams(q_low: str) -> Optional[float]:
+    if "вод" not in q_low:
+        return None
+
+    volume_match = re.search(
+        r"(\d+(?:[\.,]\d+)?)\s*(?:куб(?:ическ(?:их|ие|ий)?)?\s*сантиметр(?:ов|а)?|см\s*(?:\^\s*3|3|³))",
+        q_low,
+    )
+    if volume_match:
+        value = _parse_ru_number(volume_match.group(1))
+        if value is not None:
+            return value
+
+    liter_match = re.search(r"(\d+(?:[\.,]\d+)?)\s*(?:литр(?:ов|а)?|л)\b", q_low)
+    if liter_match:
+        value = _parse_ru_number(liter_match.group(1))
+        if value is not None:
+            return value * 1000.0
+
+    if re.search(r"\bлитр\s+вод", q_low):
+        return 1000.0
+
+    return None
+
+
+def _extract_sugar_mass_grams(q_low: str) -> Optional[float]:
+    if "сахар" not in q_low:
+        return None
+
+    kg_match = re.search(r"(\d+(?:[\.,]\d+)?)\s*(?:килограмм(?:ов|а)?|кг)\b", q_low)
+    if kg_match:
+        value = _parse_ru_number(kg_match.group(1))
+        if value is not None:
+            return value * 1000.0
+
+    g_match = re.search(r"(\d+(?:[\.,]\d+)?)\s*(?:грамм(?:ов|а)?|гр\.?|г)\b", q_low)
+    if g_match:
+        value = _parse_ru_number(g_match.group(1))
+        if value is not None:
+            return value
+
+    return None
+
+
+def _is_answer_unit_mismatch(question: str, answer: str) -> bool:
+    if not _is_weight_question_text(question):
+        return False
+
+    a_low = (answer or "").lower()
+    has_mass = any(token in a_low for token in ("кг", "килограмм", "грамм", "тонн"))
+    has_length = any(token in a_low for token in ("сантиметр", " см", "см.", "метр", "мм", "дм"))
+    return bool(has_length and not has_mass)
+
+
 def _heuristic_answer(question: str, payload: dict[str, Any] | None = None) -> str:
     q = question.strip()
     if not q:
@@ -429,9 +519,20 @@ def _heuristic_answer(question: str, payload: dict[str, Any] | None = None) -> s
             now_local = datetime.now(timezone.utc) + timedelta(hours=offset)
             return f"Сейчас {now_local.strftime('%H:%M')} {place}."
 
-    # Unit conversion: cm in meter
-    if ("сантиметр" in q_low or "см" in q_low) and ("метр" in q_low or "м" in q_low) and "сколько" in q_low:
-        # Typical: "сколько сантиметров в метре?"
+    # Deterministic mass/volume answers for water and simple mixtures
+    if _is_weight_question_text(q_low):
+        water_mass_grams = _extract_water_mass_grams(q_low)
+        sugar_mass_grams = _extract_sugar_mass_grams(q_low)
+
+        if water_mass_grams is not None and sugar_mass_grams is not None:
+            total_grams = water_mass_grams + sugar_mass_grams
+            return f"Примерно {_format_mass_value_kg(total_grams)}."
+
+        if water_mass_grams is not None:
+            return f"Примерно {_format_mass_value_kg(water_mass_grams)}."
+
+    # Unit conversion: cm in meter (only for explicit length questions)
+    if _is_explicit_cm_in_meter_question(q_low) and not _is_weight_question_text(q_low):
         return "100 сантиметров."
 
     # Nearest star to Earth
@@ -525,12 +626,12 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
 
     # 1) Deterministic local answers for simple questions (faster and more reliable than LLM)
     heur = _heuristic_answer(main_goal, payload)
-    if heur:
+    if heur and not _is_answer_unit_mismatch(main_goal, heur):
         return heur
 
     # 2) Try OpenAI-compatible endpoint (server-side) if configured
     ai_answer = _llm_answer(main_goal, payload)
-    if ai_answer:
+    if ai_answer and not _is_answer_unit_mismatch(main_goal, ai_answer):
         return ai_answer
 
     # 3) Previous template fallback
