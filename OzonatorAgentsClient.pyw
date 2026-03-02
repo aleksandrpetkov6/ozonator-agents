@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib import request, error
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, font as tkfont
 
 
 # =========================
@@ -436,7 +436,15 @@ class App(tk.Tk):
         self.after(int(POLL_INTERVAL_SEC * 1000), self._tick)
 
     def _configure_theme(self):
-        self.option_add("*Font", "Segoe UI 10")
+        self.font_ui_8 = tkfont.Font(family="Segoe UI", size=8)
+        self.font_ui_9 = tkfont.Font(family="Segoe UI", size=9)
+        self.font_ui_10 = tkfont.Font(family="Segoe UI", size=10)
+        self.font_ui_9_bold = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+        self.font_ui_10_bold = tkfont.Font(family="Segoe UI", size=10, weight="bold")
+        self.font_ui_11_bold = tkfont.Font(family="Segoe UI", size=11, weight="bold")
+        self.font_ui_12_bold = tkfont.Font(family="Segoe UI", size=12, weight="bold")
+        self.font_mono_10 = tkfont.Font(family="Consolas", size=10)
+        self.option_add("*Font", self.font_ui_10)
         self.option_add("*Menu.background", TG_PANEL)
         self.option_add("*Menu.foreground", TG_TEXT)
         self.option_add("*Menu.activeBackground", TG_ACCENT)
@@ -452,7 +460,7 @@ class App(tk.Tk):
             text="AA",
             bg=TG_ACCENT,
             fg="#ffffff",
-            font=("Segoe UI", 10, "bold"),
+            font=self.font_ui_10_bold,
             width=3,
             padx=8,
             pady=6,
@@ -466,14 +474,14 @@ class App(tk.Tk):
             text=APP_NAME,
             bg=TG_HEADER,
             fg=TG_TEXT,
-            font=("Segoe UI Semibold", 12),
+            font=self.font_ui_12_bold,
         ).pack(anchor="w")
         tk.Label(
             title_wrap,
             text="Telegram-like тёмный интерфейс",
             bg=TG_HEADER,
             fg=TG_MUTED,
-            font=("Segoe UI", 9),
+            font=self.font_ui_9,
         ).pack(anchor="w", pady=(2, 0))
 
         tk.Button(
@@ -489,7 +497,7 @@ class App(tk.Tk):
             padx=14,
             pady=8,
             cursor="hand2",
-            font=("Segoe UI", 9, "bold"),
+            font=self.font_ui_9_bold,
         ).pack(side="right", padx=16, pady=12)
 
         body = tk.Frame(self, bg=TG_BG)
@@ -504,7 +512,7 @@ class App(tk.Tk):
             text="Диалоги",
             bg=TG_PANEL,
             fg=TG_TEXT,
-            font=("Segoe UI Semibold", 11),
+            font=self.font_ui_11_bold,
         ).pack(anchor="w", padx=14, pady=(14, 10))
 
         list_frame = tk.Frame(left, bg=TG_PANEL)
@@ -521,7 +529,7 @@ class App(tk.Tk):
             relief="flat",
             bd=0,
             highlightthickness=0,
-            font=("Segoe UI", 10),
+            font=self.font_ui_10,
         )
         self.lb.pack(fill="both", expand=True)
         self.lb.bind("<<ListboxSelect>>", self._on_select_history)
@@ -566,7 +574,7 @@ class App(tk.Tk):
             textvariable=self.status_var,
             bg=TG_BG,
             fg=TG_MUTED,
-            font=("Segoe UI", 9),
+            font=self.font_ui_9,
             anchor="w",
         ).pack(fill="x", pady=(0, 10))
 
@@ -586,13 +594,13 @@ class App(tk.Tk):
             bd=0,
             padx=10,
             pady=12,
-            font=("Segoe UI", 10),
+            font=self.font_ui_10,
         )
         self.chat.pack(fill="both", expand=True)
         self.chat.configure(state="disabled")
-        self.chat.tag_configure("aa_ts", foreground=TG_MUTED, font=("Segoe UI", 8), lmargin1=22, lmargin2=22, rmargin=170, spacing1=8)
-        self.chat.tag_configure("user_ts", foreground=TG_MUTED, font=("Segoe UI", 8), justify="right", lmargin1=170, lmargin2=170, rmargin=22, spacing1=8)
-        self.chat.tag_configure("system_ts", foreground=TG_MUTED, font=("Segoe UI", 8), justify="center", lmargin1=120, lmargin2=120, rmargin=120, spacing1=8)
+        self.chat.tag_configure("aa_ts", foreground=TG_MUTED, font=self.font_ui_8, lmargin1=22, lmargin2=22, rmargin=170, spacing1=8)
+        self.chat.tag_configure("user_ts", foreground=TG_MUTED, font=self.font_ui_8, justify="right", lmargin1=170, lmargin2=170, rmargin=22, spacing1=8)
+        self.chat.tag_configure("system_ts", foreground=TG_MUTED, font=self.font_ui_8, justify="center", lmargin1=120, lmargin2=120, rmargin=120, spacing1=8)
         self.chat.tag_configure("aa_msg", foreground=TG_TEXT, background=TG_AA_BG, lmargin1=22, lmargin2=22, rmargin=170, spacing3=8)
         self.chat.tag_configure("user_msg", foreground="#ffffff", background=TG_ME_BG, justify="right", lmargin1=170, lmargin2=170, rmargin=22, spacing3=8)
         self.chat.tag_configure("system_msg", foreground=TG_TEXT, background=TG_SYSTEM_BG, justify="center", lmargin1=120, lmargin2=120, rmargin=120, spacing3=8)
@@ -613,7 +621,7 @@ class App(tk.Tk):
             bd=0,
             padx=12,
             pady=10,
-            font=("Segoe UI", 10),
+            font=self.font_ui_10,
         )
         self.input.pack(side="left", fill="both", expand=True, padx=8, pady=8)
 
@@ -632,7 +640,7 @@ class App(tk.Tk):
             padx=14,
             pady=9,
             cursor="hand2",
-            font=("Segoe UI", 10, "bold"),
+            font=self.font_ui_10_bold,
         ).pack(fill="x")
         tk.Button(
             actions,
@@ -844,7 +852,7 @@ class App(tk.Tk):
             bd=0,
             padx=12,
             pady=12,
-            font=("Consolas", 10),
+            font=self.font_mono_10,
         )
         t.pack(fill="both", expand=True)
         t.insert("1.0", text)
