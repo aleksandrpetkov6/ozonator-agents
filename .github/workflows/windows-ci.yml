@@ -23,10 +23,6 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Prepare folders
-        run: |
-          New-Item -ItemType Directory -Force -Path logs, artifacts | Out-Null
-
       - name: Verify source file exists
         run: |
           if (-not (Test-Path 'OzonatorAgentsClient.pyw')) {
@@ -36,10 +32,12 @@ jobs:
       - name: Install build tool
         id: install
         run: |
-          python -m pip install --upgrade pip *>&1 | Tee-Object -FilePath logs\pip.log
+          $pipLog = Join-Path $env:RUNNER_TEMP 'ozonator-pip.log'
+
+          python -m pip install --upgrade pip *>&1 | Tee-Object -FilePath $pipLog
           if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
 
-          python -m pip install pyinstaller *>&1 | Tee-Object -FilePath logs\pip.log -Append
+          python -m pip install pyinstaller *>&1 | Tee-Object -FilePath $pipLog -Append
           $ok = ($LASTEXITCODE -eq 0)
           "ok=$($ok.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
@@ -48,7 +46,8 @@ jobs:
         if: always() && steps.install.outputs.ok == 'true'
         continue-on-error: true
         run: |
-          python -m py_compile OzonatorAgentsClient.pyw *>&1 | Tee-Object -FilePath logs\syntax.log
+          $syntaxLog = Join-Path $env:RUNNER_TEMP 'ozonator-syntax.log'
+          python -m py_compile OzonatorAgentsClient.pyw *>&1 | Tee-Object -FilePath $syntaxLog
           $ok = ($LASTEXITCODE -eq 0)
           "ok=$($ok.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
@@ -57,6 +56,8 @@ jobs:
         if: always() && steps.install.outputs.ok == 'true'
         continue-on-error: true
         run: |
+          $buildLog = Join-Path $env:RUNNER_TEMP 'ozonator-build.log'
+
           pyinstaller `
             --noconfirm `
             --clean `
@@ -66,33 +67,23 @@ jobs:
             --hidden-import=tkinter `
             --hidden-import=tkinter.ttk `
             --hidden-import=tkinter.messagebox `
-            OzonatorAgentsClient.pyw *>&1 | Tee-Object -FilePath logs\build.log
+            OzonatorAgentsClient.pyw *>&1 | Tee-Object -FilePath $buildLog
 
           $ok = ($LASTEXITCODE -eq 0)
           "ok=$($ok.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Collect artifact
-        id: collect
+      - name: Verify exe exists
         if: always() && steps.build.outputs.ok == 'true'
-        continue-on-error: true
         run: |
           $exe = Join-Path $PWD 'dist\OzonatorAgentsClient.exe'
           if (-not (Test-Path $exe)) {
             throw 'Build completed but dist\\OzonatorAgentsClient.exe not found'
           }
 
-          Copy-Item $exe 'artifacts\OzonatorAgentsClient.exe' -Force
-          Copy-Item 'OzonatorAgentsClient.pyw' 'artifacts\OzonatorAgentsClient.pyw' -Force
-
-      - name: Upload build artifacts
-        if: always()
+      - name: Upload build artifact
+        if: always() && steps.build.outputs.ok == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ozonator-agents-client-windows
-          path: |
-            artifacts\OzonatorAgentsClient.exe
-            artifacts\OzonatorAgentsClient.pyw
-            logs\pip.log
-            logs\syntax.log
-            logs\build.log
-          if-no-files-found: warn
+          path: dist\OzonatorAgentsClient.exe
+          if-no-files-found: error
