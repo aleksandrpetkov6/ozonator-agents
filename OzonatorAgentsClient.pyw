@@ -459,6 +459,7 @@ class App(tk.Tk):
         self.input = tk.Text(bottom, wrap="word", height=5, undo=True, autoseparators=True, maxundo=-1)
         self.input.pack(side="left", fill="both", expand=True)
         self.input.bind("<Return>", self._on_input_return)
+        self.input.bind("<KP_Enter>", self._on_input_return)
         self._build_input_menu()
         self._bind_input_editor_shortcuts()
 
@@ -556,26 +557,66 @@ class App(tk.Tk):
 
     def _bind_input_editor_shortcuts(self):
         bindings = {
-            "<Control-z>": self._input_undo,
-            "<Control-Z>": self._input_undo,
-            "<Control-y>": self._input_redo,
-            "<Control-Y>": self._input_redo,
-            "<Control-x>": self._input_cut,
-            "<Control-X>": self._input_cut,
             "<Shift-Delete>": self._input_cut,
-            "<Control-c>": self._input_copy,
-            "<Control-C>": self._input_copy,
             "<Control-Insert>": self._input_copy,
-            "<Control-v>": self._input_paste,
-            "<Control-V>": self._input_paste,
             "<Shift-Insert>": self._input_paste,
-            "<Control-a>": self._input_select_all,
-            "<Control-A>": self._input_select_all,
             "<F5>": self._input_insert_datetime,
             "<Button-3>": self._show_input_context_menu,
+            "<Control-KeyPress>": self._on_input_control_keypress,
         }
         for sequence, handler in bindings.items():
             self.input.bind(sequence, handler)
+
+    def _resolve_input_ctrl_handler(self, event):
+        control_char = event.char or ""
+        keysym = (event.keysym or "").lower()
+        keycode = getattr(event, "keycode", None)
+
+        char_handlers = {
+            "\x01": self._input_select_all,
+            "\x03": self._input_copy,
+            "\x16": self._input_paste,
+            "\x18": self._input_cut,
+            "\x19": self._input_redo,
+            "\x1a": self._input_undo,
+        }
+        handler = char_handlers.get(control_char)
+        if handler is not None:
+            return handler
+
+        keysym_handlers = {
+            "a": self._input_select_all,
+            "c": self._input_copy,
+            "v": self._input_paste,
+            "x": self._input_cut,
+            "y": self._input_redo,
+            "z": self._input_undo,
+            "cyrillic_ef": self._input_select_all,
+            "cyrillic_es": self._input_copy,
+            "cyrillic_em": self._input_paste,
+            "cyrillic_che": self._input_cut,
+            "cyrillic_en": self._input_redo,
+            "cyrillic_ya": self._input_undo,
+        }
+        handler = keysym_handlers.get(keysym)
+        if handler is not None:
+            return handler
+
+        keycode_handlers = {
+            65: self._input_select_all,
+            67: self._input_copy,
+            86: self._input_paste,
+            88: self._input_cut,
+            89: self._input_redo,
+            90: self._input_undo,
+        }
+        return keycode_handlers.get(keycode)
+
+    def _on_input_control_keypress(self, event):
+        handler = self._resolve_input_ctrl_handler(event)
+        if handler is None:
+            return None
+        return handler(event)
 
     def _focus_input(self):
         try:
