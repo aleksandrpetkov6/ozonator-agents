@@ -456,9 +456,11 @@ class App(tk.Tk):
         bottom = ttk.Frame(right)
         bottom.pack(fill="x", pady=(8, 0))
 
-        self.input = tk.Text(bottom, wrap="word", height=5)
+        self.input = tk.Text(bottom, wrap="word", height=5, undo=True, autoseparators=True, maxundo=-1)
         self.input.pack(side="left", fill="both", expand=True)
         self.input.bind("<Return>", self._on_input_return)
+        self._build_input_menu()
+        self._bind_input_editor_shortcuts()
 
         actions = ttk.Frame(bottom)
         actions.pack(side="left", padx=(8, 0))
@@ -539,8 +541,150 @@ class App(tk.Tk):
         self._append("AA", text)
 
     # ---------- actions ----------
+    def _build_input_menu(self):
+        self.input_menu = tk.Menu(self, tearoff=0)
+        self.input_menu.add_command(label="Отменить", command=self._input_undo)
+        self.input_menu.add_command(label="Повторить", command=self._input_redo)
+        self.input_menu.add_separator()
+        self.input_menu.add_command(label="Вырезать", command=self._input_cut)
+        self.input_menu.add_command(label="Копировать", command=self._input_copy)
+        self.input_menu.add_command(label="Вставить", command=self._input_paste)
+        self.input_menu.add_command(label="Удалить", command=self._input_delete_selection)
+        self.input_menu.add_separator()
+        self.input_menu.add_command(label="Выделить всё", command=self._input_select_all)
+        self.input_menu.add_command(label="Дата/время", command=self._input_insert_datetime)
+
+    def _bind_input_editor_shortcuts(self):
+        bindings = {
+            "<Control-z>": self._input_undo,
+            "<Control-Z>": self._input_undo,
+            "<Control-y>": self._input_redo,
+            "<Control-Y>": self._input_redo,
+            "<Control-x>": self._input_cut,
+            "<Control-X>": self._input_cut,
+            "<Shift-Delete>": self._input_cut,
+            "<Control-c>": self._input_copy,
+            "<Control-C>": self._input_copy,
+            "<Control-Insert>": self._input_copy,
+            "<Control-v>": self._input_paste,
+            "<Control-V>": self._input_paste,
+            "<Shift-Insert>": self._input_paste,
+            "<Control-a>": self._input_select_all,
+            "<Control-A>": self._input_select_all,
+            "<F5>": self._input_insert_datetime,
+            "<Button-3>": self._show_input_context_menu,
+        }
+        for sequence, handler in bindings.items():
+            self.input.bind(sequence, handler)
+
+    def _focus_input(self):
+        try:
+            self.input.focus_set()
+        except Exception:
+            pass
+
+    def _has_input_selection(self) -> bool:
+        try:
+            return bool(self.input.tag_ranges("sel"))
+        except tk.TclError:
+            return False
+
+    def _can_paste_to_input(self) -> bool:
+        try:
+            return bool(self.clipboard_get())
+        except tk.TclError:
+            return False
+
+    def _update_input_menu_state(self):
+        has_text = bool(self.input.get("1.0", "end-1c"))
+        has_selection = self._has_input_selection()
+        can_paste = self._can_paste_to_input()
+
+        self.input_menu.entryconfigure(0, state="normal")
+        self.input_menu.entryconfigure(1, state="normal")
+        self.input_menu.entryconfigure(3, state=("normal" if has_selection else "disabled"))
+        self.input_menu.entryconfigure(4, state=("normal" if has_selection else "disabled"))
+        self.input_menu.entryconfigure(5, state=("normal" if can_paste else "disabled"))
+        self.input_menu.entryconfigure(6, state=("normal" if has_selection else "disabled"))
+        self.input_menu.entryconfigure(8, state=("normal" if has_text else "disabled"))
+        self.input_menu.entryconfigure(9, state="normal")
+
+    def _show_input_context_menu(self, event=None):
+        self._focus_input()
+        self._update_input_menu_state()
+        if event is None:
+            return "break"
+        try:
+            self.input_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.input_menu.grab_release()
+        return "break"
+
     def _clear_input(self):
         self.input.delete("1.0", tk.END)
+
+    def _input_undo(self, event=None):
+        self._focus_input()
+        try:
+            self.input.edit_undo()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _input_redo(self, event=None):
+        self._focus_input()
+        try:
+            self.input.edit_redo()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _input_cut(self, event=None):
+        self._focus_input()
+        try:
+            self.input.event_generate("<<Cut>>")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _input_copy(self, event=None):
+        self._focus_input()
+        try:
+            self.input.event_generate("<<Copy>>")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _input_paste(self, event=None):
+        self._focus_input()
+        try:
+            self.input.event_generate("<<Paste>>")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _input_delete_selection(self, event=None):
+        self._focus_input()
+        try:
+            if self._has_input_selection():
+                self.input.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _input_select_all(self, event=None):
+        self._focus_input()
+        end_index = "end-1c"
+        self.input.tag_add("sel", "1.0", end_index)
+        self.input.mark_set(tk.INSERT, end_index)
+        self.input.see(tk.INSERT)
+        return "break"
+
+    def _input_insert_datetime(self, event=None):
+        self._focus_input()
+        stamp = datetime.now().strftime("%H:%M %d.%m.%Y")
+        self.input.insert(tk.INSERT, stamp)
+        return "break"
 
     def _on_input_return(self, event):
         if event.state & 0x0001:
