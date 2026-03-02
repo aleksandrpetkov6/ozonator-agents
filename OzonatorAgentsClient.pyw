@@ -52,6 +52,10 @@ HISTORY_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Ozonator
 HISTORY_FILE = HISTORY_DIR / "history.json"
 LOG_FILE = HISTORY_DIR / "client.log"
 
+MAX_CONTEXT_MESSAGES = 20
+MAX_CONTEXT_CHARS = 6000
+MAX_CONTEXT_ITEM_CHARS = 1200
+
 POLL_INTERVAL_SEC = 1.0
 HTTP_TIMEOUT_SEC = 60
 RUN_TASK_TIMEOUT_SEC = 10  # короткий "пинок" оркестрации — дальше работаем polling'ом
@@ -239,7 +243,21 @@ class AAClient:
     def _prefixes(self) -> List[str]:
         return ["", "/api", "/v1"]
 
-    def create_task(self, user_text: str) -> int:
+    def create_task(self, user_text: str, conversation_history: Optional[List[Dict[str, str]]] = None) -> int:
+        history_payload: List[Dict[str, str]] = []
+        for item in (conversation_history or []):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            if role not in ("user", "assistant"):
+                continue
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            history_payload.append({"role": role, "content": content[:MAX_CONTEXT_ITEM_CHARS]})
+        if len(history_payload) > MAX_CONTEXT_MESSAGES:
+            history_payload = history_payload[-MAX_CONTEXT_MESSAGES:]
+
         body = {
             "target_agent": "AA",
             "task_type": "user_task",
@@ -249,6 +267,9 @@ class AAClient:
                 "llm_provider": DEFAULT_LLM_PROVIDER,
                 "llm_model": DEFAULT_LLM_MODEL,
                 "client_meta": {"source": "desktop", "client": "OzonatorAgentsClient"},
+                "conversation_enabled": True,
+                "conversation_history": history_payload,
+                "conversation_turns": len(history_payload),
             },
         }
 
@@ -408,6 +429,9 @@ class App(tk.Tk):
         self._poll_inflight = False
         self._poll_generation = 0
         self._shown_messages = set()
+        self.dialog_messages: List[Dict[str, str]] = []
+        self._conversation_task_ids = set()
+        self._assistant_turn_keys = set()
         self._stop = False
 
         self._load_history()
@@ -638,6 +662,50 @@ class App(tk.Tk):
         self._shown_messages.add(key)
         self._append(who, text)
 
+    def _clip_context_text(self, text: str, limit: int = MAX_CONTEXT_ITEM_CHARS) -> str:
+        clean = re.sub(r"\s+", " ", (text or "").strip())
+        return clean[:limit]
+
+    def _build_conversation_history(self, limit: int = MAX_CONTEXT_MESSAGES, max_chars: int = MAX_CONTEXT_CHARS) -> List[Dict[str, str]]:
+        prepared: List[Dict[str, str]] = []
+        total = 0
+        for item in reversed(self.dialog_messages):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            if role not in ("user", "assistant"):
+                continue
+            content = self._clip_context_text(str(item.get("content") or ""))
+            if not content:
+                continue
+            projected = total + len(content)
+            if prepared and projected > max_chars:
+                break
+            prepared.append({"role": role, "content": content})
+            total = projected
+            if len(prepared) >= limit:
+                break
+        prepared.reverse()
+        return prepared
+
+    def _remember_user_turn(self, text: str):
+        content = self._clip_context_text(text)
+        if not content:
+            return
+        self.dialog_messages.append({"role": "user", "content": content})
+
+    def _remember_assistant_turn(self, task_id: int, scope: str, text: str):
+        content = self._clip_context_text(text)
+        if not content:
+            return
+        key = (int(task_id or 0), str(scope), content)
+        if key in self._assistant_turn_keys:
+            return
+        self._assistant_turn_keys.add(key)
+        if int(task_id or 0) not in self._conversation_task_ids:
+            return
+        self.dialog_messages.append({"role": "assistant", "content": content})
+
     # ---------- history ----------
     def _load_history(self):
         data = _json_load(HISTORY_FILE, [])
@@ -690,10 +758,14 @@ class App(tk.Tk):
             return
         if messagebox.askyesno("Подтверждение", "Очистить всю историю?"):
             self.items = []
+            self.dialog_messages = []
+            self._conversation_task_ids.clear()
+            self._assistant_turn_keys.clear()
+            self._shown_messages.clear()
             self._save_history()
             self._refresh_history_list()
             self.current_task_id = None
-            self._append_system("История очищена.")
+            self._append_system("История очищена. Контекст диалога сброшен.")
 
     # ---------- chat ----------
     def _append(self, who: str, text: str):
@@ -726,13 +798,14 @@ class App(tk.Tk):
         user_text = self.input.get("1.0", tk.END).strip()
         if not user_text:
             return
+        history_snapshot = self._build_conversation_history()
         self._clear_input()
         self._append_user(user_text)
         self.status_var.set("Отправка задачи…")
 
         def worker():
             try:
-                task_id = self.client.create_task(user_text)
+                task_id = self.client.create_task(user_text, history_snapshot)
                 # store task
                 it = TaskItem(
                     id=task_id,
@@ -746,7 +819,7 @@ class App(tk.Tk):
                 self.items.insert(0, it)
                 self._save_history()
 
-                self.q.put(("task_created", task_id, it))
+                self.q.put(("task_created", task_id, it, user_text))
                 # kick orchestration (non-fatal)
                 try:
                     self.client.run_task_kick(task_id)
@@ -842,7 +915,9 @@ class App(tk.Tk):
             return
 
         if kind == "task_created":
-            _, task_id, it = msg
+            _, task_id, it, user_text = msg
+            self._conversation_task_ids.add(int(task_id))
+            self._remember_user_turn(user_text)
             self.current_task_id = task_id
             self._refresh_history_list()
             self.lb.selection_clear(0, tk.END)
@@ -898,12 +973,14 @@ class App(tk.Tk):
             qtxt = extract_question_to_user(task)
             if qtxt and st_upper == "REVIEW_NEEDS_ATTENTION":
                 self._append_unique("question", "AA", qtxt)
+                self._remember_assistant_turn(task_id, "question", qtxt)
 
             # show final answer if done
             if st_upper == "DONE":
                 ans = extract_final_answer(task)
                 if ans:
                     self._append_unique("final", "AA", ans)
+                    self._remember_assistant_turn(task_id, "final", ans)
                 else:
                     # if DONE but empty — show minimal info
                     self._append_unique("final_empty", "AA", "Готово. Финальный ответ пустой (проверь логи задачи).")

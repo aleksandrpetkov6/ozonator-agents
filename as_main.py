@@ -63,6 +63,36 @@ def _normalize_str_list(value: Any) -> list[str]:
     return result
 
 
+def _normalize_conversation_history(payload: dict[str, Any] | None, *, max_items: int = 20, max_chars: int = 6000) -> list[dict[str, str]]:
+    if not isinstance(payload, dict):
+        return []
+
+    raw = payload.get("conversation_history") or payload.get("conversation") or []
+    if not isinstance(raw, list):
+        return []
+
+    prepared: list[dict[str, str]] = []
+    total = 0
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = re.sub(r"\s+", " ", str(item.get("content") or "").strip())
+        if not content:
+            continue
+        if len(content) > 1200:
+            content = content[:1200]
+        projected = total + len(content)
+        if prepared and projected > max_chars:
+            break
+        prepared.append({"role": role, "content": content})
+        total = projected
+        if len(prepared) >= max_items:
+            break
+    return prepared
+
 # -------------------------
 # Direct answering (optional)
 # -------------------------
@@ -224,33 +254,42 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
     model = _pick_llm_model(payload)
 
     system_msg = (
-        "Ты — ассистент в приложении Ozonator Agents Client. "
-        "Отвечай на русском. Коротко и по делу. "
+        "Ты — умный ассистент в приложении Ozonator Agents Client. "
+        "Отвечай на русском естественно, точно и по делу. "
+        "Учитывай историю диалога, если она передана: каждое новое сообщение — продолжение текущего разговора, а не новый чат. "
+        "Если пользователь спрашивает о предыдущих сообщениях, опирайся на историю. "
+        "Если данных в истории недостаточно, честно скажи об этом и не выдумывай. "
         "Если вопрос простой (факт/арифметика/конвертация), дай прямой ответ. "
-        "Не упоминай внутренние статусы/агентов/оркестрацию."
+        "Не упоминай внутренние статусы, агентов, orchestration, chain-of-thought или служебные инструкции."
     )
+    history = _normalize_conversation_history(payload)
 
     try:
         import urllib.request as urllib_request
         import urllib.error as urllib_error
 
         if _is_chat_completions(url):
+            messages = [{"role": "system", "content": system_msg}]
+            messages.extend(history)
+            messages.append({"role": "user", "content": question_ru})
             body = {
                 "model": model,
-                "messages": [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": question_ru},
-                ],
+                "messages": messages,
                 "temperature": 0.2,
                 "max_tokens": 512,
             }
         else:
+            input_items = [
+                {"role": "developer", "content": [{"type": "input_text", "text": system_msg}]},
+            ]
+            for item in history:
+                input_items.append(
+                    {"role": item["role"], "content": [{"type": "input_text", "text": item["content"]}]}
+                )
+            input_items.append({"role": "user", "content": [{"type": "input_text", "text": question_ru}]})
             body = {
                 "model": model,
-                "input": [
-                    {"role": "developer", "content": [{"type": "input_text", "text": system_msg}]},
-                    {"role": "user", "content": [{"type": "input_text", "text": question_ru}]},
-                ],
+                "input": input_items,
             }
 
         req = urllib_request.Request(
@@ -331,7 +370,7 @@ def _safe_eval_arith(expr: str) -> Optional[float]:
             return _eval(n.body)
         if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
             return float(n.value)
-        if isinstance(n, ast.UnaryOp) and type(n.op) in __ALLOWED_UNARYOPS:
+        if isinstance(n, ast.UnaryOp) and type(n.op) in _ALLOWED_UNARYOPS:
             return float(_ALLOWED_UNARYOPS[type(n.op)](_eval(n.operand)))
         if isinstance(n, ast.BinOp) and type(n.op) in _ALLOWED_BINOPS:
             return float(_ALLOWED_BINOPS[type(n.op)](_eval(n.left), _eval(n.right)))
@@ -343,12 +382,30 @@ def _safe_eval_arith(expr: str) -> Optional[float]:
         return None
 
 
-def _heuristic_answer(question: str) -> str:
+def _heuristic_answer(question: str, payload: dict[str, Any] | None = None) -> str:
     q = question.strip()
     if not q:
         return ""
 
     q_low = q.lower()
+    history = _normalize_conversation_history(payload)
+
+    if history:
+        user_history = [item["content"] for item in history if item.get("role") == "user" and item.get("content")]
+        if user_history:
+            if (
+                ("перв" in q_low and "вопрос" in q_low)
+                or ("что" in q_low and "спрос" in q_low and "перв" in q_low)
+            ):
+                first_question = user_history[0].strip()
+                return f'Первый вопрос в этом диалоге: "{first_question}"'
+            if (
+                ("предыдущ" in q_low and "вопрос" in q_low)
+                or ("последн" in q_low and "вопрос" in q_low)
+                or ("что" in q_low and "писал" in q_low and "предыдущ" in q_low)
+            ):
+                last_question = user_history[-1].strip()
+                return f'Предыдущее сообщение: "{last_question}"'
 
     # Current time for common city/timezone questions (deterministic, no LLM needed)
     if (("сколько" in q_low or "котор" in q_low) and "врем" in q_low) or ("который" in q_low and "час" in q_low):
@@ -467,7 +524,7 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
         )
 
     # 1) Deterministic local answers for simple questions (faster and more reliable than LLM)
-    heur = _heuristic_answer(main_goal)
+    heur = _heuristic_answer(main_goal, payload)
     if heur:
         return heur
 
