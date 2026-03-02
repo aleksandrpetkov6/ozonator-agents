@@ -57,6 +57,21 @@ HTTP_TIMEOUT_SEC = 60
 RUN_TASK_TIMEOUT_SEC = 10  # короткий "пинок" оркестрации — дальше работаем polling'ом
 CREATE_RETRIES = 4
 
+# Telegram-like UI palette
+TG_BG = "#0f1720"
+TG_PANEL = "#17212b"
+TG_PANEL_ALT = "#1f2c3a"
+TG_HEADER = "#182533"
+TG_BORDER = "#22303d"
+TG_TEXT = "#e6edf3"
+TG_MUTED = "#8ea2b5"
+TG_ACCENT = "#2aabee"
+TG_ACCENT_HOVER = "#48b8f2"
+TG_ME_BG = "#2b5278"
+TG_AA_BG = "#1f2c3a"
+TG_SYSTEM_BG = "#22303d"
+TG_INPUT_BG = "#17212b"
+
 
 # =========================
 # Helpers
@@ -395,8 +410,14 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1180x720")
-        self.minsize(980, 620)
+        self.geometry("1280x800")
+        self.minsize(1040, 680)
+        self.configure(bg=TG_BG)
+        try:
+            self.state("zoomed")
+        except Exception:
+            pass
+        self._configure_theme()
 
         self.q = queue.Queue()
         self.client = AAClient(DEFAULT_BASE_URL)
@@ -405,238 +426,228 @@ class App(tk.Tk):
         self.current_task_id: Optional[int] = None
         self.last_status: Optional[str] = None
         self._polling = False
-        self._poll_inflight = False
-        self._poll_generation = 0
-        self._shown_messages = set()
         self._stop = False
 
         self._load_history()
         self._build_ui()
         self._refresh_history_list()
-        self.after(30, self._maximize_window)
 
         self.after(200, self._drain_queue)
         self.after(int(POLL_INTERVAL_SEC * 1000), self._tick)
 
+    def _configure_theme(self):
+        self.option_add("*Font", "Segoe UI 10")
+        self.option_add("*Menu.background", TG_PANEL)
+        self.option_add("*Menu.foreground", TG_TEXT)
+        self.option_add("*Menu.activeBackground", TG_ACCENT)
+        self.option_add("*Menu.activeForeground", "#ffffff")
+
     def _build_ui(self):
-        # top bar
-        top = ttk.Frame(self)
-        top.pack(fill="x", padx=10, pady=8)
+        header = tk.Frame(self, bg=TG_HEADER, height=64)
+        header.pack(fill="x")
+        header.pack_propagate(False)
 
-        ttk.Label(top, text=APP_NAME, font=("Segoe UI", 12, "bold")).pack(side="left")
+        avatar = tk.Label(
+            header,
+            text="AA",
+            bg=TG_ACCENT,
+            fg="#ffffff",
+            font=("Segoe UI", 10, "bold"),
+            width=3,
+            padx=8,
+            pady=6,
+        )
+        avatar.pack(side="left", padx=(16, 12), pady=10)
 
-        ttk.Button(top, text="Логи", command=self._show_logs).pack(side="right")
+        title_wrap = tk.Frame(header, bg=TG_HEADER)
+        title_wrap.pack(side="left", fill="y", pady=10)
+        tk.Label(
+            title_wrap,
+            text=APP_NAME,
+            bg=TG_HEADER,
+            fg=TG_TEXT,
+            font=("Segoe UI Semibold", 12),
+        ).pack(anchor="w")
+        tk.Label(
+            title_wrap,
+            text="Telegram-like тёмный интерфейс",
+            bg=TG_HEADER,
+            fg=TG_MUTED,
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(2, 0))
 
-        # body
-        body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        tk.Button(
+            header,
+            text="≡ Логи",
+            command=self._show_logs,
+            bg=TG_PANEL_ALT,
+            fg=TG_TEXT,
+            activebackground=TG_BORDER,
+            activeforeground=TG_TEXT,
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=8,
+            cursor="hand2",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="right", padx=16, pady=12)
 
-        # left: history
-        left = ttk.Frame(body, width=240)
+        body = tk.Frame(self, bg=TG_BG)
+        body.pack(fill="both", expand=True, padx=14, pady=14)
+
+        left = tk.Frame(body, bg=TG_PANEL, width=300, bd=0, highlightthickness=1, highlightbackground=TG_BORDER)
         left.pack(side="left", fill="y")
-        ttk.Label(left, text="История", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+        left.pack_propagate(False)
 
-        self.lb = tk.Listbox(left, height=25)
+        tk.Label(
+            left,
+            text="Диалоги",
+            bg=TG_PANEL,
+            fg=TG_TEXT,
+            font=("Segoe UI Semibold", 11),
+        ).pack(anchor="w", padx=14, pady=(14, 10))
+
+        list_frame = tk.Frame(left, bg=TG_PANEL)
+        list_frame.pack(fill="both", expand=True, padx=10)
+
+        self.lb = tk.Listbox(
+            list_frame,
+            height=25,
+            bg=TG_PANEL_ALT,
+            fg=TG_TEXT,
+            selectbackground=TG_ACCENT,
+            selectforeground="#ffffff",
+            activestyle="none",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            font=("Segoe UI", 10),
+        )
         self.lb.pack(fill="both", expand=True)
         self.lb.bind("<<ListboxSelect>>", self._on_select_history)
 
-        btns = ttk.Frame(left)
-        btns.pack(fill="x", pady=6)
-        ttk.Button(btns, text="Удалить", command=self._delete_selected).pack(side="left")
-        ttk.Button(btns, text="Очистить", command=self._clear_history).pack(side="right")
+        btns = tk.Frame(left, bg=TG_PANEL)
+        btns.pack(fill="x", padx=10, pady=10)
+        tk.Button(
+            btns,
+            text="Удалить",
+            command=self._delete_selected,
+            bg=TG_PANEL_ALT,
+            fg=TG_TEXT,
+            activebackground=TG_BORDER,
+            activeforeground=TG_TEXT,
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=8,
+            cursor="hand2",
+        ).pack(side="left")
+        tk.Button(
+            btns,
+            text="Очистить",
+            command=self._clear_history,
+            bg=TG_PANEL_ALT,
+            fg=TG_TEXT,
+            activebackground=TG_BORDER,
+            activeforeground=TG_TEXT,
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=8,
+            cursor="hand2",
+        ).pack(side="right")
 
-        # right: chat
-        right = ttk.Frame(body)
-        right.pack(side="left", fill="both", expand=True, padx=(12, 0))
+        right = tk.Frame(body, bg=TG_BG)
+        right.pack(side="left", fill="both", expand=True, padx=(14, 0))
 
         self.status_var = tk.StringVar(value="Готово к работе. Введите задачу и нажмите «Отправить».")
-        ttk.Label(right, textvariable=self.status_var).pack(anchor="w", pady=(0, 6))
+        tk.Label(
+            right,
+            textvariable=self.status_var,
+            bg=TG_BG,
+            fg=TG_MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
 
-        self.chat = tk.Text(right, wrap="word", height=20)
+        chat_wrap = tk.Frame(right, bg=TG_BG, bd=0, highlightthickness=1, highlightbackground=TG_BORDER)
+        chat_wrap.pack(fill="both", expand=True)
+
+        self.chat = tk.Text(
+            chat_wrap,
+            wrap="word",
+            height=20,
+            bg=TG_BG,
+            fg=TG_TEXT,
+            insertbackground=TG_TEXT,
+            selectbackground=TG_ACCENT,
+            selectforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=12,
+            font=("Segoe UI", 10),
+        )
         self.chat.pack(fill="both", expand=True)
         self.chat.configure(state="disabled")
+        self.chat.tag_configure("aa_ts", foreground=TG_MUTED, font=("Segoe UI", 8), lmargin1=22, lmargin2=22, rmargin=170, spacing1=8)
+        self.chat.tag_configure("user_ts", foreground=TG_MUTED, font=("Segoe UI", 8), justify="right", lmargin1=170, lmargin2=170, rmargin=22, spacing1=8)
+        self.chat.tag_configure("system_ts", foreground=TG_MUTED, font=("Segoe UI", 8), justify="center", lmargin1=120, lmargin2=120, rmargin=120, spacing1=8)
+        self.chat.tag_configure("aa_msg", foreground=TG_TEXT, background=TG_AA_BG, lmargin1=22, lmargin2=22, rmargin=170, spacing3=8)
+        self.chat.tag_configure("user_msg", foreground="#ffffff", background=TG_ME_BG, justify="right", lmargin1=170, lmargin2=170, rmargin=22, spacing3=8)
+        self.chat.tag_configure("system_msg", foreground=TG_TEXT, background=TG_SYSTEM_BG, justify="center", lmargin1=120, lmargin2=120, rmargin=120, spacing3=8)
 
-        # input
-        bottom = ttk.Frame(right)
-        bottom.pack(fill="x", pady=(8, 0))
+        bottom = tk.Frame(right, bg=TG_PANEL, bd=0, highlightthickness=1, highlightbackground=TG_BORDER)
+        bottom.pack(fill="x", pady=(12, 0))
 
-        self.input = tk.Text(bottom, wrap="word", height=5, undo=True, autoseparators=True, maxundo=-1)
-        self.input.pack(side="left", fill="both", expand=True)
-        self.input.bind("<Return>", self._on_input_return)
-        self.input.bind("<KP_Enter>", self._on_input_return)
-        self.input.bind("<Control-KeyPress>", self._on_input_ctrl_key)
-        self.input.bind("<Control-Insert>", self._on_copy_only)
-        self.input.bind("<Shift-Insert>", self._on_paste_only)
-        self.input.bind("<Shift-Delete>", self._on_cut_only)
-        self.input.bind("<F5>", self._on_insert_datetime)
-        self.input.bind("<Button-3>", self._show_input_context_menu)
-        self._build_input_context_menu()
+        self.input = tk.Text(
+            bottom,
+            wrap="word",
+            height=4,
+            bg=TG_INPUT_BG,
+            fg=TG_TEXT,
+            insertbackground=TG_TEXT,
+            selectbackground=TG_ACCENT,
+            selectforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=10,
+            font=("Segoe UI", 10),
+        )
+        self.input.pack(side="left", fill="both", expand=True, padx=8, pady=8)
 
-        actions = ttk.Frame(bottom)
-        actions.pack(side="left", padx=(8, 0))
-        ttk.Button(actions, text="Отправить", command=self._send).pack(fill="x")
-        ttk.Button(actions, text="Очистить", command=self._clear_input).pack(fill="x", pady=(6, 0))
-
-    def _maximize_window(self):
-        try:
-            self.state("zoomed")
-            return
-        except Exception:
-            pass
-        try:
-            self.attributes("-zoomed", True)
-            return
-        except Exception:
-            pass
-        try:
-            sw = self.winfo_screenwidth()
-            sh = self.winfo_screenheight()
-            self.geometry(f"{sw}x{sh}+0+0")
-        except Exception:
-            pass
-
-    def _build_input_context_menu(self):
-        self.input_menu = tk.Menu(self, tearoff=0)
-        self.input_menu.add_command(label="Отменить", command=self._input_undo)
-        self.input_menu.add_command(label="Повторить", command=self._input_redo)
-        self.input_menu.add_separator()
-        self.input_menu.add_command(label="Вырезать", command=self._input_cut)
-        self.input_menu.add_command(label="Копировать", command=self._input_copy)
-        self.input_menu.add_command(label="Вставить", command=self._input_paste)
-        self.input_menu.add_command(label="Удалить", command=self._input_delete_selection)
-        self.input_menu.add_separator()
-        self.input_menu.add_command(label="Выделить всё", command=self._input_select_all)
-        self.input_menu.add_command(label="Дата/время", command=self._insert_datetime)
-
-    def _show_input_context_menu(self, event):
-        try:
-            self.input.focus_set()
-            self.input_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            try:
-                self.input_menu.grab_release()
-            except Exception:
-                pass
-        return "break"
-
-    def _input_undo(self):
-        try:
-            self.input.edit_undo()
-        except Exception:
-            pass
-
-    def _input_redo(self):
-        try:
-            self.input.edit_redo()
-        except Exception:
-            pass
-
-    def _input_copy(self):
-        try:
-            self.input.event_generate("<<Copy>>")
-        except Exception:
-            pass
-
-    def _input_cut(self):
-        try:
-            self.input.event_generate("<<Cut>>")
-        except Exception:
-            pass
-
-    def _input_paste(self):
-        try:
-            self.input.event_generate("<<Paste>>")
-        except Exception:
-            pass
-
-    def _input_delete_selection(self):
-        try:
-            if self.input.tag_ranges("sel"):
-                self.input.delete("sel.first", "sel.last")
-        except Exception:
-            pass
-
-    def _input_select_all(self):
-        try:
-            self.input.focus_set()
-            self.input.tag_add("sel", "1.0", "end-1c")
-            self.input.mark_set("insert", "1.0")
-            self.input.see("insert")
-        except Exception:
-            pass
-
-    def _insert_datetime(self):
-        try:
-            self.input.insert(tk.INSERT, datetime.now().strftime("%H:%M %d.%m.%Y"))
-        except Exception:
-            pass
-
-    def _on_insert_datetime(self, _event=None):
-        self._insert_datetime()
-        return "break"
-
-    def _on_copy_only(self, _event=None):
-        self._input_copy()
-        return "break"
-
-    def _on_paste_only(self, _event=None):
-        self._input_paste()
-        return "break"
-
-    def _on_cut_only(self, _event=None):
-        self._input_cut()
-        return "break"
-
-    def _ctrl_action_from_event(self, event) -> str:
-        keycode_map = {
-            65: "select_all",
-            67: "copy",
-            86: "paste",
-            88: "cut",
-            89: "redo",
-            90: "undo",
-        }
-        action = keycode_map.get(int(getattr(event, "keycode", 0) or 0))
-        if action:
-            return action
-        keysym = str(getattr(event, "keysym", "") or "").lower()
-        char = str(getattr(event, "char", "") or "").lower()
-        alias = {
-            "a": "select_all", "c": "copy", "v": "paste", "x": "cut", "y": "redo", "z": "undo",
-            "ф": "select_all", "с": "copy", "м": "paste", "ч": "cut", "н": "redo", "я": "undo",
-        }
-        return alias.get(char) or alias.get(keysym) or ""
-
-    def _on_input_ctrl_key(self, event):
-        action = self._ctrl_action_from_event(event)
-        if not action:
-            return None
-        if action == "select_all":
-            self._input_select_all()
-        elif action == "copy":
-            self._input_copy()
-        elif action == "paste":
-            self._input_paste()
-        elif action == "cut":
-            self._input_cut()
-        elif action == "undo":
-            self._input_undo()
-        elif action == "redo":
-            self._input_redo()
-        return "break"
-
-    def _normalize_msg_text(self, text: str) -> str:
-        return re.sub(r"\s+", " ", (text or "").strip())
-
-    def _append_unique(self, scope: str, who: str, text: str):
-        norm = self._normalize_msg_text(text)
-        if not norm:
-            return
-        key = (int(self.current_task_id or 0), scope, norm)
-        if key in self._shown_messages:
-            return
-        self._shown_messages.add(key)
-        self._append(who, text)
+        actions = tk.Frame(bottom, bg=TG_PANEL)
+        actions.pack(side="left", padx=(0, 8), pady=8)
+        tk.Button(
+            actions,
+            text="➤ Отправить",
+            command=self._send,
+            bg=TG_ACCENT,
+            fg="#ffffff",
+            activebackground=TG_ACCENT_HOVER,
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=9,
+            cursor="hand2",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(fill="x")
+        tk.Button(
+            actions,
+            text="Очистить",
+            command=self._clear_input,
+            bg=TG_PANEL_ALT,
+            fg=TG_TEXT,
+            activebackground=TG_BORDER,
+            activeforeground=TG_TEXT,
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=8,
+            cursor="hand2",
+        ).pack(fill="x", pady=(8, 0))
 
     # ---------- history ----------
     def _load_history(self):
@@ -697,8 +708,23 @@ class App(tk.Tk):
 
     # ---------- chat ----------
     def _append(self, who: str, text: str):
+        text = (text or "").strip()
+        if not text:
+            return
+
+        stamp = datetime.now().strftime("%H:%M")
+        if who == "Вы":
+            ts_tag, msg_tag = "user_ts", "user_msg"
+        elif who == "AA":
+            ts_tag, msg_tag = "aa_ts", "aa_msg"
+        else:
+            ts_tag, msg_tag = "system_ts", "system_msg"
+
         self.chat.configure(state="normal")
-        self.chat.insert(tk.END, f"[{_ts()}] {who}: {text}\n")
+        if self.chat.index("end-1c") != "1.0":
+            self.chat.insert(tk.END, "\n")
+        self.chat.insert(tk.END, f"{stamp}\n", (ts_tag,))
+        self.chat.insert(tk.END, f"  {text}  \n", (msg_tag,))
         self.chat.see(tk.END)
         self.chat.configure(state="disabled")
 
@@ -714,13 +740,6 @@ class App(tk.Tk):
     # ---------- actions ----------
     def _clear_input(self):
         self.input.delete("1.0", tk.END)
-
-    def _on_input_return(self, event):
-        if event.state & 0x0001:
-            self.input.insert(tk.INSERT, "\n")
-        else:
-            self._send()
-        return "break"
 
     def _send(self):
         user_text = self.input.get("1.0", tk.END).strip()
@@ -762,28 +781,20 @@ class App(tk.Tk):
         if self._polling or self.current_task_id is None:
             return
         self._polling = True
-        self._poll_inflight = False
-        self._poll_generation += 1
         self.last_status = None
 
     def _tick(self):
         if self._stop:
             return
         try:
-            if self._polling and self.current_task_id is not None and not self._poll_inflight:
-                self._poll_inflight = True
-                poll_generation = self._poll_generation
-
-                def poll_worker(task_id: int, generation: int):
+            if self._polling and self.current_task_id is not None:
+                def poll_worker(task_id: int):
                     try:
                         task = self.client.get_task(task_id)
-                        self.q.put(("task_update", generation, task_id, task))
+                        self.q.put(("task_update", task_id, task))
                     except Exception as e:
-                        self.q.put(("poll_error", generation, task_id, str(e)))
-                    finally:
-                        self.q.put(("poll_finished", generation, task_id, None))
-
-                threading.Thread(target=poll_worker, args=(self.current_task_id, poll_generation), daemon=True).start()
+                        self.q.put(("poll_error", task_id, str(e)))
+                threading.Thread(target=poll_worker, args=(self.current_task_id,), daemon=True).start()
         finally:
             self.after(int(POLL_INTERVAL_SEC * 1000), self._tick)
 
@@ -817,8 +828,24 @@ class App(tk.Tk):
     def _popup_text(self, title: str, text: str):
         win = tk.Toplevel(self)
         win.title(title)
-        win.geometry("900x600")
-        t = tk.Text(win, wrap="word")
+        win.geometry("960x640")
+        win.configure(bg=TG_BG)
+        frame = tk.Frame(win, bg=TG_BG, padx=12, pady=12)
+        frame.pack(fill="both", expand=True)
+        t = tk.Text(
+            frame,
+            wrap="word",
+            bg=TG_PANEL,
+            fg=TG_TEXT,
+            insertbackground=TG_TEXT,
+            selectbackground=TG_ACCENT,
+            selectforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=12,
+            font=("Consolas", 10),
+        )
         t.pack(fill="both", expand=True)
         t.insert("1.0", text)
         t.configure(state="disabled")
@@ -859,18 +886,10 @@ class App(tk.Tk):
             return
 
         if kind == "poll_error":
-            _, generation, task_id, detail = msg
-            if generation != self._poll_generation:
-                return
+            _, task_id, detail = msg
             if self.current_task_id == task_id:
                 self.status_var.set(f"Ошибка опроса задачи #{task_id}")
                 self._append("Ошибка", detail)
-            return
-
-        if kind == "poll_finished":
-            _, generation, _task_id, _ = msg
-            if generation == self._poll_generation:
-                self._poll_inflight = False
             return
 
         if kind == "show_logs":
@@ -881,9 +900,7 @@ class App(tk.Tk):
             return
 
         if kind == "task_update":
-            _, generation, task_id, task = msg
-            if generation != self._poll_generation:
-                return
+            _, task_id, task = msg
             if self.current_task_id != task_id:
                 return
 
@@ -892,25 +909,23 @@ class App(tk.Tk):
                 self.last_status = st
                 self.status_var.set(f"{status_ru(st)}: задача #{task_id}")
 
-            st_upper = str(task.get("status") or "").upper()
-
-            # Show a blocking question only when task explicitly returned to user for clarification.
+            # show question to user if present
             qtxt = extract_question_to_user(task)
-            if qtxt and st_upper == "REVIEW_NEEDS_ATTENTION":
-                self._append_unique("question", "AA", qtxt)
+            if qtxt:
+                self._append_aa(qtxt)
 
             # show final answer if done
-            if st_upper == "DONE":
+            if str(task.get("status") or "").upper() == "DONE":
                 ans = extract_final_answer(task)
                 if ans:
-                    self._append_unique("final", "AA", ans)
+                    self._append_aa(ans)
                 else:
                     # if DONE but empty — show minimal info
-                    self._append_unique("final_empty", "AA", "Готово. Финальный ответ пустой (проверь логи задачи).")
+                    self._append_aa("Готово. Финальный ответ пустой (проверь логи задачи).")
                 self._polling = False
                 return
 
-            if st_upper in ("FAILED", "CANCELLED"):
+            if str(task.get("status") or "").upper() in ("FAILED", "CANCELLED"):
                 detail = ""
                 if isinstance(task.get("result"), dict) and task["result"].get("final_answer"):
                     detail = str(task["result"]["final_answer"])
