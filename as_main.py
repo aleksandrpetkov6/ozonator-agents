@@ -5,7 +5,7 @@ import os
 import re
 import ast
 import operator as op
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional, Tuple
 
 from fastapi import FastAPI
@@ -350,6 +350,28 @@ def _heuristic_answer(question: str) -> str:
 
     q_low = q.lower()
 
+    # Current time for common city/timezone questions (deterministic, no LLM needed)
+    if (("сколько" in q_low or "котор" in q_low) and "врем" in q_low) or ("который" in q_low and "час" in q_low):
+        offset = None
+        place = ""
+
+        if any(token in q_low for token in ("питер", "петербург", "санкт-петербург", "санкт петербург")):
+            offset = 3
+            place = "в Санкт-Петербурге"
+        elif any(token in q_low for token in ("москв",)):
+            offset = 3
+            place = "в Москве"
+        else:
+            m_utc = re.search(r"utc\s*([+-])\s*(\d{1,2})", q_low)
+            if m_utc:
+                sign = -1 if m_utc.group(1) == "-" else 1
+                offset = sign * int(m_utc.group(2))
+                place = f"в часовом поясе UTC{m_utc.group(1)}{int(m_utc.group(2))}"
+
+        if offset is not None:
+            now_local = datetime.now(timezone.utc) + timedelta(hours=offset)
+            return f"Сейчас {now_local.strftime('%H:%M')} {place}."
+
     # Unit conversion: cm in meter
     if ("сантиметр" in q_low or "см" in q_low) and ("метр" in q_low or "м" in q_low) and "сколько" in q_low:
         # Typical: "сколько сантиметров в метре?"
@@ -444,15 +466,15 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
             ]
         )
 
-    # 1) Try OpenAI (server-side) if configured
-    ai_answer = _llm_answer(main_goal, payload)
-    if ai_answer:
-        return ai_answer
-
-    # 2) Heuristic fallback (no external AI)
+    # 1) Deterministic local answers for simple questions (faster and more reliable than LLM)
     heur = _heuristic_answer(main_goal)
     if heur:
         return heur
+
+    # 2) Try OpenAI-compatible endpoint (server-side) if configured
+    ai_answer = _llm_answer(main_goal, payload)
+    if ai_answer:
+        return ai_answer
 
     # 3) Previous template fallback
     parts = [f"Готово. Подготовлено решение по задаче: {main_goal}."]

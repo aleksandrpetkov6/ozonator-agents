@@ -405,35 +405,18 @@ class App(tk.Tk):
         self.current_task_id: Optional[int] = None
         self.last_status: Optional[str] = None
         self._polling = False
+        self._poll_inflight = False
+        self._poll_generation = 0
+        self._shown_messages = set()
         self._stop = False
-        self._poll_request_in_flight_task_id: Optional[int] = None
-        self._last_question_text = ""
-        self._last_final_answer_text = ""
-        self._empty_final_notice_shown = False
 
         self._load_history()
         self._build_ui()
         self._refresh_history_list()
-        self.after_idle(self._maximize_window)
+        self.after(30, self._maximize_window)
 
         self.after(200, self._drain_queue)
         self.after(int(POLL_INTERVAL_SEC * 1000), self._tick)
-
-    def _maximize_window(self):
-        try:
-            self.state("zoomed")
-            return
-        except tk.TclError:
-            pass
-        try:
-            self.attributes("-zoomed", True)
-            return
-        except tk.TclError:
-            pass
-        try:
-            self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
-        except Exception:
-            pass
 
     def _build_ui(self):
         # top bar
@@ -481,13 +464,179 @@ class App(tk.Tk):
         self.input.pack(side="left", fill="both", expand=True)
         self.input.bind("<Return>", self._on_input_return)
         self.input.bind("<KP_Enter>", self._on_input_return)
-        self._build_input_menu()
-        self._bind_input_editor_shortcuts()
+        self.input.bind("<Control-KeyPress>", self._on_input_ctrl_key)
+        self.input.bind("<Control-Insert>", self._on_copy_only)
+        self.input.bind("<Shift-Insert>", self._on_paste_only)
+        self.input.bind("<Shift-Delete>", self._on_cut_only)
+        self.input.bind("<F5>", self._on_insert_datetime)
+        self.input.bind("<Button-3>", self._show_input_context_menu)
+        self._build_input_context_menu()
 
         actions = ttk.Frame(bottom)
         actions.pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="Отправить", command=self._send).pack(fill="x")
         ttk.Button(actions, text="Очистить", command=self._clear_input).pack(fill="x", pady=(6, 0))
+
+    def _maximize_window(self):
+        try:
+            self.state("zoomed")
+            return
+        except Exception:
+            pass
+        try:
+            self.attributes("-zoomed", True)
+            return
+        except Exception:
+            pass
+        try:
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            self.geometry(f"{sw}x{sh}+0+0")
+        except Exception:
+            pass
+
+    def _build_input_context_menu(self):
+        self.input_menu = tk.Menu(self, tearoff=0)
+        self.input_menu.add_command(label="Отменить", command=self._input_undo)
+        self.input_menu.add_command(label="Повторить", command=self._input_redo)
+        self.input_menu.add_separator()
+        self.input_menu.add_command(label="Вырезать", command=self._input_cut)
+        self.input_menu.add_command(label="Копировать", command=self._input_copy)
+        self.input_menu.add_command(label="Вставить", command=self._input_paste)
+        self.input_menu.add_command(label="Удалить", command=self._input_delete_selection)
+        self.input_menu.add_separator()
+        self.input_menu.add_command(label="Выделить всё", command=self._input_select_all)
+        self.input_menu.add_command(label="Дата/время", command=self._insert_datetime)
+
+    def _show_input_context_menu(self, event):
+        try:
+            self.input.focus_set()
+            self.input_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                self.input_menu.grab_release()
+            except Exception:
+                pass
+        return "break"
+
+    def _input_undo(self):
+        try:
+            self.input.edit_undo()
+        except Exception:
+            pass
+
+    def _input_redo(self):
+        try:
+            self.input.edit_redo()
+        except Exception:
+            pass
+
+    def _input_copy(self):
+        try:
+            self.input.event_generate("<<Copy>>")
+        except Exception:
+            pass
+
+    def _input_cut(self):
+        try:
+            self.input.event_generate("<<Cut>>")
+        except Exception:
+            pass
+
+    def _input_paste(self):
+        try:
+            self.input.event_generate("<<Paste>>")
+        except Exception:
+            pass
+
+    def _input_delete_selection(self):
+        try:
+            if self.input.tag_ranges("sel"):
+                self.input.delete("sel.first", "sel.last")
+        except Exception:
+            pass
+
+    def _input_select_all(self):
+        try:
+            self.input.focus_set()
+            self.input.tag_add("sel", "1.0", "end-1c")
+            self.input.mark_set("insert", "1.0")
+            self.input.see("insert")
+        except Exception:
+            pass
+
+    def _insert_datetime(self):
+        try:
+            self.input.insert(tk.INSERT, datetime.now().strftime("%H:%M %d.%m.%Y"))
+        except Exception:
+            pass
+
+    def _on_insert_datetime(self, _event=None):
+        self._insert_datetime()
+        return "break"
+
+    def _on_copy_only(self, _event=None):
+        self._input_copy()
+        return "break"
+
+    def _on_paste_only(self, _event=None):
+        self._input_paste()
+        return "break"
+
+    def _on_cut_only(self, _event=None):
+        self._input_cut()
+        return "break"
+
+    def _ctrl_action_from_event(self, event) -> str:
+        keycode_map = {
+            65: "select_all",
+            67: "copy",
+            86: "paste",
+            88: "cut",
+            89: "redo",
+            90: "undo",
+        }
+        action = keycode_map.get(int(getattr(event, "keycode", 0) or 0))
+        if action:
+            return action
+        keysym = str(getattr(event, "keysym", "") or "").lower()
+        char = str(getattr(event, "char", "") or "").lower()
+        alias = {
+            "a": "select_all", "c": "copy", "v": "paste", "x": "cut", "y": "redo", "z": "undo",
+            "ф": "select_all", "с": "copy", "м": "paste", "ч": "cut", "н": "redo", "я": "undo",
+        }
+        return alias.get(char) or alias.get(keysym) or ""
+
+    def _on_input_ctrl_key(self, event):
+        action = self._ctrl_action_from_event(event)
+        if not action:
+            return None
+        if action == "select_all":
+            self._input_select_all()
+        elif action == "copy":
+            self._input_copy()
+        elif action == "paste":
+            self._input_paste()
+        elif action == "cut":
+            self._input_cut()
+        elif action == "undo":
+            self._input_undo()
+        elif action == "redo":
+            self._input_redo()
+        return "break"
+
+    def _normalize_msg_text(self, text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip())
+
+    def _append_unique(self, scope: str, who: str, text: str):
+        norm = self._normalize_msg_text(text)
+        if not norm:
+            return
+        key = (int(self.current_task_id or 0), scope, norm)
+        if key in self._shown_messages:
+            return
+        self._shown_messages.add(key)
+        self._append(who, text)
 
     # ---------- history ----------
     def _load_history(self):
@@ -563,190 +712,8 @@ class App(tk.Tk):
         self._append("AA", text)
 
     # ---------- actions ----------
-    def _build_input_menu(self):
-        self.input_menu = tk.Menu(self, tearoff=0)
-        self.input_menu.add_command(label="Отменить", command=self._input_undo)
-        self.input_menu.add_command(label="Повторить", command=self._input_redo)
-        self.input_menu.add_separator()
-        self.input_menu.add_command(label="Вырезать", command=self._input_cut)
-        self.input_menu.add_command(label="Копировать", command=self._input_copy)
-        self.input_menu.add_command(label="Вставить", command=self._input_paste)
-        self.input_menu.add_command(label="Удалить", command=self._input_delete_selection)
-        self.input_menu.add_separator()
-        self.input_menu.add_command(label="Выделить всё", command=self._input_select_all)
-        self.input_menu.add_command(label="Дата/время", command=self._input_insert_datetime)
-
-    def _bind_input_editor_shortcuts(self):
-        bindings = {
-            "<Shift-Delete>": self._input_cut,
-            "<Control-Insert>": self._input_copy,
-            "<Shift-Insert>": self._input_paste,
-            "<F5>": self._input_insert_datetime,
-            "<Button-3>": self._show_input_context_menu,
-            "<Control-KeyPress>": self._on_input_control_keypress,
-        }
-        for sequence, handler in bindings.items():
-            self.input.bind(sequence, handler)
-
-    def _resolve_input_ctrl_handler(self, event):
-        control_char = event.char or ""
-        keysym = (event.keysym or "").lower()
-        keycode = getattr(event, "keycode", None)
-
-        char_handlers = {
-            "\x01": self._input_select_all,
-            "\x03": self._input_copy,
-            "\x16": self._input_paste,
-            "\x18": self._input_cut,
-            "\x19": self._input_redo,
-            "\x1a": self._input_undo,
-        }
-        handler = char_handlers.get(control_char)
-        if handler is not None:
-            return handler
-
-        keysym_handlers = {
-            "a": self._input_select_all,
-            "c": self._input_copy,
-            "v": self._input_paste,
-            "x": self._input_cut,
-            "y": self._input_redo,
-            "z": self._input_undo,
-            "cyrillic_ef": self._input_select_all,
-            "cyrillic_es": self._input_copy,
-            "cyrillic_em": self._input_paste,
-            "cyrillic_che": self._input_cut,
-            "cyrillic_en": self._input_redo,
-            "cyrillic_ya": self._input_undo,
-        }
-        handler = keysym_handlers.get(keysym)
-        if handler is not None:
-            return handler
-
-        keycode_handlers = {
-            65: self._input_select_all,
-            67: self._input_copy,
-            86: self._input_paste,
-            88: self._input_cut,
-            89: self._input_redo,
-            90: self._input_undo,
-        }
-        return keycode_handlers.get(keycode)
-
-    def _on_input_control_keypress(self, event):
-        handler = self._resolve_input_ctrl_handler(event)
-        if handler is None:
-            return None
-        return handler(event)
-
-    def _focus_input(self):
-        try:
-            self.input.focus_set()
-        except Exception:
-            pass
-
-    def _has_input_selection(self) -> bool:
-        try:
-            return bool(self.input.tag_ranges("sel"))
-        except tk.TclError:
-            return False
-
-    def _can_paste_to_input(self) -> bool:
-        try:
-            return bool(self.clipboard_get())
-        except tk.TclError:
-            return False
-
-    def _update_input_menu_state(self):
-        has_text = bool(self.input.get("1.0", "end-1c"))
-        has_selection = self._has_input_selection()
-        can_paste = self._can_paste_to_input()
-
-        self.input_menu.entryconfigure(0, state="normal")
-        self.input_menu.entryconfigure(1, state="normal")
-        self.input_menu.entryconfigure(3, state=("normal" if has_selection else "disabled"))
-        self.input_menu.entryconfigure(4, state=("normal" if has_selection else "disabled"))
-        self.input_menu.entryconfigure(5, state=("normal" if can_paste else "disabled"))
-        self.input_menu.entryconfigure(6, state=("normal" if has_selection else "disabled"))
-        self.input_menu.entryconfigure(8, state=("normal" if has_text else "disabled"))
-        self.input_menu.entryconfigure(9, state="normal")
-
-    def _show_input_context_menu(self, event=None):
-        self._focus_input()
-        self._update_input_menu_state()
-        if event is None:
-            return "break"
-        try:
-            self.input_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.input_menu.grab_release()
-        return "break"
-
     def _clear_input(self):
         self.input.delete("1.0", tk.END)
-
-    def _input_undo(self, event=None):
-        self._focus_input()
-        try:
-            self.input.edit_undo()
-        except tk.TclError:
-            pass
-        return "break"
-
-    def _input_redo(self, event=None):
-        self._focus_input()
-        try:
-            self.input.edit_redo()
-        except tk.TclError:
-            pass
-        return "break"
-
-    def _input_cut(self, event=None):
-        self._focus_input()
-        try:
-            self.input.event_generate("<<Cut>>")
-        except tk.TclError:
-            pass
-        return "break"
-
-    def _input_copy(self, event=None):
-        self._focus_input()
-        try:
-            self.input.event_generate("<<Copy>>")
-        except tk.TclError:
-            pass
-        return "break"
-
-    def _input_paste(self, event=None):
-        self._focus_input()
-        try:
-            self.input.event_generate("<<Paste>>")
-        except tk.TclError:
-            pass
-        return "break"
-
-    def _input_delete_selection(self, event=None):
-        self._focus_input()
-        try:
-            if self._has_input_selection():
-                self.input.delete("sel.first", "sel.last")
-        except tk.TclError:
-            pass
-        return "break"
-
-    def _input_select_all(self, event=None):
-        self._focus_input()
-        end_index = "end-1c"
-        self.input.tag_add("sel", "1.0", end_index)
-        self.input.mark_set(tk.INSERT, end_index)
-        self.input.see(tk.INSERT)
-        return "break"
-
-    def _input_insert_datetime(self, event=None):
-        self._focus_input()
-        stamp = datetime.now().strftime("%H:%M %d.%m.%Y")
-        self.input.insert(tk.INSERT, stamp)
-        return "break"
 
     def _on_input_return(self, event):
         if event.state & 0x0001:
@@ -792,33 +759,31 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _start_polling(self):
-        if self.current_task_id is None:
+        if self._polling or self.current_task_id is None:
             return
         self._polling = True
+        self._poll_inflight = False
+        self._poll_generation += 1
         self.last_status = None
-        self._last_question_text = ""
-        self._last_final_answer_text = ""
-        self._empty_final_notice_shown = False
-        if self._poll_request_in_flight_task_id != self.current_task_id:
-            self._poll_request_in_flight_task_id = None
 
     def _tick(self):
         if self._stop:
             return
         try:
-            if self._polling and self.current_task_id is not None:
-                task_id = self.current_task_id
-                if self._poll_request_in_flight_task_id != task_id:
-                    self._poll_request_in_flight_task_id = task_id
+            if self._polling and self.current_task_id is not None and not self._poll_inflight:
+                self._poll_inflight = True
+                poll_generation = self._poll_generation
 
-                    def poll_worker(task_id: int):
-                        try:
-                            task = self.client.get_task(task_id)
-                            self.q.put(("task_update", task_id, task))
-                        except Exception as e:
-                            self.q.put(("poll_error", task_id, str(e)))
+                def poll_worker(task_id: int, generation: int):
+                    try:
+                        task = self.client.get_task(task_id)
+                        self.q.put(("task_update", generation, task_id, task))
+                    except Exception as e:
+                        self.q.put(("poll_error", generation, task_id, str(e)))
+                    finally:
+                        self.q.put(("poll_finished", generation, task_id, None))
 
-                    threading.Thread(target=poll_worker, args=(task_id,), daemon=True).start()
+                threading.Thread(target=poll_worker, args=(self.current_task_id, poll_generation), daemon=True).start()
         finally:
             self.after(int(POLL_INTERVAL_SEC * 1000), self._tick)
 
@@ -894,12 +859,18 @@ class App(tk.Tk):
             return
 
         if kind == "poll_error":
-            _, task_id, detail = msg
-            if self._poll_request_in_flight_task_id == task_id:
-                self._poll_request_in_flight_task_id = None
+            _, generation, task_id, detail = msg
+            if generation != self._poll_generation:
+                return
             if self.current_task_id == task_id:
                 self.status_var.set(f"Ошибка опроса задачи #{task_id}")
                 self._append("Ошибка", detail)
+            return
+
+        if kind == "poll_finished":
+            _, generation, _task_id, _ = msg
+            if generation == self._poll_generation:
+                self._poll_inflight = False
             return
 
         if kind == "show_logs":
@@ -910,43 +881,36 @@ class App(tk.Tk):
             return
 
         if kind == "task_update":
-            _, task_id, task = msg
-            if self._poll_request_in_flight_task_id == task_id:
-                self._poll_request_in_flight_task_id = None
+            _, generation, task_id, task = msg
+            if generation != self._poll_generation:
+                return
             if self.current_task_id != task_id:
                 return
 
-            status_upper = str(task.get("status") or "").upper()
             st = str(task.get("status") or "")
             if st and st != self.last_status:
                 self.last_status = st
                 self.status_var.set(f"{status_ru(st)}: задача #{task_id}")
 
-            ans = extract_final_answer(task)
+            st_upper = str(task.get("status") or "").upper()
 
-            # show question to user if present (without duplicate spam)
+            # Show a blocking question only when task explicitly returned to user for clarification.
             qtxt = extract_question_to_user(task)
-            if qtxt and not (status_upper == "DONE" and ans and qtxt.strip() == ans.strip()):
-                if qtxt != self._last_question_text:
-                    self._append_aa(qtxt)
-                    self._last_question_text = qtxt
+            if qtxt and st_upper == "REVIEW_NEEDS_ATTENTION":
+                self._append_unique("question", "AA", qtxt)
 
             # show final answer if done
-            if status_upper == "DONE":
+            if st_upper == "DONE":
+                ans = extract_final_answer(task)
                 if ans:
-                    if ans != self._last_final_answer_text:
-                        self._append_aa(ans)
-                        self._last_final_answer_text = ans
+                    self._append_unique("final", "AA", ans)
                 else:
                     # if DONE but empty — show minimal info
-                    if not self._empty_final_notice_shown:
-                        self._append_aa("Готово. Финальный ответ пустой (проверь логи задачи).")
-                        self._empty_final_notice_shown = True
+                    self._append_unique("final_empty", "AA", "Готово. Финальный ответ пустой (проверь логи задачи).")
                 self._polling = False
-                self._poll_request_in_flight_task_id = None
                 return
 
-            if status_upper in ("FAILED", "CANCELLED"):
+            if st_upper in ("FAILED", "CANCELLED"):
                 detail = ""
                 if isinstance(task.get("result"), dict) and task["result"].get("final_answer"):
                     detail = str(task["result"]["final_answer"])
@@ -956,7 +920,6 @@ class App(tk.Tk):
                     detail = task["error"]
                 self._append("Ошибка", detail or "Задача завершилась ошибкой (см. логи).")
                 self._polling = False
-                self._poll_request_in_flight_task_id = None
                 return
 
             # keep polling
