@@ -458,6 +458,7 @@ class App(tk.Tk):
 
         self.input = tk.Text(bottom, wrap="word", height=5)
         self.input.pack(side="left", fill="both", expand=True)
+        self.input.bind("<Return>", self._on_input_return)
 
         actions = ttk.Frame(bottom)
         actions.pack(side="left", padx=(8, 0))
@@ -540,6 +541,13 @@ class App(tk.Tk):
     # ---------- actions ----------
     def _clear_input(self):
         self.input.delete("1.0", tk.END)
+
+    def _on_input_return(self, event):
+        if event.state & 0x0001:
+            self.input.insert(tk.INSERT, "\n")
+        else:
+            self._send()
+        return "break"
 
     def _send(self):
         user_text = self.input.get("1.0", tk.END).strip()
