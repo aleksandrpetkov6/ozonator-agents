@@ -406,13 +406,34 @@ class App(tk.Tk):
         self.last_status: Optional[str] = None
         self._polling = False
         self._stop = False
+        self._poll_request_in_flight_task_id: Optional[int] = None
+        self._last_question_text = ""
+        self._last_final_answer_text = ""
+        self._empty_final_notice_shown = False
 
         self._load_history()
         self._build_ui()
         self._refresh_history_list()
+        self.after_idle(self._maximize_window)
 
         self.after(200, self._drain_queue)
         self.after(int(POLL_INTERVAL_SEC * 1000), self._tick)
+
+    def _maximize_window(self):
+        try:
+            self.state("zoomed")
+            return
+        except tk.TclError:
+            pass
+        try:
+            self.attributes("-zoomed", True)
+            return
+        except tk.TclError:
+            pass
+        try:
+            self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
+        except Exception:
+            pass
 
     def _build_ui(self):
         # top bar
@@ -771,23 +792,33 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _start_polling(self):
-        if self._polling or self.current_task_id is None:
+        if self.current_task_id is None:
             return
         self._polling = True
         self.last_status = None
+        self._last_question_text = ""
+        self._last_final_answer_text = ""
+        self._empty_final_notice_shown = False
+        if self._poll_request_in_flight_task_id != self.current_task_id:
+            self._poll_request_in_flight_task_id = None
 
     def _tick(self):
         if self._stop:
             return
         try:
             if self._polling and self.current_task_id is not None:
-                def poll_worker(task_id: int):
-                    try:
-                        task = self.client.get_task(task_id)
-                        self.q.put(("task_update", task_id, task))
-                    except Exception as e:
-                        self.q.put(("poll_error", task_id, str(e)))
-                threading.Thread(target=poll_worker, args=(self.current_task_id,), daemon=True).start()
+                task_id = self.current_task_id
+                if self._poll_request_in_flight_task_id != task_id:
+                    self._poll_request_in_flight_task_id = task_id
+
+                    def poll_worker(task_id: int):
+                        try:
+                            task = self.client.get_task(task_id)
+                            self.q.put(("task_update", task_id, task))
+                        except Exception as e:
+                            self.q.put(("poll_error", task_id, str(e)))
+
+                    threading.Thread(target=poll_worker, args=(task_id,), daemon=True).start()
         finally:
             self.after(int(POLL_INTERVAL_SEC * 1000), self._tick)
 
@@ -864,6 +895,8 @@ class App(tk.Tk):
 
         if kind == "poll_error":
             _, task_id, detail = msg
+            if self._poll_request_in_flight_task_id == task_id:
+                self._poll_request_in_flight_task_id = None
             if self.current_task_id == task_id:
                 self.status_var.set(f"Ошибка опроса задачи #{task_id}")
                 self._append("Ошибка", detail)
@@ -878,31 +911,42 @@ class App(tk.Tk):
 
         if kind == "task_update":
             _, task_id, task = msg
+            if self._poll_request_in_flight_task_id == task_id:
+                self._poll_request_in_flight_task_id = None
             if self.current_task_id != task_id:
                 return
 
+            status_upper = str(task.get("status") or "").upper()
             st = str(task.get("status") or "")
             if st and st != self.last_status:
                 self.last_status = st
                 self.status_var.set(f"{status_ru(st)}: задача #{task_id}")
 
-            # show question to user if present
+            ans = extract_final_answer(task)
+
+            # show question to user if present (without duplicate spam)
             qtxt = extract_question_to_user(task)
-            if qtxt:
-                self._append_aa(qtxt)
+            if qtxt and not (status_upper == "DONE" and ans and qtxt.strip() == ans.strip()):
+                if qtxt != self._last_question_text:
+                    self._append_aa(qtxt)
+                    self._last_question_text = qtxt
 
             # show final answer if done
-            if str(task.get("status") or "").upper() == "DONE":
-                ans = extract_final_answer(task)
+            if status_upper == "DONE":
                 if ans:
-                    self._append_aa(ans)
+                    if ans != self._last_final_answer_text:
+                        self._append_aa(ans)
+                        self._last_final_answer_text = ans
                 else:
                     # if DONE but empty — show minimal info
-                    self._append_aa("Готово. Финальный ответ пустой (проверь логи задачи).")
+                    if not self._empty_final_notice_shown:
+                        self._append_aa("Готово. Финальный ответ пустой (проверь логи задачи).")
+                        self._empty_final_notice_shown = True
                 self._polling = False
+                self._poll_request_in_flight_task_id = None
                 return
 
-            if str(task.get("status") or "").upper() in ("FAILED", "CANCELLED"):
+            if status_upper in ("FAILED", "CANCELLED"):
                 detail = ""
                 if isinstance(task.get("result"), dict) and task["result"].get("final_answer"):
                     detail = str(task["result"]["final_answer"])
@@ -912,6 +956,7 @@ class App(tk.Tk):
                     detail = task["error"]
                 self._append("Ошибка", detail or "Задача завершилась ошибкой (см. логи).")
                 self._polling = False
+                self._poll_request_in_flight_task_id = None
                 return
 
             # keep polling
