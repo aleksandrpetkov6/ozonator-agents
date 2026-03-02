@@ -24,6 +24,7 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import traceback
@@ -62,11 +63,33 @@ RUN_TASK_TIMEOUT_SEC = 10  # короткий "пинок" оркестраци�
 CREATE_RETRIES = 4
 
 
+def _app_install_dir() -> Path:
+    try:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent
+    except Exception:
+        pass
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        return Path.cwd()
+
+
+def _pin_working_directory() -> None:
+    try:
+        os.chdir(_app_install_dir())
+    except Exception:
+        pass
+
+
+_pin_working_directory()
+
+
 # =========================
 # Helpers
 # =========================
 def _ts() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 def safe_log(msg: str) -> None:
@@ -723,7 +746,7 @@ class App(tk.Tk):
     def _refresh_history_list(self):
         self.lb.delete(0, tk.END)
         for it in self.items:
-            self.lb.insert(tk.END, f"{it.title} (#{it.id})")
+            self.lb.insert(tk.END, it.title)
 
     def _on_select_history(self, _evt=None):
         sel = self.lb.curselection()
@@ -736,7 +759,7 @@ class App(tk.Tk):
         self.current_task_id = it.id
         self.client.base_url = it.base_url
         self.client.api_prefix = it.api_prefix or ""
-        self._append_system(f"Выбрана задача #{it.id}.")
+        self._append_system("Выбрана задача.")
         self._start_polling()
 
     def _delete_selected(self):
@@ -751,7 +774,7 @@ class App(tk.Tk):
         self._refresh_history_list()
         if self.current_task_id == it.id:
             self.current_task_id = None
-        self._append_system(f"Удалено из истории: #{it.id}.")
+        self._append_system("Удалено из истории.")
 
     def _clear_history(self):
         if not self.items:
@@ -875,7 +898,7 @@ class App(tk.Tk):
             return
 
         task_id = self.current_task_id
-        self.status_var.set(f"Загрузка логов задачи #{task_id}…")
+        self.status_var.set("Загрузка логов…")
 
         def worker():
             try:
@@ -923,14 +946,14 @@ class App(tk.Tk):
             self.lb.selection_clear(0, tk.END)
             self.lb.selection_set(0)
             self.lb.activate(0)
-            self.status_var.set(f"Задача #{task_id} создана. Запуск оркестрации…")
+            self.status_var.set("Задача создана. Запуск оркестрации…")
             self._start_polling()
             return
 
         if kind == "kick_done":
             _, task_id, _ = msg
             if self.current_task_id == task_id:
-                self.status_var.set(f"Задача #{task_id} в работе…")
+                self.status_var.set("Задача в работе…")
             return
 
         if kind == "poll_error":
@@ -938,7 +961,7 @@ class App(tk.Tk):
             if generation != self._poll_generation:
                 return
             if self.current_task_id == task_id:
-                self.status_var.set(f"Ошибка опроса задачи #{task_id}")
+                self.status_var.set("Ошибка опроса задачи")
                 self._append("Ошибка", detail)
             return
 
@@ -951,8 +974,8 @@ class App(tk.Tk):
         if kind == "show_logs":
             _, task_id, txt = msg
             if self.current_task_id == task_id:
-                self.status_var.set(f"Логи задачи #{task_id}")
-            self._popup_text(f"Логи задачи #{task_id}", txt)
+                self.status_var.set("Логи задачи")
+            self._popup_text("Логи задачи", txt)
             return
 
         if kind == "task_update":
@@ -965,7 +988,7 @@ class App(tk.Tk):
             st = str(task.get("status") or "")
             if st and st != self.last_status:
                 self.last_status = st
-                self.status_var.set(f"{status_ru(st)}: задача #{task_id}")
+                self.status_var.set(status_ru(st))
 
             st_upper = str(task.get("status") or "").upper()
 
