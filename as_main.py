@@ -5,6 +5,8 @@ import json
 import operator as op
 import os
 import re
+import io
+import csv
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
@@ -22,6 +24,7 @@ from db.tasks import (
     update_task_status,
     write_orchestration_log,
 )
+from db.files import get_task_file_content, list_task_files
 
 app = FastAPI(title="Ozonator Agents AS")
 
@@ -37,6 +40,135 @@ def _normalize_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+_ATT_MAX_FILES = 8
+_ATT_MAX_TOTAL_BYTES = 2 * 1024 * 1024
+_ATT_MAX_CHARS_PER_FILE = 20000
+
+
+def _ext(name: str) -> str:
+    name = (name or "").lower()
+    if "." not in name:
+        return ""
+    return name.rsplit(".", 1)[-1]
+
+
+def _decode_text(raw: bytes) -> str:
+    if raw is None:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        try:
+            return raw.decode("cp1251")
+        except Exception:
+            return raw.decode("utf-8", errors="replace")
+
+
+def _trim_text(s: str, limit: int) -> str:
+    s = s or ""
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "\n…(обрезано)"
+
+
+def _preview_csv(text: str, delimiter: str, max_rows: int = 60) -> str:
+    if not text:
+        return "(пусто)"
+    try:
+        f = io.StringIO(text)
+        reader = csv.reader(f, delimiter=delimiter)
+        out_lines = []
+        for i, row in enumerate(reader):
+            if i >= max_rows:
+                out_lines.append("…(обрезано)")
+                break
+            out_lines.append("\t".join(row))
+        return "\n".join(out_lines).strip() or "(пусто)"
+    except Exception:
+        return _trim_text(text, _ATT_MAX_CHARS_PER_FILE)
+
+
+def _preview_xlsx(raw: bytes) -> str:
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        return "(xlsx: openpyxl не установлен)"
+
+    try:
+        wb = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+        ws = wb.worksheets[0] if wb.worksheets else None
+        if ws is None:
+            return "(xlsx: нет листов)"
+
+        max_rows = 60
+        max_cols = 25
+        lines = []
+        for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=max_rows, max_col=max_cols, values_only=True), start=1):
+            vals = []
+            for v in row:
+                if v is None:
+                    vals.append("")
+                else:
+                    vals.append(str(v))
+            lines.append("\t".join(vals).rstrip())
+        txt = "\n".join(lines).strip()
+        return txt or "(xlsx: пусто)"
+    except Exception:
+        return "(xlsx: не удалось прочитать)"
+
+
+def _build_attachments_block(task_id: int) -> str:
+    settings = get_settings()
+    db_url = getattr(settings, "database_url", None)
+    if not db_url:
+        return ""
+
+    ok, files, message = list_task_files(db_url, task_id)
+    if not ok or not files:
+        return ""
+
+    total = 0
+    blocks: list[str] = []
+    for meta in files[:_ATT_MAX_FILES]:
+        file_id = int(meta.get("id") or 0)
+        file_name = str(meta.get("file_name") or f"file_{file_id}")
+        size_bytes = int(meta.get("size_bytes") or 0)
+        if total + size_bytes > _ATT_MAX_TOTAL_BYTES:
+            blocks.append("(достигнут лимит по суммарному размеру вложений, остальное пропущено)")
+            break
+
+        ok_c, meta_c, content, msg_c = get_task_file_content(db_url, task_id, file_id)
+        if not ok_c or content is None:
+            blocks.append(f"— {file_name}: (не удалось загрузить содержимое)")
+            continue
+
+        total += len(content)
+        ext = _ext(file_name)
+
+        if ext in {"txt", "md", "log", "json", "yaml", "yml"}:
+            txt = _trim_text(_decode_text(content), _ATT_MAX_CHARS_PER_FILE)
+            blocks.append(f"— {file_name}\n{txt}")
+            continue
+        if ext == "csv":
+            txt = _decode_text(content)
+            blocks.append(f"— {file_name}\n{_preview_csv(txt, ',', 60)}")
+            continue
+        if ext == "tsv":
+            txt = _decode_text(content)
+            blocks.append(f"— {file_name}\n{_preview_csv(txt, '\t', 60)}")
+            continue
+        if ext in {"xlsx", "xlsm"}:
+            blocks.append(f"— {file_name}\n{_preview_xlsx(content)}")
+            continue
+
+        blocks.append(f"— {file_name}: (бинарный формат, автоматический разбор не поддерживается)")
+
+    if not blocks:
+        return ""
+
+    return "\n\n".join(["Вложения к задаче (используй их при ответе):", *blocks]).strip()
 
 
 def _normalize_str_list(value: Any) -> list[str]:
@@ -612,6 +744,9 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
 
     main_goal = user_request or payload_brief or goal or title or f"задача #{task_id}"
 
+    attachments_block = _build_attachments_block(task_id)
+    llm_question = (main_goal + "\n\n" + attachments_block).strip() if attachments_block else main_goal
+
     endpoints = _normalize_str_list(payload.get("endpoints") or payload.get("endpoint") or az_fix_plan.get("endpoints") or az_fix_plan.get("endpoint"))
     request_keys = _normalize_str_list(payload.get("request_keys") or payload.get("input_keys") or az_fix_plan.get("request_keys") or az_fix_plan.get("input_keys"))
     response_keys = _normalize_str_list(payload.get("response_keys") or payload.get("output_keys") or az_fix_plan.get("response_keys") or az_fix_plan.get("output_keys"))
@@ -634,7 +769,7 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
             ]
         )
 
-    ai_answer = _llm_answer(main_goal, payload)
+    ai_answer = _llm_answer(llm_question, payload)
     if ai_answer:
         return ai_answer
 
