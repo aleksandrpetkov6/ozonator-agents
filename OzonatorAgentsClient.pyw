@@ -23,9 +23,11 @@ import os
 import threading
 import time
 import tkinter as tk
+import uuid
+import mimetypes
 from dataclasses import dataclass
 from datetime import datetime
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -80,6 +82,25 @@ class AAClient:
         if AA_ADMIN_TOKEN:
             h["X-Admin-Token"] = AA_ADMIN_TOKEN
         return h
+
+    def _request_raw(self, method: str, url: str, body: bytes | None, headers: dict) -> ApiResponse:
+        req = urllib_request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib_request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+                raw = r.read()
+                txt = raw.decode("utf-8") if raw else ""
+                return ApiResponse(True, r.status, json.loads(txt) if txt else {}, None)
+        except urllib_error.HTTPError as e:
+            status = int(getattr(e, "code", 0) or 0)
+            try:
+                raw = e.read()
+                txt = raw.decode("utf-8") if raw else ""
+                payload = json.loads(txt) if txt else {}
+            except Exception:
+                payload = None
+            return ApiResponse(False, status, payload, f"HTTPError {status}")
+        except Exception as e:
+            return ApiResponse(False, 0, None, f"{e.__class__.__name__}")
 
     def _request_json(self, method: str, url: str, body: dict | None) -> ApiResponse:
         data = None
@@ -150,6 +171,34 @@ class AAClient:
                 return resp.data["logs"]
         return []
 
+    def upload_file(self, task_id: int, file_path: str) -> None:
+        file_name = os.path.basename(file_path) or "file"
+        ctype = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+
+        with open(file_path, "rb") as f:
+            content = f.read()
+
+        boundary = "----ozonatorboundary" + uuid.uuid4().hex
+        head = (
+            f"--{boundary}\r\n"
+            f"Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n"
+            f"Content-Type: {ctype}\r\n\r\n"
+        ).encode("utf-8")
+        tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        body = head + content + tail
+
+        for pref in self._prefixes():
+            self.api_prefix = pref
+            url = self._mk(f"/tasks/{task_id}/files/upload")
+            headers = self._headers().copy()
+            headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+            headers["Accept"] = "application/json"
+            resp = self._request_raw("POST", url, body, headers)
+            if resp.ok:
+                return
+
+        raise RuntimeError("upload_failed")
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -168,6 +217,7 @@ class App(tk.Tk):
 
         self._typing_range = None
         self._conversation_history: list[dict[str, str]] = []
+        self._attached_files: list[str] = []
 
         self._build_ui()
         self._bind_hotkeys()
@@ -219,8 +269,11 @@ class App(tk.Tk):
         bottom = tk.Frame(self, padx=10, pady=10)
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
 
+        self.btn_files = tk.Button(bottom, text="Файлы", command=self._pick_files)
+        self.btn_files.pack(side=tk.LEFT)
+
         self.entry = tk.Entry(bottom, font=("Segoe UI", 12))
-        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
         self.entry.focus_set()
 
         self.btn_send = tk.Canvas(bottom, width=46, height=46, highlightthickness=0)
@@ -286,6 +339,23 @@ class App(tk.Tk):
     def _clear_input(self):
         self.entry.delete(0, tk.END)
 
+    def _pick_files(self):
+        paths = filedialog.askopenfilenames(title="Выбери файлы")
+        if not paths:
+            return
+        self._attached_files = [str(p) for p in paths if p]
+        self._update_status()
+
+    def _clear_files(self):
+        self._attached_files = []
+        self._update_status()
+
+    def _update_status(self):
+        if self._attached_files:
+            self.lbl_status.config(text=f"● online · файлов: {len(self._attached_files)}")
+        else:
+            self.lbl_status.config(text="● online")
+
     def _build_task_payload(self, user_text: str) -> dict:
         # user_prefs (как ты попросил)
         user_prefs = {
@@ -299,6 +369,16 @@ class App(tk.Tk):
         # history
         history = list(self._conversation_history)[-HISTORY_MAX_ITEMS:]
 
+        attachments_meta = []
+        for p in self._attached_files:
+            try:
+                attachments_meta.append({
+                    "name": os.path.basename(p) or "file",
+                    "size_bytes": int(os.path.getsize(p)),
+                })
+            except Exception:
+                attachments_meta.append({"name": os.path.basename(p) or "file"})
+
         return {
             "user_request": user_text,
             "llm_provider": DEFAULT_LLM_PROVIDER,
@@ -306,6 +386,7 @@ class App(tk.Tk):
             "client_meta": {"source": "desktop", "client": "OzonatorAgentsClient"},
             "user_prefs": user_prefs,
             "conversation_history": history,
+            "attachments": attachments_meta,
         }
 
     def _push_history(self, role: str, content: str):
@@ -320,6 +401,9 @@ class App(tk.Tk):
 
         self._clear_input()
         self._append("Ты", user_text)
+        if self._attached_files:
+            names = [os.path.basename(p) or "file" for p in self._attached_files]
+            self._append("Ты", "Прикреплено файлов: " + ", ".join(names))
         self._push_history("user", user_text)
 
         self._show_typing()
@@ -330,6 +414,12 @@ class App(tk.Tk):
             try:
                 task_id = self.client.create_task(payload)
                 self.current_task_id = task_id
+
+                # Загружаем вложения ДО оркестрации
+                for p in list(self._attached_files):
+                    self.client.upload_file(task_id, p)
+                self._clear_files()
+
                 self.client.run_task(task_id)
                 self._polling = True
                 self._poll_fast_until = time.time() + FAST_POLL_WINDOW_SEC
