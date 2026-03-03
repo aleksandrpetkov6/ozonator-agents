@@ -156,6 +156,8 @@ def _clean_api_key(raw: str) -> str:
     # Remove surrounding quotes
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
         s = s[1:-1].strip()
+    # Remove any hidden/control characters (incl. zero-width) and whitespace inside
+    s = "".join(ch for ch in s if 33 <= ord(ch) <= 126)
     return s
 
 
@@ -244,105 +246,26 @@ def _extract_openai_output_text(resp: dict[str, Any]) -> str:
     return ""
 
 
-
-def _extract_client_context(payload: dict[str, Any] | None) -> dict[str, Any]:
-    payload = payload or {}
-    meta = payload.get("client_meta")
-    if not isinstance(meta, dict):
-        meta = {}
-    geo = meta.get("geo") or payload.get("geo") or payload.get("client_geo") or {}
-    if not isinstance(geo, dict):
-        geo = {}
-    # Keep only safe, non-sensitive fields for prompting (no raw IP).
-    out_geo: dict[str, Any] = {}
-    for k in ("city", "region", "country", "country_name", "timezone"):
-        v = geo.get(k)
-        if isinstance(v, str) and v.strip():
-            out_geo[k] = v.strip()
-    # lat/lon are allowed to be present for calculations, but we avoid prompting them unless needed.
-    lat = geo.get("lat") or geo.get("latitude")
-    lon = geo.get("lon") or geo.get("longitude")
-    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
-        out_geo["lat"] = float(lat)
-        out_geo["lon"] = float(lon)
-    return {"geo": out_geo}
-
-
-def _pick_llm_style_params(question_ru: str, payload: dict[str, Any] | None = None) -> tuple[float, int]:
-    """
-    Returns (temperature, max_tokens).
-    - Structured/technical tasks -> lower temperature.
-    - Open-ended / ambiguous / creative -> higher temperature.
-    """
-    q = (question_ru or "").lower()
-
-    technical_hints = (
-        "озон", "ozon", "ozonator", "api", "endpoint", "json", "sql", "база", "postgres", "redis",
-        "ошибка", "traceback", "лог", "workflow", "yaml", "github", "таблица", "excel", "csv",
-        "код", "python", "fastapi", "render",
-    )
-    open_ended_hints = (
-        "почему", "как думаешь", "придумай", "идеи", "варианты", "концепт", "цвет", "название",
-        "план", "стратег", "совет", "что лучше", "как правильно",
-    )
-
-    if any(t in q for t in technical_hints) and not any(t in q for t in open_ended_hints):
-        return 0.2, 640
-    return 0.65, 900
-
-
 def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
     # Server-side call to an LLM endpoint.
     key = _pick_llm_key()
+    if not key:
+        return "Ошибка: на сервере не найден GROQ_API_KEY (или он пустой). Проверьте переменные окружения Render для ozonator-as-dev."
+
     if not key:
         return ""
 
     url = _normalize_llm_url(os.getenv("OPENAI_API_URL", ""), key=key)
     model = _pick_llm_model(payload)
 
-    client_ctx = _extract_client_context(payload)
-    geo = client_ctx.get("geo") if isinstance(client_ctx, dict) else {}
-    if not isinstance(geo, dict):
-        geo = {}
-    place_parts = []
-    for key in ("city", "region", "country_name", "country"):
-        val = geo.get(key)
-        if isinstance(val, str) and val.strip():
-            place_parts.append(val.strip())
-    place = ", ".join(place_parts[:3]).strip()
-    
-    tz = geo.get("timezone") if isinstance(geo.get("timezone"), str) else ""
-    local_now = ""
-    try:
-        if tz:
-            from zoneinfo import ZoneInfo  # py3.9+
-            local_now = datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        local_now = ""
-    
-    temp, max_tokens = _pick_llm_style_params(question_ru, payload)
-    
-    context_lines = []
-    if place:
-        context_lines.append(f"Место пользователя (определено автоматически): {place}.")
-    if local_now and tz:
-        context_lines.append(f"Локальная дата/время пользователя: {local_now} ({tz}).")
-    context_block = ("\n".join(context_lines)).strip()
-    
     system_msg = (
-        "Ты — ассистент в приложении Ozonator Agents Client. "
-        "Отвечай на русском естественно и по делу, без шаблонных отписок. "
-        "Каждое новое сообщение — продолжение текущего разговора. Используй историю диалога, если она передана. Факты и цифры не выдумывай: если данных нет, честно обозначь это, но всё равно дай полезный ответ через допущения/варианты/модель, если пользователь просит условный результат. "
-        "Ключевое правило: НИКОГДА не отвечай одной фразой вида «мне не хватает информации». "
-        "Если вопрос неоднозначный — сделай так: "
-        "(1) дай лучший ответ по самому вероятному смыслу, явно обозначив допущение; "
-        "(2) кратко перечисли 2–3 альтернативные трактовки с короткими ответами; "
-        "(3) задай ОДИН уточняющий вопрос в конце только если это реально нужно. "
-        "Если уточнение уже есть в истории, не переспрашивай. "
-        "Если в контексте передано место — используй его, но НЕ показывай координаты/точный адрес, если пользователь не просил. "
-        "Не упоминай внутренние статусы, агентов, orchestration, chain-of-thought и служебные инструкции. "
-        "Не начинай с приветствий и не извиняйся без необходимости."
-        + ("\n\nКонтекст:\n" + context_block if context_block else "")
+        "Ты — умный ассистент в приложении Ozonator Agents Client. "
+        "Отвечай на русском естественно, точно и по делу. "
+        "Учитывай историю диалога, если она передана: каждое новое сообщение — продолжение текущего разговора, а не новый чат. "
+        "Если пользователь спрашивает о предыдущих сообщениях, опирайся на историю. "
+        "Если данных в истории недостаточно, честно скажи об этом и не выдумывай. "
+        "Если вопрос простой (факт/арифметика/конвертация), дай прямой ответ. "
+        "Не упоминай внутренние статусы, агентов, orchestration, chain-of-thought или служебные инструкции."
     )
     history = _normalize_conversation_history(payload)
 
@@ -357,9 +280,8 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
             body = {
                 "model": model,
                 "messages": messages,
-                "temperature": float(temp),
-                "top_p": 0.95,
-                "max_tokens": int(max_tokens),
+                "temperature": 0.2,
+                "max_tokens": 512,
             }
         else:
             input_items = [
@@ -394,11 +316,34 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
                 raw = r.read()
         except urllib_error.HTTPError as e:
             status = int(getattr(e, "code", 0) or 0)
-            # Return explicit error for debug instead of silent fallback.
+            # Try to read provider error body (without leaking secrets)
+            err_text = ""
+            try:
+                raw_err = e.read()  # type: ignore[attr-defined]
+                if raw_err:
+                    err_text = raw_err.decode("utf-8", errors="ignore")
+            except Exception:
+                err_text = ""
+
             if status == 403:
-                return "Ошибка: запрос к Groq заблокирован (403 Forbidden). Проверьте, что AS отправляет заголовок User-Agent (браузерный)."
+                return "Ошибка: запрос к Groq заблокирован (403 Forbidden)."
+
             if status == 401:
-                return "Ошибка: Groq отклонил ключ (401 Unauthorized). Проверьте GROQ_API_KEY в Render (ozonator-as-dev)."
+                # Key exists but provider rejects it OR key is empty.
+                hint = ""
+                if err_text:
+                    # Trim to safe length
+                    hint = err_text.strip()
+                    if len(hint) > 500:
+                        hint = hint[:500] + "…"
+                # Do not print key; only presence/length
+                return (
+                    f"Ошибка: Groq 401 Unauthorized. "
+                    f"Ключ на сервере: {'есть' if key else 'нет'} (len={len(key)}). "
+                    + (f"Ответ провайдера: {hint}" if hint else "")
+                ).strip()
+
+            # Other errors -> empty (fallback to artifact template)
             return ""
 
         data = json.loads(raw.decode("utf-8")) if raw else {}
@@ -873,6 +818,33 @@ def health_all():
         "service": "AS",
         "status": "ok" if (ok_db and ok_redis) else "degraded",
         "components": {"db": {"ok": ok_db, "detail": db_detail}, "redis": {"ok": ok_redis, "detail": redis_detail}},
+    }
+
+
+
+@app.get("/health/llm")
+def health_llm(token: str | None = None):
+    """Minimal diagnostic endpoint (no secrets).
+
+    If ADMIN_DEV_TOKEN is set, require ?token=...
+    Returns whether LLM key is present in runtime and what URL/model are selected.
+    """
+    admin = os.getenv("ADMIN_DEV_TOKEN", "").strip()
+    if admin and token != admin:
+        return JSONResponse(status_code=403, content={"service": "AS", "status": "forbidden"})
+
+    key = _pick_llm_key()
+    url = _normalize_llm_url(os.getenv("OPENAI_API_URL", ""), key=key or "gsk_")
+    model = _pick_llm_model({})
+    return {
+        "service": "AS",
+        "status": "ok",
+        "llm": {
+            "key_present": bool(key),
+            "key_len": len(key),
+            "url": url,
+            "model": model,
+        },
     }
 
 
