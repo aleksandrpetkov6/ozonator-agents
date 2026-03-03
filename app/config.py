@@ -18,6 +18,7 @@ class Settings:
     ak_run_task_base_url: str
     aa_auto_orchestration_enabled: bool
     aa_max_rework_cycles: int
+    aa_max_upload_bytes: int
 
 
 
@@ -36,4 +37,5 @@ def get_settings() -> Settings:
         ).rstrip("/"),
         aa_auto_orchestration_enabled=_env_bool("AA_AUTO_ORCHESTRATION_ENABLED", True),
         aa_max_rework_cycles=max(1, int(os.getenv("AA_MAX_REWORK_CYCLES") or "2")),
+        aa_max_upload_bytes=max(1, int(os.getenv("AA_MAX_UPLOAD_BYTES") or str(10 * 1024 * 1024))),
     )
