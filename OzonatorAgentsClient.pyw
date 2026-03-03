@@ -624,6 +624,11 @@ class App(tk.Tk):
             font=self.font_ui_10,
         )
         self.input.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        # Enter: send, Shift+Enter: new line
+        self.input.bind('<Return>', self._on_input_enter)
+        self.input.bind('<KP_Enter>', self._on_input_enter)
+        self.input.bind('<Shift-Return>', self._on_input_shift_enter)
+        self.input.bind('<Shift-KP_Enter>', self._on_input_shift_enter)
 
         actions = tk.Frame(bottom, bg=TG_PANEL)
         actions.pack(side="left", padx=(0, 8), pady=8)
@@ -746,6 +751,16 @@ class App(tk.Tk):
         self._append("AA", text)
 
     # ---------- actions ----------
+    def _on_input_enter(self, _evt=None):
+        # Send on Enter
+        self._send()
+        return 'break'
+
+    def _on_input_shift_enter(self, _evt=None):
+        # New line on Shift+Enter
+        self.input.insert(tk.INSERT, '\n')
+        return 'break'
+
     def _clear_input(self):
         self.input.delete("1.0", tk.END)
 
