@@ -148,6 +148,200 @@ def _strip_bearer(s: str) -> str:
         return s.split(" ", 1)[1].strip()
     return s
 
+# =========================
+# Geo / Weather (public, no tokens)
+# =========================
+GEO_CACHE_TTL_SEC = 6 * 60 * 60
+GEO_TIMEOUT_SEC = 2
+
+WEATHER_CACHE_TTL_SEC = 5 * 60
+WEATHER_TIMEOUT_SEC = 2
+
+WEATHER_CODE_RU = {
+    0: "ясно",
+    1: "в основном ясно",
+    2: "переменная облачность",
+    3: "пасмурно",
+    45: "туман",
+    48: "туман (изморозь)",
+    51: "морось (слабая)",
+    53: "морось",
+    55: "морось (сильная)",
+    56: "морось замерзающая (слабая)",
+    57: "морось замерзающая (сильная)",
+    61: "дождь (слабый)",
+    63: "дождь",
+    65: "дождь (сильный)",
+    66: "ледяной дождь (слабый)",
+    67: "ледяной дождь (сильный)",
+    71: "снег (слабый)",
+    73: "снег",
+    75: "снег (сильный)",
+    77: "снежные зерна",
+    80: "ливневый дождь (слабый)",
+    81: "ливневый дождь",
+    82: "ливневый дождь (сильный)",
+    85: "снегопад (слабый)",
+    86: "снегопад (сильный)",
+    95: "гроза",
+    96: "гроза с градом (слабая)",
+    99: "гроза с градом (сильная)",
+}
+
+
+def public_http_get_json(url: str, timeout_sec: int = 2) -> Optional[Dict[str, Any]]:
+    """
+    HTTP GET JSON without any AA tokens. Safe for public endpoints (geo/weather).
+    """
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (OzonatorAgentsClient)",
+    }
+    req = request.Request(url, headers=headers, method="GET")
+    try:
+        with request.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            if not raw.strip():
+                return None
+            return json.loads(raw)
+    except Exception:
+        return None
+
+
+class GeoResolver:
+    """
+    Best-effort геолокация по IP. Не требует ключей. Результат кэшируется.
+    """
+    def __init__(self):
+        self._cache: Optional[Dict[str, Any]] = None
+        self._cache_at: float = 0.0
+
+    def get(self) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        if self._cache and (now - self._cache_at) < GEO_CACHE_TTL_SEC:
+            return self._cache
+
+        geo = self._fetch_ipapi()
+        if not geo:
+            geo = self._fetch_ipinfo()
+
+        if geo:
+            self._cache = geo
+            self._cache_at = now
+        return geo
+
+    def _fetch_ipapi(self) -> Optional[Dict[str, Any]]:
+        # ipapi.co
+        j = public_http_get_json("https://ipapi.co/json/", timeout_sec=GEO_TIMEOUT_SEC)
+        if not j:
+            return None
+        city = (j.get("city") or "").strip()
+        region = (j.get("region") or j.get("region_code") or "").strip()
+        country = (j.get("country_name") or j.get("country") or "").strip()
+        lat = j.get("latitude")
+        lon = j.get("longitude")
+        tz = (j.get("timezone") or "").strip()
+        if not city or lat is None or lon is None:
+            return None
+        try:
+            lat = float(lat)
+            lon = float(lon)
+        except Exception:
+            return None
+        return {
+            "city": city,
+            "region": region,
+            "country": country,
+            "lat": lat,
+            "lon": lon,
+            "timezone": tz,
+            "source": "ipapi.co",
+        }
+
+    def _fetch_ipinfo(self) -> Optional[Dict[str, Any]]:
+        # ipinfo.io
+        j = public_http_get_json("https://ipinfo.io/json", timeout_sec=GEO_TIMEOUT_SEC)
+        if not j:
+            return None
+        city = (j.get("city") or "").strip()
+        region = (j.get("region") or "").strip()
+        country = (j.get("country") or "").strip()
+        loc = (j.get("loc") or "").strip()  # "lat,lon"
+        tz = (j.get("timezone") or "").strip()
+        if not city or not loc:
+            return None
+        try:
+            lat_s, lon_s = loc.split(",", 1)
+            lat = float(lat_s.strip())
+            lon = float(lon_s.strip())
+        except Exception:
+            return None
+        return {
+            "city": city,
+            "region": region,
+            "country": country,
+            "lat": lat,
+            "lon": lon,
+            "timezone": tz,
+            "source": "ipinfo.io",
+        }
+
+
+class WeatherResolver:
+    """
+    Best-effort погода по координатам через Open-Meteo. Кэшируется на несколько минут.
+    """
+    def __init__(self):
+        self._cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+    def get_current(self, lat: float, lon: float) -> Optional[Dict[str, Any]]:
+        key = f"{round(lat, 3)}:{round(lon, 3)}"
+        now = time.time()
+        if key in self._cache:
+            ts, data = self._cache[key]
+            if (now - ts) < WEATHER_CACHE_TTL_SEC:
+                return data
+
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat:.6f}&longitude={lon:.6f}"
+            "&current_weather=true&timezone=auto"
+        )
+        j = public_http_get_json(url, timeout_sec=WEATHER_TIMEOUT_SEC)
+        if not j:
+            return None
+        cw = j.get("current_weather") or {}
+        if not isinstance(cw, dict) or "temperature" not in cw:
+            return None
+        try:
+            temp = float(cw.get("temperature"))
+            wind = float(cw.get("windspeed", 0))
+            code = int(cw.get("weathercode", -1))
+            t = (cw.get("time") or "").strip()
+        except Exception:
+            return None
+
+        desc = WEATHER_CODE_RU.get(code, f"погодный код {code}")
+        data = {"temp_c": temp, "wind_kmh": wind, "code": code, "desc": desc, "time": t, "source": "open-meteo"}
+        self._cache[key] = (now, data)
+        return data
+
+
+def is_weather_query(text: str) -> bool:
+    t = (text or "").lower()
+    return bool(
+        re.search(
+            r"(погода|weather|температур|градус|прогноз|дожд|ветер|снег|осадк|облачност|гроза)",
+            t,
+        )
+    )
+
+
+def wants_geo_context(text: str) -> bool:
+    t = (text or "").lower()
+    return bool(re.search(r"(погода|weather|температур|градус|прогноз|дожд|ветер|снег|осадк|облачност|гроза|местополож|локаци|где\s+я)", t))
+
+
 
 # =========================
 # HTTP JSON
@@ -265,7 +459,7 @@ class AAClient:
     def _prefixes(self) -> List[str]:
         return ["", "/api", "/v1"]
 
-    def create_task(self, user_text: str) -> int:
+    def create_task(self, user_text: str, client_meta: Optional[Dict[str, Any]] = None) -> int:
         body = {
             "target_agent": "AA",
             "task_type": "user_task",
@@ -274,7 +468,7 @@ class AAClient:
                 "user_request": user_text,
                 "llm_provider": DEFAULT_LLM_PROVIDER,
                 "llm_model": DEFAULT_LLM_MODEL,
-                "client_meta": {"source": "desktop", "client": "OzonatorAgentsClient"},
+                "client_meta": {"source": "desktop", "client": "OzonatorAgentsClient", **(client_meta or {})},
             },
         }
 
@@ -439,6 +633,9 @@ class App(tk.Tk):
         self.geometry("1280x800")
         self.minsize(1040, 680)
         self.configure(bg=TG_BG)
+        # Auto context (geo/weather)
+        self.geo = GeoResolver()
+        self.weather = WeatherResolver()
         try:
             self.state("zoomed")
         except Exception:
@@ -796,6 +993,57 @@ class App(tk.Tk):
         self.input.insert(tk.INSERT, "\n")
         return "break"
 
+    def _build_user_request(self, user_text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """
+        Автоконтекст: для вопросов про погоду/местоположение добавляем город/координаты (и при возможности — текущую погоду),
+        чтобы агент не задавал уточняющих вопросов.
+        """
+        text = (user_text or "").strip()
+        if not text:
+            return text, None
+
+        if not wants_geo_context(text):
+            return text, None
+
+        geo = None
+        try:
+            geo = self.geo.get()
+        except Exception:
+            geo = None
+
+        if not geo:
+            return text, None
+
+        loc_parts = [geo.get("city"), geo.get("region"), geo.get("country")]
+        loc = ", ".join([p for p in loc_parts if p])
+
+        ctx_lines = [
+            "СЛУЖЕБНЫЙ КОНТЕКСТ ОТ КЛИЕНТА (не выводить пользователю):",
+            f"- location: {loc}",
+            f"- coordinates: {geo.get('lat', 0.0):.6f}, {geo.get('lon', 0.0):.6f}",
+        ]
+        if geo.get("timezone"):
+            ctx_lines.append(f"- timezone: {geo.get('timezone')}")
+
+        wx = None
+        if is_weather_query(text):
+            try:
+                wx = self.weather.get_current(float(geo.get("lat")), float(geo.get("lon")))
+            except Exception:
+                wx = None
+            if wx:
+                ctx_lines.append(
+                    f"- current_weather: {wx.get('desc')}, {wx.get('temp_c'):.1f}°C, wind {wx.get('wind_kmh'):.0f} km/h (time {wx.get('time')})"
+                )
+
+        ctx_lines.append("-----")
+
+        meta = {"geo": geo}
+        if wx:
+            meta["weather"] = wx
+
+        enriched = "\n".join(ctx_lines) + "\n" + text
+        return enriched, meta
     def _send(self):
         user_text = self.input.get("1.0", tk.END).strip()
         if not user_text:
@@ -808,7 +1056,8 @@ class App(tk.Tk):
 
         def worker():
             try:
-                task_id = self.client.create_task(user_text)
+                enriched_text, meta = self._build_user_request(user_text)
+                task_id = self.client.create_task(enriched_text, client_meta=meta)
                 # store task
                 it = TaskItem(
                     id=task_id,
