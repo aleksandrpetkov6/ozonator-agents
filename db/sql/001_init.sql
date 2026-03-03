@@ -114,3 +114,17 @@ CREATE TABLE IF NOT EXISTS agent_state (
 
 CREATE INDEX IF NOT EXISTS ix_agent_state_agent_code ON agent_state(agent_code);
 CREATE INDEX IF NOT EXISTS ix_agent_state_state_key ON agent_state(state_key);
+
+-- 8) task_files: вложения пользователя к задаче (для обработки агентами)
+CREATE TABLE IF NOT EXISTS task_files (
+  id BIGSERIAL PRIMARY KEY,
+  task_id BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  file_name TEXT NOT NULL,
+  content_type TEXT,
+  size_bytes BIGINT NOT NULL,
+  sha256 TEXT,
+  content BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_task_files_task_id ON task_files(task_id);
