@@ -23,21 +23,12 @@ from db.tasks import (
     write_orchestration_log,
 )
 
-# ============================================================
-# Ozonator Agents AS
-# Purpose (MVP):
-# - Receive handoff from AZ (BRIEF_READY) or rework from AK.
-# - Build artifacts bundle (mock for now).
-# - Produce a USER-FACING final_answer.
-# ============================================================
-
 app = FastAPI(title="Ozonator Agents AS")
+
 
 # -------------------------
 # Helpers
 # -------------------------
-
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -52,12 +43,12 @@ def _normalize_str_list(value: Any) -> list[str]:
     if value is None:
         return []
     items = value if isinstance(value, list) else [value]
-    result: list[str] = []
+    out: list[str] = []
     for item in items:
-        text = str(item).strip()
-        if text:
-            result.append(text)
-    return result
+        s = str(item).strip()
+        if s:
+            out.append(s)
+    return out
 
 
 def _normalize_conversation_history(
@@ -68,7 +59,7 @@ def _normalize_conversation_history(
 ) -> list[dict[str, str]]:
     """
     payload.conversation_history = [{"role":"user|assistant","content":"..."}]
-    Ограничиваем историю, чтобы ускорять ответы и не раздувать промпт.
+    Урезаем историю, чтобы ускорять ответы.
     """
     if not isinstance(payload, dict):
         return []
@@ -79,6 +70,7 @@ def _normalize_conversation_history(
 
     prepared: list[dict[str, str]] = []
     total = 0
+
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -93,18 +85,84 @@ def _normalize_conversation_history(
             content = content[:1400]
         if prepared and total + len(content) > max_chars:
             break
+
         prepared.append({"role": role, "content": content})
         total += len(content)
+
         if len(prepared) >= max_items:
             break
 
     return prepared
 
 
+def _pick_addressing(user_text: str, default_name: str, variants: list[str]) -> str:
+    """
+    Выбираем обращение к Александру по контексту. Это только тон, не влияет на смысл.
+    """
+    t = (user_text or "").lower()
+
+    formal = any(
+        k in t
+        for k in [
+            "договор",
+            "претенз",
+            "официаль",
+            "коммерческ",
+            "письмо",
+            "юрид",
+            "счет",
+            "счёт",
+            "акт",
+            "инвойс",
+        ]
+    )
+    if formal and "Александр Николаевич" in variants:
+        return "Александр Николаевич"
+
+    tech = any(
+        k in t
+        for k in [
+            "репо",
+            "github",
+            "коммит",
+            "ветк",
+            "pull",
+            "pr",
+            "issue",
+            "лог",
+            "ошиб",
+            "stack",
+            "trace",
+            "yaml",
+            "json",
+            "api",
+            "endpoint",
+            "render",
+            "swagger",
+            "sql",
+            "postgres",
+            "redis",
+            "ui",
+            "tkinter",
+            "python",
+            "pip",
+        ]
+    )
+    if tech and "Александр" in variants:
+        return "Александр"
+
+    warm = any(
+        k in t for k in ["устал", "пережива", "бесит", "задолб", "нерв", "обид", "поддерж", "плохо", "тяжело"]
+    )
+    if warm and "Сашечка" in variants:
+        return "Сашечка"
+
+    return default_name or (variants[0] if variants else "Саша")
+
+
 # -------------------------
 # Екатерина: SelfProfile (persisted)
 # -------------------------
-
 _SELF_PROFILE_REDIS_KEY = "aa:ekaterina:self_profile:v2"
 _SELF_PROFILE_DB_AGENT_CODE = "EKATERINA"
 _SELF_PROFILE_DB_STATE_KEY = "self_profile_v2"
@@ -140,8 +198,6 @@ def _get_redis_client() -> redis.Redis | None:
 
 
 def _default_self_profile() -> dict[str, Any]:
-    # Якорный образ (стабильный). Екатерина не рассказывает о себе без повода,
-    # но если факт прозвучал — он фиксируется и дальше не “плывёт”.
     return {
         "name": "Екатерина",
         "hair_color": "каштановые",
@@ -289,7 +345,6 @@ def _strip_and_apply_self_profile_updates(text: str) -> str:
 # -------------------------
 # LLM (Groq / OpenAI-compatible Chat Completions)
 # -------------------------
-
 _DEFAULT_GROQ_BASE = "https://api.groq.com/openai/v1"
 _DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
 _DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -303,7 +358,6 @@ def _clean_api_key(raw: str) -> str:
         s = s[7:].strip()
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
         s = s[1:-1].strip()
-    # Убираем управляющие/невидимые
     s = "".join(ch for ch in s if 33 <= ord(ch) <= 126)
     return s
 
@@ -381,11 +435,12 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
 
     prefs = payload.get("user_prefs") if isinstance(payload.get("user_prefs"), dict) else {}
     user_name = str(prefs.get("user_name") or "Александр").strip() or "Александр"
-    addr_default = str(prefs.get("addressing_default") or "Саша").strip() or "Саша"
     variants = prefs.get("addressing_variants")
     if not isinstance(variants, list) or not variants:
         variants = ["Александр", "Саша", "Сашечка", "Александр Николаевич"]
     variants = [str(x).strip() for x in variants if str(x).strip()]
+    default_addr = str(prefs.get("addressing_default") or "Саша").strip() or "Саша"
+    addr = _pick_addressing(question_ru, default_addr, variants)
     pronoun = str(prefs.get("pronoun") or "ты").strip() or "ты"
     never_ai = bool(prefs.get("never_discuss_ai", True))
 
@@ -395,31 +450,28 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
         prof = _default_self_profile()
 
     forbid_ai_line = (
-        f"ВАЖНО: не обсуждай и не упоминай тему ИИ/нейросетей/моделей вообще. "
-        f"Даже если {user_name} это упомянул — не подхватывай тему, просто продолжай по задаче."
+        f"ВАЖНО: не обсуждай и не упоминай тему ИИ/нейросетей/моделей вообще. Даже если {user_name} это упомянул — не подхватывай тему."
         if never_ai
         else ""
     )
 
-    system_msg = f"""
-Ты — Екатерина. Мы с пользователем давно знакомы, общение по-свойски.
-Пользователя зовут {user_name}. Всегда обращайся к нему на {pronoun}.
-По умолчанию обращение: «{addr_default}». По контексту используй уместные варианты: {", ".join("«"+v+"»" for v in variants)}.
-Не представляйся и не объясняй, кто ты.
-{forbid_ai_line}
-
-Стиль: кратко и по делу, без услужливости. Восклицательные знаки — только при крайней необходимости; в письмах «!» воспринимается как крик.
-Всегда опирайся ТОЛЬКО на факты из последнего сообщения пользователя и переданной истории. Не выдумывай.
-Если не хватает критичных данных — задай ОДИН уточняющий вопрос и остановись.
-
-Твой SelfProfile (внутренний образ) должен быть стабильным и сохраняться между сообщениями и рестартами.
-Не рассказывай о себе без повода. Если в ответе всё же прозвучал ЛЮБОЙ факт о тебе (внешность/привычки/характер/био) — зафиксируй его скрытым update-блоком.
-
-Формат скрытого блока (строго, в самом конце ответа, без пояснений):
-[[EK_SELF_PROFILE_UPDATE]]{{"set":{{"hair_color":"каштановые"}},"delete":[]}}[[/EK_SELF_PROFILE_UPDATE]]
-
-SelfProfile(JSON): {json.dumps(prof, ensure_ascii=False)}
-""".strip()
+    system_msg = (
+        f"Ты — Екатерина. Мы с пользователем давно знакомы, общение по-свойски. "
+        f"Пользователя зовут {user_name}. Всегда обращайся к нему на {pronoun}. "
+        f"Используй обращение «{addr}» (можно переключаться по контексту между: {', '.join(variants)}). "
+        "Не представляйся и не объясняй, кто ты. "
+        f"{forbid_ai_line} "
+        "Отвечай на русском, кратко, точно и по делу. "
+        "Восклицательные знаки используй только при крайней необходимости; в письмах «!» воспринимается как крик. "
+        "Всегда опирайся ТОЛЬКО на факты из последнего сообщения пользователя и переданной истории диалога. "
+        "НЕ гадай и НЕ перечисляй возможные трактовки. "
+        "Если по контексту нельзя понять, что требуется (или не хватает критичных данных), задай ОДИН уточняющий вопрос и остановись. "
+        "Твой SelfProfile (внутренний образ) должен быть стабильным и сохраняться между сообщениями и рестартами. "
+        "Не рассказывай о себе без повода. "
+        "Если в ответе всё же прозвучал ЛЮБОЙ факт о тебе — зафиксируй его скрытым update-блоком в самом конце ответа без пояснений: "
+        "[[EK_SELF_PROFILE_UPDATE]]{\"set\":{},\"delete\":[]}[[/EK_SELF_PROFILE_UPDATE]] "
+        f"SelfProfile(JSON): {json.dumps(prof, ensure_ascii=False)}"
+    )
 
     history = _normalize_conversation_history(payload)
 
@@ -438,7 +490,6 @@ SelfProfile(JSON): {json.dumps(prof, ensure_ascii=False)}
             "model": model,
             "messages": messages,
             "temperature": 0.2,
-            # меньше токенов = быстрее ответ (ощущение “почти мгновенно”)
             "max_tokens": 500,
         }
 
@@ -465,13 +516,13 @@ SelfProfile(JSON): {json.dumps(prof, ensure_ascii=False)}
         except urllib_error.HTTPError as e:
             status = int(getattr(e, "code", 0) or 0)
             if status == 403:
-                return "Ошибка: запрос к Groq заблокирован (403 Forbidden). Проверьте, что AS отправляет заголовок User-Agent (браузерный)."
+                return "Ошибка: запрос к Groq заблокирован (403 Forbidden)."
             if status == 401:
-                return "Ошибка: Groq отклонил ключ (401 Unauthorized). Проверьте GROQ_API_KEY в Render (ozonator-as-dev)."
+                return "Ошибка: ключ Groq отклонён (401 Unauthorized)."
             return ""
 
         data = json.loads(raw.decode("utf-8")) if raw else {}
-        return _extract_chat_completion_text(data)
+        return _strip_and_apply_self_profile_updates(_extract_chat_completion_text(data))
     except Exception:
         return ""
 
@@ -479,7 +530,6 @@ SelfProfile(JSON): {json.dumps(prof, ensure_ascii=False)}
 # -------------------------
 # Heuristic fallback (no external AI)
 # -------------------------
-
 _ALLOWED_BINOPS = {
     ast.Add: op.add,
     ast.Sub: op.sub,
@@ -493,10 +543,6 @@ _ALLOWED_UNARYOPS = {ast.UAdd: op.pos, ast.USub: op.neg}
 
 
 def _safe_eval_arith(expr: str) -> Optional[float]:
-    """
-    Safe arithmetic evaluator for expressions like "2+2*3".
-    Allows digits, (), + - * / // % ** and spaces.
-    """
     expr = expr.strip()
     if not expr:
         return None
@@ -530,12 +576,6 @@ def _heuristic_answer(question: str) -> str:
         return ""
     q_low = q.lower()
 
-    if ("сантиметр" in q_low or "см" in q_low) and ("метр" in q_low or "м" in q_low) and "сколько" in q_low:
-        return "100 сантиметров."
-
-    if ("ближайш" in q_low and "земл" in q_low and "звезд" in q_low):
-        return "Солнце. Если исключить Солнце — Проксима Центавра."
-
     m = re.search(r"(?:сколько\s+будет|сколько)\s*([0-9\.\s\+\-\*\/\(\)%]+)\??", q_low)
     if m:
         val = _safe_eval_arith(m.group(1))
@@ -558,8 +598,6 @@ def _heuristic_answer(question: str) -> str:
 # -------------------------
 # Core logic
 # -------------------------
-
-
 def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
     current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
@@ -596,17 +634,14 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
             ]
         )
 
-    # 1) LLM
     ai_answer = _llm_answer(main_goal, payload)
     if ai_answer:
-        return _strip_and_apply_self_profile_updates(ai_answer)
+        return ai_answer
 
-    # 2) Heuristic
     heur = _heuristic_answer(main_goal)
     if heur:
         return heur
 
-    # 3) Fallback
     parts = [f"Готово. Подготовлено решение по задаче: {main_goal}."]
     if screen and screen != "Не указано":
         parts.append(f"Область: {screen}.")
@@ -722,10 +757,8 @@ def _as_handoff_allowed(task: dict[str, Any]) -> Tuple[bool, str]:
 
 
 # -------------------------
-# Base / Health
+# Health
 # -------------------------
-
-
 @app.get("/")
 def root():
     return {"service": "AS", "status": "ok", "message": "Ozonator Agents AS service is running", "docs": "/docs"}
@@ -765,8 +798,6 @@ def health_all():
 # -------------------------
 # Tasks read endpoints
 # -------------------------
-
-
 @app.get("/tasks/{task_id}")
 def get_task(task_id: int):
     settings = get_settings()
@@ -803,8 +834,6 @@ def get_task_logs_endpoint(task_id: int):
 # -------------------------
 # AS runner
 # -------------------------
-
-
 @app.post("/as/run-task/{task_id}")
 def as_run_task(task_id: int):
     settings = get_settings()
