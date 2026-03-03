@@ -1,11 +1,12 @@
+import hashlib
 import json
 import os
 from typing import Annotated, Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
+from fastapi.responses import JSONResponse, Response
 
 from app.config import get_settings
 from db.health import check_postgres, check_redis
@@ -24,6 +25,7 @@ from db.tasks import (
     update_task_status,
     write_orchestration_log,
 )
+from db.files import add_task_file, get_task_file_content, list_task_files
 from schemas.tasks import TaskCreateRequest
 
 app = FastAPI(title="Ozonator Agents AA")
@@ -217,6 +219,182 @@ def tasks_create(body: TaskCreateRequest):
             "task": task if ok else None,
         },
     )
+
+
+@app.post("/tasks/{task_id}/files/upload")
+async def upload_task_file(task_id: int, file: UploadFile = File(...)):
+    settings = get_settings()
+
+    ok_task, _task, message_task = get_task_record(settings.database_url, task_id)
+    if not ok_task:
+        return _json_response(
+            404 if message_task == "Задача не найдена" else 503,
+            {
+                "service": "AA",
+                "operation": "upload_task_file",
+                "status": "error",
+                "message": message_task,
+                "task_id": task_id,
+            },
+        )
+
+    raw = await file.read()
+    max_bytes = int(getattr(settings, "aa_max_upload_bytes", 10 * 1024 * 1024) or (10 * 1024 * 1024))
+    if raw is None:
+        raw = b""
+    if len(raw) > max_bytes:
+        return _json_response(
+            413,
+            {
+                "service": "AA",
+                "operation": "upload_task_file",
+                "status": "error",
+                "message": f"Файл слишком большой. Лимит {max_bytes} bytes",
+                "task_id": task_id,
+            },
+        )
+
+    file_name = (file.filename or "file").strip() or "file"
+    content_type = (file.content_type or "application/octet-stream").strip()
+
+    ok, meta, message = add_task_file(
+        settings.database_url,
+        task_id=task_id,
+        file_name=file_name,
+        content_type=content_type,
+        content=raw,
+    )
+    if not ok and message == "schema_not_initialized":
+        # Подстраховка для старых деплоев: создаём схему (включая task_files) и повторяем
+        init_schema(settings.database_url)
+        ok, meta, message = add_task_file(
+            settings.database_url,
+            task_id=task_id,
+            file_name=file_name,
+            content_type=content_type,
+            content=raw,
+        )
+
+    if not ok:
+        return _json_response(
+            503,
+            {
+                "service": "AA",
+                "operation": "upload_task_file",
+                "status": "error",
+                "message": message,
+                "task_id": task_id,
+            },
+        )
+
+    write_orchestration_log(
+        settings.database_url,
+        task_id=task_id,
+        actor_agent="AA",
+        event_type="file_uploaded",
+        level="info",
+        message="Пользователь загрузил файл во вложения задачи",
+        meta={
+            "file_id": meta.get("id") if isinstance(meta, dict) else None,
+            "file_name": file_name,
+            "content_type": content_type,
+            "size_bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        },
+    )
+
+    return _json_response(
+        200,
+        {
+            "service": "AA",
+            "operation": "upload_task_file",
+            "status": "ok",
+            "message": "Файл сохранён",
+            "task_id": task_id,
+            "file": meta,
+        },
+    )
+
+
+@app.get("/tasks/{task_id}/files")
+def list_task_files_endpoint(task_id: int):
+    settings = get_settings()
+
+    ok_task, _task, message_task = get_task_record(settings.database_url, task_id)
+    if not ok_task:
+        return _json_response(
+            404 if message_task == "Задача не найдена" else 503,
+            {
+                "service": "AA",
+                "operation": "list_task_files",
+                "status": "error",
+                "message": message_task,
+                "task_id": task_id,
+                "files": None,
+            },
+        )
+
+    ok, files, message = list_task_files(settings.database_url, task_id)
+    if not ok and message == "schema_not_initialized":
+        return _json_response(
+            200,
+            {
+                "service": "AA",
+                "operation": "list_task_files",
+                "status": "ok",
+                "message": "OK",
+                "task_id": task_id,
+                "files": [],
+            },
+        )
+    if not ok:
+        return _json_response(
+            503,
+            {
+                "service": "AA",
+                "operation": "list_task_files",
+                "status": "error",
+                "message": message,
+                "task_id": task_id,
+                "files": None,
+            },
+        )
+
+    return _json_response(
+        200,
+        {
+            "service": "AA",
+            "operation": "list_task_files",
+            "status": "ok",
+            "message": "OK",
+            "task_id": task_id,
+            "files": files or [],
+        },
+    )
+
+
+@app.get("/tasks/{task_id}/files/{file_id}/download")
+def download_task_file(task_id: int, file_id: int):
+    settings = get_settings()
+    ok, meta, content, message = get_task_file_content(settings.database_url, task_id, file_id)
+    if not ok:
+        return _json_response(
+            404 if message in {"Файл не найден", "Задача не найдена"} else 503,
+            {
+                "service": "AA",
+                "operation": "download_task_file",
+                "status": "error",
+                "message": message,
+                "task_id": task_id,
+                "file_id": file_id,
+            },
+        )
+
+    file_name = (meta.get("file_name") if isinstance(meta, dict) else None) or f"file_{file_id}"
+    content_type = (meta.get("content_type") if isinstance(meta, dict) else None) or "application/octet-stream"
+
+    headers = {"Content-Disposition": f"attachment; filename=\"{file_name}\""}
+    return Response(content=content or b"", media_type=content_type, headers=headers)
 
 
 
