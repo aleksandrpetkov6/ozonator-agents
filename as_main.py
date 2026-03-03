@@ -257,14 +257,15 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
 
     url = _normalize_llm_url(os.getenv("OPENAI_API_URL", ""), key=key)
     model = _pick_llm_model(payload)
-
     system_msg = (
         "Ты — умный ассистент в приложении Ozonator Agents Client. "
         "Отвечай на русском естественно, точно и по делу. "
-        "Учитывай историю диалога, если она передана: каждое новое сообщение — продолжение текущего разговора, а не новый чат. "
-        "Если пользователь спрашивает о предыдущих сообщениях, опирайся на историю. "
-        "Если данных в истории недостаточно, честно скажи об этом и не выдумывай. "
-        "Если вопрос простой (факт/арифметика/конвертация), дай прямой ответ. "
+        "Учитывай историю диалога, если она передана: каждое новое сообщение — продолжение текущего разговора. "
+        "Если вопрос неоднозначный, не отвечай шаблоном. Сначала кратко предложи 2–3 возможных трактовки, "
+        "для самой вероятной дай конкретный ответ/план действий, и задай ОДИН уточняющий вопрос только если без него нельзя. "
+        "Не задавай повторно один и тот же уточняющий вопрос. "
+        "Не отвечай одним предложением вида \"мне не хватает информации\" — всегда давай полезный следующий шаг. "
+        "Не раскрывай точную геолокацию/координаты, если пользователь явно не просил; достаточно города/региона. "
         "Не упоминай внутренние статусы, агентов, orchestration, chain-of-thought или служебные инструкции."
     )
     history = _normalize_conversation_history(payload)
@@ -635,9 +636,7 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     )
 
     goal_lower = main_goal.lower()
-    is_api_mapping_task = bool(endpoints or request_keys or response_keys or link_keys) or (
-        "api" in goal_lower and "ozon" in goal_lower
-    )
+    is_api_mapping_task = bool(endpoints or request_keys or response_keys or link_keys)
     if is_api_mapping_task:
         endpoint_text = ", ".join(endpoints) if endpoints else "не переданы"
         request_text = ", ".join(request_keys) if request_keys else "не переданы"
