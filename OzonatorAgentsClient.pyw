@@ -48,6 +48,9 @@ DEFAULT_LLM_PROVIDER = os.environ.get("OZONATOR_LLM_PROVIDER", "groq").strip() o
 DEFAULT_LLM_MODEL = os.environ.get("OZONATOR_LLM_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 
 APP_NAME = "Ozonator Agents Client"
+AA_DISPLAY_NAME = "Екатерина"
+SHOW_HISTORY_PANEL = False  # скрыть левую панель истории диалогов
+
 HISTORY_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "OzonatorAgentsClient"
 HISTORY_FILE = HISTORY_DIR / "history.json"
 LOG_FILE = HISTORY_DIR / "client.log"
@@ -578,7 +581,7 @@ class App(tk.Tk):
 
         avatar = tk.Label(
             header,
-            text="AA",
+            text="ЕК",
             bg=TG_ACCENT,
             fg="#ffffff",
             font=self.font_ui_10_bold,
@@ -592,14 +595,14 @@ class App(tk.Tk):
         title_wrap.pack(side="left", fill="y", pady=10)
         tk.Label(
             title_wrap,
-            text=APP_NAME,
+            text=AA_DISPLAY_NAME,
             bg=TG_HEADER,
             fg=TG_TEXT,
             font=self.font_ui_12_bold,
         ).pack(anchor="w")
         tk.Label(
             title_wrap,
-            text="Telegram-like тёмный интерфейс",
+            text=APP_NAME,
             bg=TG_HEADER,
             fg=TG_MUTED,
             font=self.font_ui_9,
@@ -624,72 +627,12 @@ class App(tk.Tk):
         body = tk.Frame(self, bg=TG_BG)
         body.pack(fill="both", expand=True, padx=14, pady=14)
 
-        left = tk.Frame(body, bg=TG_PANEL, width=300, bd=0, highlightthickness=1, highlightbackground=TG_BORDER)
-        left.pack(side="left", fill="y")
-        left.pack_propagate(False)
-
-        tk.Label(
-            left,
-            text="Диалоги",
-            bg=TG_PANEL,
-            fg=TG_TEXT,
-            font=self.font_ui_11_bold,
-        ).pack(anchor="w", padx=14, pady=(14, 10))
-
-        list_frame = tk.Frame(left, bg=TG_PANEL)
-        list_frame.pack(fill="both", expand=True, padx=10)
-
-        self.lb = tk.Listbox(
-            list_frame,
-            height=25,
-            bg=TG_PANEL_ALT,
-            fg=TG_TEXT,
-            selectbackground=TG_ACCENT,
-            selectforeground="#ffffff",
-            activestyle="none",
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            font=self.font_ui_10,
-        )
-        self.lb.pack(fill="both", expand=True)
-        self.lb.bind("<<ListboxSelect>>", self._on_select_history)
-
-        btns = tk.Frame(left, bg=TG_PANEL)
-        btns.pack(fill="x", padx=10, pady=10)
-        tk.Button(
-            btns,
-            text="Удалить",
-            command=self._delete_selected,
-            bg=TG_PANEL_ALT,
-            fg=TG_TEXT,
-            activebackground=TG_BORDER,
-            activeforeground=TG_TEXT,
-            relief="flat",
-            bd=0,
-            padx=12,
-            pady=8,
-            cursor="hand2",
-        ).pack(side="left")
-        tk.Button(
-            btns,
-            text="Очистить",
-            command=self._clear_history,
-            bg=TG_PANEL_ALT,
-            fg=TG_TEXT,
-            activebackground=TG_BORDER,
-            activeforeground=TG_TEXT,
-            relief="flat",
-            bd=0,
-            padx=12,
-            pady=8,
-            cursor="hand2",
-        ).pack(side="right")
-
+        # По НФ: левую панель истории чатов скрываем.
+        self.lb = None
         right = tk.Frame(body, bg=TG_BG)
-        right.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        right.pack(side="left", fill="both", expand=True)
 
-        self.status_var = tk.StringVar(value="Готово к работе. Введите задачу и нажмите «Отправить».")
+        self.status_var = tk.StringVar(value="Готово к работе. Введите задачу и нажмите «Отправить»." )
         tk.Label(
             right,
             textvariable=self.status_var,
@@ -719,12 +662,42 @@ class App(tk.Tk):
         )
         self.chat.pack(fill="both", expand=True)
         self.chat.configure(state="disabled")
-        self.chat.tag_configure("aa_ts", foreground=TG_MUTED, font=self.font_ui_8, lmargin1=22, lmargin2=22, rmargin=170, spacing1=8)
-        self.chat.tag_configure("user_ts", foreground=TG_MUTED, font=self.font_ui_8, justify="right", lmargin1=170, lmargin2=170, rmargin=22, spacing1=8)
-        self.chat.tag_configure("system_ts", foreground=TG_MUTED, font=self.font_ui_8, justify="center", lmargin1=120, lmargin2=120, rmargin=120, spacing1=8)
-        self.chat.tag_configure("aa_msg", foreground=TG_TEXT, background=TG_AA_BG, lmargin1=22, lmargin2=22, rmargin=170, spacing3=8)
-        self.chat.tag_configure("user_msg", foreground="#ffffff", background=TG_ME_BG, justify="right", lmargin1=170, lmargin2=170, rmargin=22, spacing3=8)
-        self.chat.tag_configure("system_msg", foreground=TG_TEXT, background=TG_SYSTEM_BG, justify="center", lmargin1=120, lmargin2=120, rmargin=120, spacing3=8)
+
+        # По НФ: убираем «зебру» — одинаковый фон, без заливки строк.
+        self.chat.tag_configure(
+            "aa_ts",
+            foreground=TG_MUTED,
+            font=self.font_ui_8,
+            lmargin1=18,
+            lmargin2=18,
+            rmargin=170,
+            spacing1=8,
+        )
+        self.chat.tag_configure(
+            "user_ts",
+            foreground=TG_MUTED,
+            font=self.font_ui_8,
+            justify="right",
+            lmargin1=170,
+            lmargin2=170,
+            rmargin=18,
+            spacing1=8,
+        )
+        self.chat.tag_configure(
+            "system_ts",
+            foreground=TG_MUTED,
+            font=self.font_ui_8,
+            justify="center",
+            lmargin1=120,
+            lmargin2=120,
+            rmargin=120,
+            spacing1=8,
+        )
+
+        # Важно: background НЕ задаём — так исчезают «полосы».
+        self.chat.tag_configure("aa_msg", foreground=TG_TEXT, lmargin1=18, lmargin2=18, rmargin=170, spacing3=8)
+        self.chat.tag_configure("user_msg", foreground="#ffffff", justify="right", lmargin1=170, lmargin2=170, rmargin=18, spacing3=8)
+        self.chat.tag_configure("system_msg", foreground=TG_TEXT, justify="center", lmargin1=120, lmargin2=120, rmargin=120, spacing3=8)
 
         bottom = tk.Frame(right, bg=TG_PANEL, bd=0, highlightthickness=1, highlightbackground=TG_BORDER)
         bottom.pack(fill="x", pady=(12, 0))
@@ -783,6 +756,9 @@ class App(tk.Tk):
             cursor="hand2",
         ).pack(fill="x", pady=(8, 0))
 
+
+    # ---------- history ----------
+
     # ---------- history ----------
     def _load_history(self):
         data = _json_load(HISTORY_FILE, [])
@@ -798,12 +774,17 @@ class App(tk.Tk):
         _json_save(HISTORY_FILE, [i.to_dict() for i in self.items])
 
     def _refresh_history_list(self):
+        if getattr(self, 'lb', None) is None:
+            return
         self.lb.delete(0, tk.END)
         for it in self.items:
             self.lb.insert(tk.END, f"{it.title} (#{it.id})")
 
     def _on_select_history(self, _evt=None):
-        sel = self.lb.curselection()
+        lb = getattr(self, 'lb', None)
+        if lb is None:
+            return
+        sel = lb.curselection()
         if not sel:
             return
         idx = int(sel[0])
@@ -817,7 +798,10 @@ class App(tk.Tk):
         self._start_polling()
 
     def _delete_selected(self):
-        sel = self.lb.curselection()
+        lb = getattr(self, 'lb', None)
+        if lb is None:
+            return
+        sel = lb.curselection()
         if not sel:
             return
         idx = int(sel[0])
@@ -849,7 +833,7 @@ class App(tk.Tk):
         stamp = datetime.now().strftime("%H:%M")
         if who == "Вы":
             ts_tag, msg_tag = "user_ts", "user_msg"
-        elif who == "AA":
+        elif who in ("AA", AA_DISPLAY_NAME):
             ts_tag, msg_tag = "aa_ts", "aa_msg"
         else:
             ts_tag, msg_tag = "system_ts", "system_msg"
@@ -874,7 +858,7 @@ class App(tk.Tk):
         self._append("Вы", text)
 
     def _append_aa(self, text: str):
-        self._append("AA", text)
+        self._append(AA_DISPLAY_NAME, text)
 
     # ---------- conversation ----------
     def _load_conversation(self):
@@ -902,7 +886,7 @@ class App(tk.Tk):
         role = None
         if who == "Вы":
             role = "user"
-        elif who == "AA":
+        elif who in ("AA", AA_DISPLAY_NAME):
             role = "assistant"
         else:
             return
@@ -1120,7 +1104,8 @@ class App(tk.Tk):
             _, task_id, it = msg
             self.current_task_id = task_id
             self._refresh_history_list()
-            self.lb.selection_clear(0, tk.END)
+            if getattr(self, 'lb', None) is not None:
+                self.lb.selection_clear(0, tk.END)
             self.lb.selection_set(0)
             self.lb.activate(0)
             self.status_var.set(f"Задача #{task_id} создана. Запуск оркестрации…")
