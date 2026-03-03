@@ -68,6 +68,13 @@ CREATE_RETRIES = 4
 WARMUP_INTERVAL_SEC = 55
 WARMUP_TIMEOUT_SEC = 3
 
+# Conversation context (in-memory; sent with each request)
+CTX_MAX_MESSAGES = 24
+CTX_HEAD_MESSAGES = 2
+CTX_MAX_CHARS = 5200
+CTX_MAX_CHARS_PER_MSG = 180
+CTX_MAX_STORED_MESSAGES = 200
+
 # Telegram-like UI palette
 TG_BG = "#0f1720"
 TG_PANEL = "#17212b"
@@ -657,6 +664,9 @@ class App(tk.Tk):
         self._poll_inflight = False
         self._last_question_text = ""
 
+
+        # in-memory conversation for context (do NOT persist to disk)
+        self.session_messages: List[Dict[str, str]] = []
         self._load_history()
         self._build_ui()
         self._refresh_history_list()
@@ -975,9 +985,63 @@ class App(tk.Tk):
 
     def _append_user(self, text: str):
         self._append("Вы", text)
+        self._track_message("user", text)
 
     def _append_aa(self, text: str):
         self._append("AA", text)
+        self._track_message("assistant", text)
+
+    def _track_message(self, role: str, text: str):
+        """Храним историю диалога в памяти. На диск НЕ пишем."""
+        t = (text or "").strip()
+        if not t:
+            return
+        if role not in ("user", "assistant"):
+            return
+        self.session_messages.append({"role": role, "content": t})
+        if len(self.session_messages) > CTX_MAX_STORED_MESSAGES:
+            self.session_messages = self.session_messages[-CTX_MAX_STORED_MESSAGES:]
+
+    def _build_context_block(self, exclude_last_user_text: Optional[str] = None) -> str:
+        msgs = [
+            m
+            for m in self.session_messages
+            if m.get("role") in ("user", "assistant") and (m.get("content") or "").strip()
+        ]
+        if exclude_last_user_text and msgs and msgs[-1]["role"] == "user":
+            if msgs[-1]["content"].strip() == exclude_last_user_text.strip():
+                msgs = msgs[:-1]
+        if not msgs:
+            return ""
+
+        if len(msgs) > CTX_MAX_MESSAGES:
+            head = msgs[:CTX_HEAD_MESSAGES]
+            tail = msgs[-(CTX_MAX_MESSAGES - CTX_HEAD_MESSAGES):]
+            msgs_use = head + tail
+        else:
+            msgs_use = msgs
+
+        lines: List[str] = []
+        for m in msgs_use:
+            who = "Вы" if m["role"] == "user" else "AA"
+            c = (m["content"] or "").replace("\r", "").strip()
+            c = c.replace("\n", " / ")
+            if len(c) > CTX_MAX_CHARS_PER_MSG:
+                c = c[:CTX_MAX_CHARS_PER_MSG].rstrip() + "…"
+            lines.append(f"{who}: {c}")
+
+        block = (
+            "КОНТЕКСТ ПЕРЕПИСКИ (для понимания; не цитировать):\n"
+            + "\n".join(lines)
+            + "\n---\nОТВЕТЬ ТОЛЬКО НА ПОСЛЕДНИЙ ЗАПРОС НИЖЕ."
+        )
+        if len(block) > CTX_MAX_CHARS:
+            block = block[-CTX_MAX_CHARS:]
+            nl = block.find("\n")
+            if nl != -1:
+                block = block[nl + 1 :]
+                block = "КОНТЕКСТ ПЕРЕПИСКИ (сокращено):\n" + block
+        return block
 
     # ---------- actions ----------
     def _clear_input(self):
@@ -995,63 +1059,66 @@ class App(tk.Tk):
 
     def _build_user_request(self, user_text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """
-        Автоконтекст: для вопросов про погоду/местоположение добавляем город/координаты (и при возможности — текущую погоду),
-        чтобы агент не задавал уточняющих вопросов.
+        Формируем user_request так, чтобы:
+        - AA держал контекст (берём последние реплики из чата);
+        - вопросы про погоду/местоположение работали без уточнений.
+
+        Важно: контекст хранится только в памяти (не пишем на диск).
         """
         text = (user_text or "").strip()
         if not text:
             return text, None
 
-        if not wants_geo_context(text):
-            return text, None
+        parts: List[str] = []
+        ctx = self._build_context_block(exclude_last_user_text=text)
+        if ctx:
+            parts.append(ctx)
 
-        geo = None
-        try:
-            geo = self.geo.get()
-        except Exception:
+        meta: Dict[str, Any] = {}
+        if wants_geo_context(text):
             geo = None
-
-        if not geo:
-            return text, None
-
-        loc_parts = [geo.get("city"), geo.get("region"), geo.get("country")]
-        loc = ", ".join([p for p in loc_parts if p])
-
-        ctx_lines = [
-            "СЛУЖЕБНЫЙ КОНТЕКСТ ОТ КЛИЕНТА (не выводить пользователю):",
-            f"- location: {loc}",
-            f"- coordinates: {geo.get('lat', 0.0):.6f}, {geo.get('lon', 0.0):.6f}",
-        ]
-        if geo.get("timezone"):
-            ctx_lines.append(f"- timezone: {geo.get('timezone')}")
-
-        wx = None
-        if is_weather_query(text):
             try:
-                wx = self.weather.get_current(float(geo.get("lat")), float(geo.get("lon")))
+                geo = self.geo.get()
             except Exception:
-                wx = None
-            if wx:
-                ctx_lines.append(
-                    f"- current_weather: {wx.get('desc')}, {wx.get('temp_c'):.1f}°C, wind {wx.get('wind_kmh'):.0f} km/h (time {wx.get('time')})"
-                )
+                geo = None
 
-        ctx_lines.append("-----")
+            if geo:
+                loc_parts = [geo.get("city"), geo.get("region"), geo.get("country")]
+                loc = ", ".join([p for p in loc_parts if p])
+                if loc:
+                    parts.append(
+                        "Локация пользователя определена автоматически: "
+                        + loc
+                        + ". Считай это верным и не запрашивай подтверждение."
+                    )
 
-        meta = {"geo": geo}
-        if wx:
-            meta["weather"] = wx
+                # координаты НЕ вставляем в user_request (чтобы их не повторяли в ответе)
+                meta["geo"] = geo
 
-        enriched = "\n".join(ctx_lines) + "\n" + text
-        return enriched, meta
+                if is_weather_query(text):
+                    wx = None
+                    try:
+                        wx = self.weather.get_current(float(geo.get("lat")), float(geo.get("lon")))
+                    except Exception:
+                        wx = None
+                    if wx and wx.get("desc") is not None:
+                        parts.append(
+                            f"Текущая погода (авто): {wx.get('desc')}, {wx.get('temp_c'):.1f}°C, ветер {wx.get('wind_kmh'):.0f} км/ч."
+                        )
+                        meta["weather"] = wx
+
+        parts.append(text)
+        final = "\n\n".join([p for p in parts if (p or "").strip()])
+        return final, (meta or None)
+
     def _send(self):
+
         user_text = self.input.get("1.0", tk.END).strip()
         if not user_text:
             return
         self._clear_input()
         self._append_user(user_text)
-        # НФ: быстрый отклик — пользователю всегда видно, что запрос принят
-        self._append_aa("Принято. Выполняю.")
+        # Быстрый отклик: обновляем строку состояния (без сообщений в чате)
         self.status_var.set("Отправка задачи…")
 
         def worker():
