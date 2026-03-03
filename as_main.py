@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import ast
 import json
+import operator as op
 import os
 import re
-import ast
-import operator as op
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
+import psycopg
+import redis
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -27,20 +29,15 @@ from db.tasks import (
 # - Receive handoff from AZ (BRIEF_READY) or rework from AK.
 # - Build artifacts bundle (mock for now).
 # - Produce a USER-FACING final_answer.
-#
-# Patch v2:
-# - Add "direct answer" mode for generic user questions.
-#   1) If OpenAI key is configured on server: call Responses API and return answer.
-#   2) Else: try small built-in heuristics (math/unit conversions/FAQ).
-#   3) Else: fallback to previous template ("Готово... артефакты...").
 # ============================================================
 
 app = FastAPI(title="Ozonator Agents AS")
 
-
 # -------------------------
 # Helpers
 # -------------------------
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -63,7 +60,16 @@ def _normalize_str_list(value: Any) -> list[str]:
     return result
 
 
-def _normalize_conversation_history(payload: dict[str, Any] | None, *, max_items: int = 20, max_chars: int = 6000) -> list[dict[str, str]]:
+def _normalize_conversation_history(
+    payload: dict[str, Any] | None,
+    *,
+    max_items: int = 24,
+    max_chars: int = 7000,
+) -> list[dict[str, str]]:
+    """
+    payload.conversation_history = [{"role":"user|assistant","content":"..."}]
+    Ограничиваем историю, чтобы ускорять ответы и не раздувать промпт.
+    """
     if not isinstance(payload, dict):
         return []
 
@@ -79,68 +85,210 @@ def _normalize_conversation_history(payload: dict[str, Any] | None, *, max_items
         role = str(item.get("role") or "").strip().lower()
         if role not in {"user", "assistant"}:
             continue
-        content = re.sub(r"\s+", " ", str(item.get("content") or "").strip())
+        content = str(item.get("content") or "").strip()
+        content = re.sub(r"\s+", " ", content)
         if not content:
             continue
-        if len(content) > 1200:
-            content = content[:1200]
-        projected = total + len(content)
-        if prepared and projected > max_chars:
+        if len(content) > 1400:
+            content = content[:1400]
+        if prepared and total + len(content) > max_chars:
             break
         prepared.append({"role": role, "content": content})
-        total = projected
+        total += len(content)
         if len(prepared) >= max_items:
             break
+
     return prepared
 
-# -------------------------
-# Direct answering (optional)
-# -------------------------
-# IMPORTANT:
-# - Secrets (API keys) must be stored ONLY on server env (Render), never in client.
-# - This module supports BOTH:
-#   1) OpenAI Responses API (default for OpenAI)
-#   2) OpenAI-compatible Chat Completions (required for Groq)
-#
-# How to switch to Groq (server-side):
-# - Set API key in Render env (AS service):
-#     GROQ_API_KEY   (recommended)  OR  OPENAI_API_KEY  OR  Agents (legacy name)
-# - Optionally set:
-#     OPENAI_MODEL   (e.g. "llama-3.3-70b-versatile")
-#     OPENAI_API_URL (e.g. "https://api.groq.com/openai/v1/chat/completions")
-#
-# Defaults:
-# - If OPENAI_API_URL is not provided, we default to Groq Chat Completions endpoint.
-
-_LLM_URL = os.getenv("OPENAI_API_URL", "").strip() or "https://api.groq.com/openai/v1/chat/completions"
-_LLM_MODEL = os.getenv("OPENAI_MODEL", "").strip() or "llama-3.3-70b-versatile"
-
-# Prefer explicit Groq key, then OpenAI-style, then legacy "Agents" env var (as in your screenshot).
-_LLM_KEY = (
-    os.getenv("GROQ_API_KEY")
-    or os.getenv("OPENAI_API_KEY")
-    or os.getenv("Agents")
-    or ""
-).strip()
-
-
 
 # -------------------------
-# Direct answering (optional)
+# Екатерина: SelfProfile (persisted)
 # -------------------------
-# IMPORTANT:
-# - Secrets (API keys) must be stored ONLY on server env (Render), never in client.
-# - This module supports BOTH:
-#   1) OpenAI-compatible Chat Completions (required for Groq)
-#   2) OpenAI Responses API (optional for OpenAI)
-#
-# Server env vars (AS service):
-#   GROQ_API_KEY (recommended)
-#   OPENAI_API_KEY (fallback)
-#   Agents (legacy name)
-# Optional:
-#   GROQ_MODEL / OPENAI_MODEL
-#   OPENAI_API_URL (can be base .../v1 or full .../chat/completions)
+
+_SELF_PROFILE_REDIS_KEY = "aa:ekaterina:self_profile:v2"
+_SELF_PROFILE_DB_AGENT_CODE = "EKATERINA"
+_SELF_PROFILE_DB_STATE_KEY = "self_profile_v2"
+
+_SELF_PROFILE_UPDATE_RE = re.compile(
+    r"\[\[EK_SELF_PROFILE_UPDATE\]\](.*?)\[\[/EK_SELF_PROFILE_UPDATE\]\]",
+    re.S,
+)
+
+_REDIS_CLIENT: redis.Redis | None = None
+
+
+def _get_redis_client() -> redis.Redis | None:
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is not None:
+        return _REDIS_CLIENT
+
+    settings = get_settings()
+    if not getattr(settings, "redis_url", None):
+        return None
+
+    try:
+        _REDIS_CLIENT = redis.Redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        return _REDIS_CLIENT
+    except Exception:
+        _REDIS_CLIENT = None
+        return None
+
+
+def _default_self_profile() -> dict[str, Any]:
+    # Якорный образ (стабильный). Екатерина не рассказывает о себе без повода,
+    # но если факт прозвучал — он фиксируется и дальше не “плывёт”.
+    return {
+        "name": "Екатерина",
+        "hair_color": "каштановые",
+        "eyes": "ярко-голубые",
+        "vibe": "по-свойски, спокойная, без услужливости",
+    }
+
+
+def _db_load_self_profile() -> dict[str, Any] | None:
+    settings = get_settings()
+    db_url = getattr(settings, "database_url", None)
+    if not db_url:
+        return None
+    try:
+        with psycopg.connect(db_url, connect_timeout=3) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT state_json
+                    FROM agent_state
+                    WHERE agent_code = %s AND state_key = %s
+                    LIMIT 1;
+                    """,
+                    (_SELF_PROFILE_DB_AGENT_CODE, _SELF_PROFILE_DB_STATE_KEY),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        val = row[0]
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, str) and val.strip():
+            try:
+                obj = json.loads(val)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
+
+
+def _db_save_self_profile(profile: dict[str, Any]) -> None:
+    settings = get_settings()
+    db_url = getattr(settings, "database_url", None)
+    if not db_url:
+        return
+    try:
+        payload_json = json.dumps(profile, ensure_ascii=False)
+        with psycopg.connect(db_url, connect_timeout=3) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO agent_state (agent_code, state_key, state_json, updated_at)
+                    VALUES (%s, %s, %s::jsonb, NOW())
+                    ON CONFLICT (agent_code, state_key)
+                    DO UPDATE SET state_json = EXCLUDED.state_json, updated_at = NOW();
+                    """,
+                    (_SELF_PROFILE_DB_AGENT_CODE, _SELF_PROFILE_DB_STATE_KEY, payload_json),
+                )
+            conn.commit()
+    except Exception:
+        return
+
+
+def _load_self_profile() -> dict[str, Any]:
+    r = _get_redis_client()
+    if r is not None:
+        try:
+            raw = r.get(_SELF_PROFILE_REDIS_KEY)
+            if raw:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    return obj
+        except Exception:
+            pass
+
+    prof = _db_load_self_profile()
+    if isinstance(prof, dict) and prof:
+        if r is not None:
+            try:
+                r.set(_SELF_PROFILE_REDIS_KEY, json.dumps(prof, ensure_ascii=False))
+            except Exception:
+                pass
+        return prof
+
+    prof = _default_self_profile()
+    if r is not None:
+        try:
+            r.set(_SELF_PROFILE_REDIS_KEY, json.dumps(prof, ensure_ascii=False))
+        except Exception:
+            pass
+    _db_save_self_profile(prof)
+    return prof
+
+
+def _save_self_profile(profile: dict[str, Any]) -> None:
+    r = _get_redis_client()
+    if r is not None:
+        try:
+            r.set(_SELF_PROFILE_REDIS_KEY, json.dumps(profile, ensure_ascii=False))
+        except Exception:
+            pass
+    _db_save_self_profile(profile)
+
+
+def _apply_self_profile_update(update_obj: dict[str, Any]) -> None:
+    try:
+        current = _load_self_profile()
+        set_part = update_obj.get("set") if isinstance(update_obj.get("set"), dict) else {}
+        del_part = update_obj.get("delete") if isinstance(update_obj.get("delete"), list) else []
+
+        for k, v in set_part.items():
+            if isinstance(k, str) and k.strip():
+                current[k.strip()] = v
+        for k in del_part:
+            if isinstance(k, str) and k.strip():
+                current.pop(k.strip(), None)
+
+        _save_self_profile(current)
+    except Exception:
+        return
+
+
+def _strip_and_apply_self_profile_updates(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return text
+
+    cleaned = text
+    for m in list(_SELF_PROFILE_UPDATE_RE.finditer(text)):
+        payload = (m.group(1) or "").strip()
+        try:
+            upd = json.loads(payload)
+            if isinstance(upd, dict):
+                _apply_self_profile_update(upd)
+        except Exception:
+            pass
+        cleaned = cleaned.replace(m.group(0), "")
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
+# -------------------------
+# LLM (Groq / OpenAI-compatible Chat Completions)
+# -------------------------
 
 _DEFAULT_GROQ_BASE = "https://api.groq.com/openai/v1"
 _DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
@@ -153,16 +301,14 @@ def _clean_api_key(raw: str) -> str:
         return ""
     if s.lower().startswith("bearer "):
         s = s[7:].strip()
-    # Remove surrounding quotes
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
         s = s[1:-1].strip()
-    # Remove any hidden/control characters (incl. zero-width) and whitespace inside
+    # Убираем управляющие/невидимые
     s = "".join(ch for ch in s if 33 <= ord(ch) <= 126)
     return s
 
 
 def _pick_llm_key() -> str:
-    # Prefer explicit Groq key, then OpenAI-style, then legacy "Agents".
     for name in ("GROQ_API_KEY", "OPENAI_API_KEY", "Agents"):
         key = _clean_api_key(os.getenv(name, ""))
         if key:
@@ -187,11 +333,9 @@ def _normalize_llm_url(raw_url: str, *, key: str) -> str:
     u = url.rstrip("/")
     low = u.lower()
 
-    # Base forms -> append chat/completions
     if low.endswith("/v1") or low.endswith("/openai/v1"):
         return u + "/chat/completions"
 
-    # If URL is provider base but missing route -> append chat/completions
     if ("groq.com" in low or "openai.com" in low) and ("/chat/completions" not in low) and ("/responses" not in low):
         return u + "/chat/completions"
 
@@ -199,8 +343,7 @@ def _normalize_llm_url(raw_url: str, *, key: str) -> str:
 
 
 def _is_chat_completions(url: str) -> bool:
-    u = (url or "").lower()
-    return "/chat/completions" in u
+    return "/chat/completions" in (url or "").lower()
 
 
 def _extract_chat_completion_text(resp: dict[str, Any]) -> str:
@@ -227,82 +370,77 @@ def _extract_chat_completion_text(resp: dict[str, Any]) -> str:
     return ""
 
 
-def _extract_openai_output_text(resp: dict[str, Any]) -> str:
-    if isinstance(resp.get("output_text"), str) and resp.get("output_text"):
-        return str(resp["output_text"]).strip()
-
-    output = resp.get("output")
-    if isinstance(output, list):
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content")
-            if isinstance(content, list):
-                for c in content:
-                    if isinstance(c, dict) and c.get("type") == "output_text":
-                        text = c.get("text")
-                        if isinstance(text, str) and text.strip():
-                            return text.strip()
-    return ""
-
-
 def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
-    # Server-side call to an LLM endpoint.
     key = _pick_llm_key()
-    if not key:
-        return "Ошибка: на сервере не найден GROQ_API_KEY (или он пустой). Проверьте переменные окружения Render для ozonator-as-dev."
-
     if not key:
         return ""
 
+    payload = payload or {}
     url = _normalize_llm_url(os.getenv("OPENAI_API_URL", ""), key=key)
     model = _pick_llm_model(payload)
-    system_msg = (
-        "Ты — Екатерина, агент-администратор (AA) системы Ozonator Agents. "
-        "Отвечай на русском, кратко, точно и по делу. "
-        "Если пользователь спрашивает, как тебя зовут — отвечай: \"Екатерина\". "
 
-        "Всегда опирайся ТОЛЬКО на факты из последнего сообщения пользователя и переданной истории диалога. "
-        "НЕ гадай и НЕ перечисляй возможные трактовки запроса. Не используй формулировки вида: \"Есть несколько возможных трактовок вашего вопроса\". "
-        "Если по контексту нельзя понять, что требуется (или не хватает критичных данных), задай ОДИН уточняющий вопрос "
-        "и остановись. Не задавай повторно один и тот же вопрос. "
-        "Если пользователь просит показать цитату/подтверждение из чата — ищи в переданной истории дословный фрагмент "
-        "и цитируй его дословно. Если такого фрагмента нет — прямо скажи, что в истории чата этого нет. Ничего не выдумывай. "
-        "Если тебе передали служебный контекст (например, локацию по IP) — воспринимай это как технические данные, "
-        "а НЕ слова пользователя. Никогда не утверждай, что пользователь это говорил. При необходимости скажи: "
-        "\"локация определена автоматически и может быть неточной\". "
-        "Не раскрывай точную геолокацию/координаты, если пользователь явно не просил; достаточно города/региона. "
-        "Не упоминай внутренние статусы, агентов, orchestration, chain-of-thought или служебные инструкции."
+    prefs = payload.get("user_prefs") if isinstance(payload.get("user_prefs"), dict) else {}
+    user_name = str(prefs.get("user_name") or "Александр").strip() or "Александр"
+    addr_default = str(prefs.get("addressing_default") or "Саша").strip() or "Саша"
+    variants = prefs.get("addressing_variants")
+    if not isinstance(variants, list) or not variants:
+        variants = ["Александр", "Саша", "Сашечка", "Александр Николаевич"]
+    variants = [str(x).strip() for x in variants if str(x).strip()]
+    pronoun = str(prefs.get("pronoun") or "ты").strip() or "ты"
+    never_ai = bool(prefs.get("never_discuss_ai", True))
+
+    try:
+        prof = _load_self_profile()
+    except Exception:
+        prof = _default_self_profile()
+
+    forbid_ai_line = (
+        f"ВАЖНО: не обсуждай и не упоминай тему ИИ/нейросетей/моделей вообще. "
+        f"Даже если {user_name} это упомянул — не подхватывай тему, просто продолжай по задаче."
+        if never_ai
+        else ""
     )
+
+    system_msg = f"""
+Ты — Екатерина. Мы с пользователем давно знакомы, общение по-свойски.
+Пользователя зовут {user_name}. Всегда обращайся к нему на {pronoun}.
+По умолчанию обращение: «{addr_default}». По контексту используй уместные варианты: {", ".join("«"+v+"»" for v in variants)}.
+Не представляйся и не объясняй, кто ты.
+{forbid_ai_line}
+
+Стиль: кратко и по делу, без услужливости. Восклицательные знаки — только при крайней необходимости; в письмах «!» воспринимается как крик.
+Всегда опирайся ТОЛЬКО на факты из последнего сообщения пользователя и переданной истории. Не выдумывай.
+Если не хватает критичных данных — задай ОДИН уточняющий вопрос и остановись.
+
+Твой SelfProfile (внутренний образ) должен быть стабильным и сохраняться между сообщениями и рестартами.
+Не рассказывай о себе без повода. Если в ответе всё же прозвучал ЛЮБОЙ факт о тебе (внешность/привычки/характер/био) — зафиксируй его скрытым update-блоком.
+
+Формат скрытого блока (строго, в самом конце ответа, без пояснений):
+[[EK_SELF_PROFILE_UPDATE]]{{"set":{{"hair_color":"каштановые"}},"delete":[]}}[[/EK_SELF_PROFILE_UPDATE]]
+
+SelfProfile(JSON): {json.dumps(prof, ensure_ascii=False)}
+""".strip()
+
     history = _normalize_conversation_history(payload)
 
     try:
-        import urllib.request as urllib_request
         import urllib.error as urllib_error
+        import urllib.request as urllib_request
 
-        if _is_chat_completions(url):
-            messages = [{"role": "system", "content": system_msg}]
-            messages.extend(history)
-            messages.append({"role": "user", "content": question_ru})
-            body = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0.2,
-                "max_tokens": 512,
-            }
-        else:
-            input_items = [
-                {"role": "developer", "content": [{"type": "input_text", "text": system_msg}]},
-            ]
-            for item in history:
-                input_items.append(
-                    {"role": item["role"], "content": [{"type": "input_text", "text": item["content"]}]}
-                )
-            input_items.append({"role": "user", "content": [{"type": "input_text", "text": question_ru}]})
-            body = {
-                "model": model,
-                "input": input_items,
-            }
+        if not _is_chat_completions(url):
+            return ""
+
+        messages = [{"role": "system", "content": system_msg}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": question_ru})
+
+        body = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.2,
+            # меньше токенов = быстрее ответ (ощущение “почти мгновенно”)
+            "max_tokens": 500,
+        }
 
         req = urllib_request.Request(
             url,
@@ -310,8 +448,11 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
             headers={
                 "Content-Type": "application/json; charset=utf-8",
                 "Accept": "application/json",
-                # Cloudflare/Groq may block default Python-urllib UA; use browser-like UA.
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 OzonatorAgents-AS",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36 OzonatorAgents-AS"
+                ),
                 "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Authorization": f"Bearer {key}",
             },
@@ -323,53 +464,22 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
                 raw = r.read()
         except urllib_error.HTTPError as e:
             status = int(getattr(e, "code", 0) or 0)
-            # Try to read provider error body (without leaking secrets)
-            err_text = ""
-            try:
-                raw_err = e.read()  # type: ignore[attr-defined]
-                if raw_err:
-                    err_text = raw_err.decode("utf-8", errors="ignore")
-            except Exception:
-                err_text = ""
-
             if status == 403:
-                return "Ошибка: запрос к Groq заблокирован (403 Forbidden)."
-
+                return "Ошибка: запрос к Groq заблокирован (403 Forbidden). Проверьте, что AS отправляет заголовок User-Agent (браузерный)."
             if status == 401:
-                # Key exists but provider rejects it OR key is empty.
-                hint = ""
-                if err_text:
-                    # Trim to safe length
-                    hint = err_text.strip()
-                    if len(hint) > 500:
-                        hint = hint[:500] + "…"
-                # Do not print key; only presence/length
-                return (
-                    f"Ошибка: Groq 401 Unauthorized. "
-                    f"Ключ на сервере: {'есть' if key else 'нет'} (len={len(key)}). "
-                    + (f"Ответ провайдера: {hint}" if hint else "")
-                ).strip()
-
-            # Other errors -> empty (fallback to artifact template)
+                return "Ошибка: Groq отклонил ключ (401 Unauthorized). Проверьте GROQ_API_KEY в Render (ozonator-as-dev)."
             return ""
 
         data = json.loads(raw.decode("utf-8")) if raw else {}
-        if _is_chat_completions(url):
-            return _extract_chat_completion_text(data)
-        return _extract_openai_output_text(data)
-
+        return _extract_chat_completion_text(data)
     except Exception:
         return ""
-
-
-# Backward compatible alias (old name used by code below)
-def _openai_answer(question_ru: str) -> str:
-    return _llm_answer(question_ru)
 
 
 # -------------------------
 # Heuristic fallback (no external AI)
 # -------------------------
+
 _ALLOWED_BINOPS = {
     ast.Add: op.add,
     ast.Sub: op.sub,
@@ -390,11 +500,8 @@ def _safe_eval_arith(expr: str) -> Optional[float]:
     expr = expr.strip()
     if not expr:
         return None
-
-    # Quick allowlist
     if not re.fullmatch(r"[0-9\.\s\+\-\*\/\(\)%]*", expr):
         return None
-
     try:
         node = ast.parse(expr, mode="eval")
     except Exception:
@@ -417,174 +524,26 @@ def _safe_eval_arith(expr: str) -> Optional[float]:
         return None
 
 
-def _parse_ru_number(raw: str) -> Optional[float]:
-    s = (raw or "").strip().lower().replace(" ", "")
-    if not s:
-        return None
-    s = s.replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
-def _format_mass_value_kg(total_grams: float) -> str:
-    if total_grams >= 1000:
-        kg = total_grams / 1000.0
-        if abs(kg - round(kg)) < 1e-9:
-            return f"{int(round(kg))} кг"
-        return f"{kg:.3f}".rstrip("0").rstrip(".").replace(".", ",") + " кг"
-    if abs(total_grams - round(total_grams)) < 1e-9:
-        return f"{int(round(total_grams))} г"
-    return f"{total_grams:.3f}".rstrip("0").rstrip(".").replace(".", ",") + " г"
-
-
-def _is_weight_question_text(text: str) -> bool:
-    q_low = (text or "").lower()
-    return any(token in q_low for token in ("вес", "весит", "масса"))
-
-
-def _is_explicit_cm_in_meter_question(q_low: str) -> bool:
-    s = re.sub(r"\s+", " ", q_low)
-    patterns = [
-        r"(?:сколько|чему\s+равн(?:о|а))\s+(?:сантиметр(?:ов|а)?|см)\s+в\s+(?:одном\s+)?метр(?:е|у)\b",
-        r"(?:сколько|чему\s+равн(?:о|а))\s+(?:в\s+)?(?:одном\s+)?метр(?:е|у)\s+(?:сантиметр(?:ов|а)?|см)\b",
-    ]
-    return any(re.search(pattern, s) for pattern in patterns)
-
-
-def _extract_water_mass_grams(q_low: str) -> Optional[float]:
-    if "вод" not in q_low:
-        return None
-
-    volume_match = re.search(
-        r"(\d+(?:[\.,]\d+)?)\s*(?:куб(?:ическ(?:их|ие|ий)?)?\s*сантиметр(?:ов|а)?|см\s*(?:\^\s*3|3|³))",
-        q_low,
-    )
-    if volume_match:
-        value = _parse_ru_number(volume_match.group(1))
-        if value is not None:
-            return value
-
-    liter_match = re.search(r"(\d+(?:[\.,]\d+)?)\s*(?:литр(?:ов|а)?|л)\b", q_low)
-    if liter_match:
-        value = _parse_ru_number(liter_match.group(1))
-        if value is not None:
-            return value * 1000.0
-
-    if re.search(r"\bлитр\s+вод", q_low):
-        return 1000.0
-
-    return None
-
-
-def _extract_sugar_mass_grams(q_low: str) -> Optional[float]:
-    if "сахар" not in q_low:
-        return None
-
-    kg_match = re.search(r"(\d+(?:[\.,]\d+)?)\s*(?:килограмм(?:ов|а)?|кг)\b", q_low)
-    if kg_match:
-        value = _parse_ru_number(kg_match.group(1))
-        if value is not None:
-            return value * 1000.0
-
-    g_match = re.search(r"(\d+(?:[\.,]\d+)?)\s*(?:грамм(?:ов|а)?|гр\.?|г)\b", q_low)
-    if g_match:
-        value = _parse_ru_number(g_match.group(1))
-        if value is not None:
-            return value
-
-    return None
-
-
-def _is_answer_unit_mismatch(question: str, answer: str) -> bool:
-    if not _is_weight_question_text(question):
-        return False
-
-    a_low = (answer or "").lower()
-    has_mass = any(token in a_low for token in ("кг", "килограмм", "грамм", "тонн"))
-    has_length = any(token in a_low for token in ("сантиметр", " см", "см.", "метр", "мм", "дм"))
-    return bool(has_length and not has_mass)
-
-
-def _heuristic_answer(question: str, payload: dict[str, Any] | None = None) -> str:
+def _heuristic_answer(question: str) -> str:
     q = question.strip()
     if not q:
         return ""
-
     q_low = q.lower()
-    history = _normalize_conversation_history(payload)
 
-    if history:
-        user_history = [item["content"] for item in history if item.get("role") == "user" and item.get("content")]
-        if user_history:
-            if (
-                ("перв" in q_low and "вопрос" in q_low)
-                or ("что" in q_low and "спрос" in q_low and "перв" in q_low)
-            ):
-                first_question = user_history[0].strip()
-                return f'Первый вопрос в этом диалоге: "{first_question}"'
-            if (
-                ("предыдущ" in q_low and "вопрос" in q_low)
-                or ("последн" in q_low and "вопрос" in q_low)
-                or ("что" in q_low and "писал" in q_low and "предыдущ" in q_low)
-            ):
-                last_question = user_history[-1].strip()
-                return f'Предыдущее сообщение: "{last_question}"'
-
-    # Current time for common city/timezone questions (deterministic, no LLM needed)
-    if (("сколько" in q_low or "котор" in q_low) and "врем" in q_low) or ("который" in q_low and "час" in q_low):
-        offset = None
-        place = ""
-
-        if any(token in q_low for token in ("питер", "петербург", "санкт-петербург", "санкт петербург")):
-            offset = 3
-            place = "в Санкт-Петербурге"
-        elif any(token in q_low for token in ("москв",)):
-            offset = 3
-            place = "в Москве"
-        else:
-            m_utc = re.search(r"utc\s*([+-])\s*(\d{1,2})", q_low)
-            if m_utc:
-                sign = -1 if m_utc.group(1) == "-" else 1
-                offset = sign * int(m_utc.group(2))
-                place = f"в часовом поясе UTC{m_utc.group(1)}{int(m_utc.group(2))}"
-
-        if offset is not None:
-            now_local = datetime.now(timezone.utc) + timedelta(hours=offset)
-            return f"Сейчас {now_local.strftime('%H:%M')} {place}."
-
-    # Deterministic mass/volume answers for water and simple mixtures
-    if _is_weight_question_text(q_low):
-        water_mass_grams = _extract_water_mass_grams(q_low)
-        sugar_mass_grams = _extract_sugar_mass_grams(q_low)
-
-        if water_mass_grams is not None and sugar_mass_grams is not None:
-            total_grams = water_mass_grams + sugar_mass_grams
-            return f"Примерно {_format_mass_value_kg(total_grams)}."
-
-        if water_mass_grams is not None:
-            return f"Примерно {_format_mass_value_kg(water_mass_grams)}."
-
-    # Unit conversion: cm in meter (only for explicit length questions)
-    if _is_explicit_cm_in_meter_question(q_low) and not _is_weight_question_text(q_low):
+    if ("сантиметр" in q_low or "см" in q_low) and ("метр" in q_low or "м" in q_low) and "сколько" in q_low:
         return "100 сантиметров."
 
-    # Nearest star to Earth
     if ("ближайш" in q_low and "земл" in q_low and "звезд" in q_low):
         return "Солнце. Если исключить Солнце — Проксима Центавра."
 
-    # Arithmetic: "сколько будет 2+2" or any question that is mostly math
     m = re.search(r"(?:сколько\s+будет|сколько)\s*([0-9\.\s\+\-\*\/\(\)%]+)\??", q_low)
     if m:
         val = _safe_eval_arith(m.group(1))
         if val is not None:
-            # Pretty format: int if whole
             if abs(val - round(val)) < 1e-9:
                 return str(int(round(val)))
             return str(val)
 
-    # Also handle "2+2?" (pure expression)
     if re.fullmatch(r"[0-9\.\s\+\-\*\/\(\)%]+\??", q_low):
         expr = q_low.replace("?", "").strip()
         val = _safe_eval_arith(expr)
@@ -599,50 +558,30 @@ def _heuristic_answer(question: str, payload: dict[str, Any] | None = None) -> s
 # -------------------------
 # Core logic
 # -------------------------
+
+
 def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
     current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
-    az_fix_plan = (
-        current_result.get("az_fix_plan") if isinstance(current_result.get("az_fix_plan"), dict) else {}
-    )
+    az_fix_plan = current_result.get("az_fix_plan") if isinstance(current_result.get("az_fix_plan"), dict) else {}
 
     user_request = _normalize_text(payload.get("user_request"))
     payload_brief = _normalize_text(payload.get("brief"))
     goal = _normalize_text(az_fix_plan.get("goal"))
     title = _normalize_text(payload.get("title")) or _normalize_text(az_fix_plan.get("title"))
     screen = _normalize_text(payload.get("screen")) or _normalize_text(az_fix_plan.get("screen"))
-    target_columns = _normalize_str_list(payload.get("target_columns")) or _normalize_str_list(
-        az_fix_plan.get("target_columns")
-    )
+    target_columns = _normalize_str_list(payload.get("target_columns")) or _normalize_str_list(az_fix_plan.get("target_columns"))
+
     main_goal = user_request or payload_brief or goal or title or f"задача #{task_id}"
 
-    endpoints = _normalize_str_list(
-        payload.get("endpoints")
-        or payload.get("endpoint")
-        or az_fix_plan.get("endpoints")
-        or az_fix_plan.get("endpoint")
-    )
-    request_keys = _normalize_str_list(
-        payload.get("request_keys")
-        or payload.get("input_keys")
-        or az_fix_plan.get("request_keys")
-        or az_fix_plan.get("input_keys")
-    )
-    response_keys = _normalize_str_list(
-        payload.get("response_keys")
-        or payload.get("output_keys")
-        or az_fix_plan.get("response_keys")
-        or az_fix_plan.get("output_keys")
-    )
-    link_keys = _normalize_str_list(
-        payload.get("link_keys")
-        or payload.get("binding_keys")
-        or az_fix_plan.get("link_keys")
-        or az_fix_plan.get("binding_keys")
-    )
+    endpoints = _normalize_str_list(payload.get("endpoints") or payload.get("endpoint") or az_fix_plan.get("endpoints") or az_fix_plan.get("endpoint"))
+    request_keys = _normalize_str_list(payload.get("request_keys") or payload.get("input_keys") or az_fix_plan.get("request_keys") or az_fix_plan.get("input_keys"))
+    response_keys = _normalize_str_list(payload.get("response_keys") or payload.get("output_keys") or az_fix_plan.get("response_keys") or az_fix_plan.get("output_keys"))
+    link_keys = _normalize_str_list(payload.get("link_keys") or payload.get("binding_keys") or az_fix_plan.get("link_keys") or az_fix_plan.get("binding_keys"))
 
     goal_lower = main_goal.lower()
-    is_api_mapping_task = bool(endpoints or request_keys or response_keys or link_keys)
+    is_api_mapping_task = bool(endpoints or request_keys or response_keys or link_keys) or ("api" in goal_lower and "ozon" in goal_lower)
+
     if is_api_mapping_task:
         endpoint_text = ", ".join(endpoints) if endpoints else "не переданы"
         request_text = ", ".join(request_keys) if request_keys else "не переданы"
@@ -657,17 +596,17 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
             ]
         )
 
-    # 1) Deterministic local answers for simple questions (faster and more reliable than LLM)
-    heur = _heuristic_answer(main_goal, payload)
-    if heur and not _is_answer_unit_mismatch(main_goal, heur):
+    # 1) LLM
+    ai_answer = _llm_answer(main_goal, payload)
+    if ai_answer:
+        return _strip_and_apply_self_profile_updates(ai_answer)
+
+    # 2) Heuristic
+    heur = _heuristic_answer(main_goal)
+    if heur:
         return heur
 
-    # 2) Try OpenAI-compatible endpoint (server-side) if configured
-    ai_answer = _llm_answer(main_goal, payload)
-    if ai_answer and not _is_answer_unit_mismatch(main_goal, ai_answer):
-        return ai_answer
-
-    # 3) Previous template fallback
+    # 3) Fallback
     parts = [f"Готово. Подготовлено решение по задаче: {main_goal}."]
     if screen and screen != "Не указано":
         parts.append(f"Область: {screen}.")
@@ -680,22 +619,17 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
 def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
     current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
-    az_fix_plan = (
-        current_result.get("az_fix_plan") if isinstance(current_result.get("az_fix_plan"), dict) else {}
-    )
+    az_fix_plan = current_result.get("az_fix_plan") if isinstance(current_result.get("az_fix_plan"), dict) else {}
 
     title = _normalize_text(payload.get("title")) or _normalize_text(az_fix_plan.get("title")) or "Рабочий артефакт"
     screen = _normalize_text(payload.get("screen")) or _normalize_text(az_fix_plan.get("screen")) or "Не указано"
-    target_columns = _normalize_str_list(payload.get("target_columns")) or _normalize_str_list(
-        az_fix_plan.get("target_columns")
-    )
+    target_columns = _normalize_str_list(payload.get("target_columns")) or _normalize_str_list(az_fix_plan.get("target_columns"))
     task_type = _normalize_text(task.get("task_type")) or "unknown"
 
     implementation_steps: list[dict[str, Any]] = []
     for idx, step in enumerate(az_fix_plan.get("technical_plan") or [], start=1):
-        implementation_steps.append(
-            {"step_no": idx, "title_ru": f"Шаг {idx}", "description_ru": str(step)}
-        )
+        implementation_steps.append({"step_no": idx, "title_ru": f"Шаг {idx}", "description_ru": str(step)})
+
     if not implementation_steps:
         implementation_steps = [
             {
@@ -790,6 +724,8 @@ def _as_handoff_allowed(task: dict[str, Any]) -> Tuple[bool, str]:
 # -------------------------
 # Base / Health
 # -------------------------
+
+
 @app.get("/")
 def root():
     return {"service": "AS", "status": "ok", "message": "Ozonator Agents AS service is running", "docs": "/docs"}
@@ -826,36 +762,11 @@ def health_all():
     }
 
 
-
-@app.get("/health/llm")
-def health_llm(token: str | None = None):
-    """Minimal diagnostic endpoint (no secrets).
-
-    If ADMIN_DEV_TOKEN is set, require ?token=...
-    Returns whether LLM key is present in runtime and what URL/model are selected.
-    """
-    admin = os.getenv("ADMIN_DEV_TOKEN", "").strip()
-    if admin and token != admin:
-        return JSONResponse(status_code=403, content={"service": "AS", "status": "forbidden"})
-
-    key = _pick_llm_key()
-    url = _normalize_llm_url(os.getenv("OPENAI_API_URL", ""), key=key or "gsk_")
-    model = _pick_llm_model({})
-    return {
-        "service": "AS",
-        "status": "ok",
-        "llm": {
-            "key_present": bool(key),
-            "key_len": len(key),
-            "url": url,
-            "model": model,
-        },
-    }
-
-
 # -------------------------
 # Tasks read endpoints
 # -------------------------
+
+
 @app.get("/tasks/{task_id}")
 def get_task(task_id: int):
     settings = get_settings()
@@ -892,6 +803,8 @@ def get_task_logs_endpoint(task_id: int):
 # -------------------------
 # AS runner
 # -------------------------
+
+
 @app.post("/as/run-task/{task_id}")
 def as_run_task(task_id: int):
     settings = get_settings()
@@ -932,8 +845,8 @@ def as_run_task(task_id: int):
 
         prev_result = task.get("result") if isinstance(task.get("result"), dict) else {}
         prev_result = prev_result if isinstance(prev_result, dict) else {}
-        current_review_cycle = int(prev_result.get("review_cycle") or 0)
 
+        current_review_cycle = int(prev_result.get("review_cycle") or 0)
         is_rework = (prev_result.get("next_action") or "").lower() in {"return_to_as", "ak_return_to_as"}
         if is_rework:
             current_review_cycle += 1
@@ -1026,7 +939,6 @@ def as_run_task(task_id: int):
 
     except Exception as e:
         err = f"AS error: {e}"
-        # Do not leak secrets.
         set_task_result(
             settings.database_url,
             task_id=task_id,
