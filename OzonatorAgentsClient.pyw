@@ -1231,10 +1231,18 @@ class App(tk.Tk):
         try:
             while True:
                 msg = self.q.get_nowait()
-                self._handle_msg(msg)
+                try:
+                    self._handle_msg(msg)
+                except Exception as e:
+                    safe_log("QUEUE handler exception:\n" + traceback.format_exc())
+                    try:
+                        self._append("Ошибка", f"Внутренняя ошибка клиента: {e}")
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
-        self.after(200, self._drain_queue)
+        finally:
+            self.after(200, self._drain_queue)
 
     def _handle_msg(self, msg):
         kind = msg[0]
@@ -1248,10 +1256,16 @@ class App(tk.Tk):
             _, task_id, it = msg
             self.current_task_id = task_id
             self._refresh_history_list()
-            if getattr(self, 'lb', None) is not None:
-                self.lb.selection_clear(0, tk.END)
-            self.lb.selection_set(0)
-            self.lb.activate(0)
+
+            lb = getattr(self, 'lb', None)
+            if lb is not None:
+                try:
+                    lb.selection_clear(0, tk.END)
+                    lb.selection_set(0)
+                    lb.activate(0)
+                except Exception:
+                    pass
+
             self.status_var.set(f"Задача #{task_id} создана. Запуск оркестрации…")
             self._start_polling()
             return
