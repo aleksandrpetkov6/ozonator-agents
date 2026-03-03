@@ -52,10 +52,21 @@ HISTORY_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Ozonator
 HISTORY_FILE = HISTORY_DIR / "history.json"
 LOG_FILE = HISTORY_DIR / "client.log"
 
-POLL_INTERVAL_SEC = 1.0
+# Polling: быстрый отклик в первые секунды, затем нормальный опрос
+POLL_TICK_MS = 200  # частота тика UI; реальная частота опроса считается динамически
+POLL_FAST_INTERVAL_SEC = 0.25
+POLL_NORMAL_INTERVAL_SEC = 1.0
+POLL_SLOW_INTERVAL_SEC = 2.0
+POLL_SLOW_AFTER_SEC = 60
+POLL_SLOW2_INTERVAL_SEC = 3.0
+POLL_SLOW2_AFTER_SEC = 180
 HTTP_TIMEOUT_SEC = 60
 RUN_TASK_TIMEOUT_SEC = 10  # короткий "пинок" оркестрации — дальше работаем polling'ом
 CREATE_RETRIES = 4
+
+# Keep-warm (борьба с cold start Render)
+WARMUP_INTERVAL_SEC = 55
+WARMUP_TIMEOUT_SEC = 3
 
 # Telegram-like UI palette
 TG_BG = "#0f1720"
@@ -372,6 +383,21 @@ class AAClient:
         return []
 
 
+    def warmup(self) -> None:
+        """
+        Держит сервис 'тёплым' и уменьшает задержки из-за cold start.
+        Ошибки игнорируем: это best-effort.
+        """
+        paths = ("/health", "/openapi.json")
+        for pref in self._prefixes():
+            for path in paths:
+                url = f"{self.base_url}{pref}{path}"
+                code, _ = http_json("GET", url, None, timeout_sec=WARMUP_TIMEOUT_SEC)
+                if code:
+                    self.api_prefix = pref
+                    return
+
+
 # =========================
 # UI data
 # =========================
@@ -428,12 +454,19 @@ class App(tk.Tk):
         self._polling = False
         self._stop = False
 
+        # polling internals
+        self._poll_started_at = 0.0
+        self._last_poll_at = 0.0
+        self._poll_inflight = False
+        self._last_question_text = ""
+
         self._load_history()
         self._build_ui()
         self._refresh_history_list()
 
         self.after(200, self._drain_queue)
-        self.after(int(POLL_INTERVAL_SEC * 1000), self._tick)
+        self.after(POLL_TICK_MS, self._tick)
+        self.after(800, self._warmup_tick)
 
     def _configure_theme(self):
         self.font_ui_8 = tkfont.Font(family="Segoe UI", size=8)
@@ -624,11 +657,10 @@ class App(tk.Tk):
             font=self.font_ui_10,
         )
         self.input.pack(side="left", fill="both", expand=True, padx=8, pady=8)
-        # Enter: send, Shift+Enter: new line
-        self.input.bind('<Return>', self._on_input_enter)
-        self.input.bind('<KP_Enter>', self._on_input_enter)
-        self.input.bind('<Shift-Return>', self._on_input_shift_enter)
-        self.input.bind('<Shift-KP_Enter>', self._on_input_shift_enter)
+
+        # Enter -> send, Shift+Enter -> new line
+        self.input.bind("<Return>", self._on_enter)
+        self.input.bind("<Shift-Return>", self._on_shift_enter)
 
         actions = tk.Frame(bottom, bg=TG_PANEL)
         actions.pack(side="left", padx=(0, 8), pady=8)
@@ -751,18 +783,18 @@ class App(tk.Tk):
         self._append("AA", text)
 
     # ---------- actions ----------
-    def _on_input_enter(self, _evt=None):
-        # Send on Enter
-        self._send()
-        return 'break'
-
-    def _on_input_shift_enter(self, _evt=None):
-        # New line on Shift+Enter
-        self.input.insert(tk.INSERT, '\n')
-        return 'break'
-
     def _clear_input(self):
         self.input.delete("1.0", tk.END)
+
+    def _on_enter(self, _evt=None):
+        # Отправка по Enter
+        self._send()
+        return "break"
+
+    def _on_shift_enter(self, _evt=None):
+        # Перенос строки по Shift+Enter
+        self.input.insert(tk.INSERT, "\n")
+        return "break"
 
     def _send(self):
         user_text = self.input.get("1.0", tk.END).strip()
@@ -770,6 +802,8 @@ class App(tk.Tk):
             return
         self._clear_input()
         self._append_user(user_text)
+        # НФ: быстрый отклик — пользователю всегда видно, что запрос принят
+        self._append_aa("Принято. Выполняю.")
         self.status_var.set("Отправка задачи…")
 
         def worker():
@@ -805,21 +839,57 @@ class App(tk.Tk):
             return
         self._polling = True
         self.last_status = None
+        self._last_question_text = ""
+        self._poll_started_at = time.time()
+        self._last_poll_at = 0.0
+        self._poll_inflight = False
 
     def _tick(self):
         if self._stop:
             return
         try:
-            if self._polling and self.current_task_id is not None:
-                def poll_worker(task_id: int):
-                    try:
-                        task = self.client.get_task(task_id)
-                        self.q.put(("task_update", task_id, task))
-                    except Exception as e:
-                        self.q.put(("poll_error", task_id, str(e)))
-                threading.Thread(target=poll_worker, args=(self.current_task_id,), daemon=True).start()
+            if self._polling and self.current_task_id is not None and not self._poll_inflight:
+                now = time.time()
+                elapsed = now - (self._poll_started_at or now)
+                if elapsed < 10:
+                    interval = POLL_FAST_INTERVAL_SEC
+                elif elapsed < POLL_SLOW_AFTER_SEC:
+                    interval = POLL_NORMAL_INTERVAL_SEC
+                elif elapsed < POLL_SLOW2_AFTER_SEC:
+                    interval = POLL_SLOW_INTERVAL_SEC
+                else:
+                    interval = POLL_SLOW2_INTERVAL_SEC
+
+                if (now - (self._last_poll_at or 0.0)) >= interval:
+                    self._last_poll_at = now
+                    self._poll_inflight = True
+
+                    def poll_worker(task_id: int):
+                        try:
+                            task = self.client.get_task(task_id)
+                            self.q.put(("task_update", task_id, task))
+                        except Exception as e:
+                            self.q.put(("poll_error", task_id, str(e)))
+                        finally:
+                            self.q.put(("poll_done", task_id, None))
+
+                    threading.Thread(target=poll_worker, args=(self.current_task_id,), daemon=True).start()
         finally:
-            self.after(int(POLL_INTERVAL_SEC * 1000), self._tick)
+            self.after(POLL_TICK_MS, self._tick)
+
+    def _warmup_tick(self):
+        if self._stop:
+            return
+
+        def worker():
+            try:
+                # best-effort: держим AA 'тёплым'
+                self.client.warmup()
+            except Exception as e:
+                safe_log(f"warmup exception: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(int(WARMUP_INTERVAL_SEC * 1000), self._warmup_tick)
 
     def _show_logs(self):
         if self.current_task_id is None:
@@ -915,6 +985,12 @@ class App(tk.Tk):
                 self._append("Ошибка", detail)
             return
 
+        if kind == "poll_done":
+            _, task_id, _ = msg
+            if self.current_task_id == task_id:
+                self._poll_inflight = False
+            return
+
         if kind == "show_logs":
             _, task_id, txt = msg
             if self.current_task_id == task_id:
@@ -934,7 +1010,8 @@ class App(tk.Tk):
 
             # show question to user if present
             qtxt = extract_question_to_user(task)
-            if qtxt:
+            if qtxt and qtxt != self._last_question_text:
+                self._last_question_text = qtxt
                 self._append_aa(qtxt)
 
             # show final answer if done
@@ -946,6 +1023,7 @@ class App(tk.Tk):
                     # if DONE but empty — show minimal info
                     self._append_aa("Готово. Финальный ответ пустой (проверь логи задачи).")
                 self._polling = False
+                self._poll_inflight = False
                 return
 
             if str(task.get("status") or "").upper() in ("FAILED", "CANCELLED"):
@@ -958,6 +1036,7 @@ class App(tk.Tk):
                     detail = task["error"]
                 self._append("Ошибка", detail or "Задача завершилась ошибкой (см. логи).")
                 self._polling = False
+                self._poll_inflight = False
                 return
 
             # keep polling
