@@ -50,30 +50,13 @@ DEFAULT_LLM_MODEL = os.environ.get("OZONATOR_LLM_MODEL", "llama-3.3-70b-versatil
 APP_NAME = "Ozonator Agents Client"
 HISTORY_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "OzonatorAgentsClient"
 HISTORY_FILE = HISTORY_DIR / "history.json"
+CONV_FILE = HISTORY_DIR / "conversation.json"
 LOG_FILE = HISTORY_DIR / "client.log"
 
-# Polling: быстрый отклик в первые секунды, затем нормальный опрос
-POLL_TICK_MS = 200  # частота тика UI; реальная частота опроса считается динамически
-POLL_FAST_INTERVAL_SEC = 0.25
-POLL_NORMAL_INTERVAL_SEC = 1.0
-POLL_SLOW_INTERVAL_SEC = 2.0
-POLL_SLOW_AFTER_SEC = 60
-POLL_SLOW2_INTERVAL_SEC = 3.0
-POLL_SLOW2_AFTER_SEC = 180
+POLL_INTERVAL_SEC = 1.0
 HTTP_TIMEOUT_SEC = 60
 RUN_TASK_TIMEOUT_SEC = 10  # короткий "пинок" оркестрации — дальше работаем polling'ом
 CREATE_RETRIES = 4
-
-# Keep-warm (борьба с cold start Render)
-WARMUP_INTERVAL_SEC = 55
-WARMUP_TIMEOUT_SEC = 3
-
-# Conversation context (in-memory; sent with each request)
-CTX_MAX_MESSAGES = 24
-CTX_HEAD_MESSAGES = 2
-CTX_MAX_CHARS = 5200
-CTX_MAX_CHARS_PER_MSG = 180
-CTX_MAX_STORED_MESSAGES = 200
 
 # Telegram-like UI palette
 TG_BG = "#0f1720"
@@ -155,200 +138,6 @@ def _strip_bearer(s: str) -> str:
         return s.split(" ", 1)[1].strip()
     return s
 
-# =========================
-# Geo / Weather (public, no tokens)
-# =========================
-GEO_CACHE_TTL_SEC = 6 * 60 * 60
-GEO_TIMEOUT_SEC = 2
-
-WEATHER_CACHE_TTL_SEC = 5 * 60
-WEATHER_TIMEOUT_SEC = 2
-
-WEATHER_CODE_RU = {
-    0: "ясно",
-    1: "в основном ясно",
-    2: "переменная облачность",
-    3: "пасмурно",
-    45: "туман",
-    48: "туман (изморозь)",
-    51: "морось (слабая)",
-    53: "морось",
-    55: "морось (сильная)",
-    56: "морось замерзающая (слабая)",
-    57: "морось замерзающая (сильная)",
-    61: "дождь (слабый)",
-    63: "дождь",
-    65: "дождь (сильный)",
-    66: "ледяной дождь (слабый)",
-    67: "ледяной дождь (сильный)",
-    71: "снег (слабый)",
-    73: "снег",
-    75: "снег (сильный)",
-    77: "снежные зерна",
-    80: "ливневый дождь (слабый)",
-    81: "ливневый дождь",
-    82: "ливневый дождь (сильный)",
-    85: "снегопад (слабый)",
-    86: "снегопад (сильный)",
-    95: "гроза",
-    96: "гроза с градом (слабая)",
-    99: "гроза с градом (сильная)",
-}
-
-
-def public_http_get_json(url: str, timeout_sec: int = 2) -> Optional[Dict[str, Any]]:
-    """
-    HTTP GET JSON without any AA tokens. Safe for public endpoints (geo/weather).
-    """
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (OzonatorAgentsClient)",
-    }
-    req = request.Request(url, headers=headers, method="GET")
-    try:
-        with request.urlopen(req, timeout=timeout_sec) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            if not raw.strip():
-                return None
-            return json.loads(raw)
-    except Exception:
-        return None
-
-
-class GeoResolver:
-    """
-    Best-effort геолокация по IP. Не требует ключей. Результат кэшируется.
-    """
-    def __init__(self):
-        self._cache: Optional[Dict[str, Any]] = None
-        self._cache_at: float = 0.0
-
-    def get(self) -> Optional[Dict[str, Any]]:
-        now = time.time()
-        if self._cache and (now - self._cache_at) < GEO_CACHE_TTL_SEC:
-            return self._cache
-
-        geo = self._fetch_ipapi()
-        if not geo:
-            geo = self._fetch_ipinfo()
-
-        if geo:
-            self._cache = geo
-            self._cache_at = now
-        return geo
-
-    def _fetch_ipapi(self) -> Optional[Dict[str, Any]]:
-        # ipapi.co
-        j = public_http_get_json("https://ipapi.co/json/", timeout_sec=GEO_TIMEOUT_SEC)
-        if not j:
-            return None
-        city = (j.get("city") or "").strip()
-        region = (j.get("region") or j.get("region_code") or "").strip()
-        country = (j.get("country_name") or j.get("country") or "").strip()
-        lat = j.get("latitude")
-        lon = j.get("longitude")
-        tz = (j.get("timezone") or "").strip()
-        if not city or lat is None or lon is None:
-            return None
-        try:
-            lat = float(lat)
-            lon = float(lon)
-        except Exception:
-            return None
-        return {
-            "city": city,
-            "region": region,
-            "country": country,
-            "lat": lat,
-            "lon": lon,
-            "timezone": tz,
-            "source": "ipapi.co",
-        }
-
-    def _fetch_ipinfo(self) -> Optional[Dict[str, Any]]:
-        # ipinfo.io
-        j = public_http_get_json("https://ipinfo.io/json", timeout_sec=GEO_TIMEOUT_SEC)
-        if not j:
-            return None
-        city = (j.get("city") or "").strip()
-        region = (j.get("region") or "").strip()
-        country = (j.get("country") or "").strip()
-        loc = (j.get("loc") or "").strip()  # "lat,lon"
-        tz = (j.get("timezone") or "").strip()
-        if not city or not loc:
-            return None
-        try:
-            lat_s, lon_s = loc.split(",", 1)
-            lat = float(lat_s.strip())
-            lon = float(lon_s.strip())
-        except Exception:
-            return None
-        return {
-            "city": city,
-            "region": region,
-            "country": country,
-            "lat": lat,
-            "lon": lon,
-            "timezone": tz,
-            "source": "ipinfo.io",
-        }
-
-
-class WeatherResolver:
-    """
-    Best-effort погода по координатам через Open-Meteo. Кэшируется на несколько минут.
-    """
-    def __init__(self):
-        self._cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-
-    def get_current(self, lat: float, lon: float) -> Optional[Dict[str, Any]]:
-        key = f"{round(lat, 3)}:{round(lon, 3)}"
-        now = time.time()
-        if key in self._cache:
-            ts, data = self._cache[key]
-            if (now - ts) < WEATHER_CACHE_TTL_SEC:
-                return data
-
-        url = (
-            "https://api.open-meteo.com/v1/forecast"
-            f"?latitude={lat:.6f}&longitude={lon:.6f}"
-            "&current_weather=true&timezone=auto"
-        )
-        j = public_http_get_json(url, timeout_sec=WEATHER_TIMEOUT_SEC)
-        if not j:
-            return None
-        cw = j.get("current_weather") or {}
-        if not isinstance(cw, dict) or "temperature" not in cw:
-            return None
-        try:
-            temp = float(cw.get("temperature"))
-            wind = float(cw.get("windspeed", 0))
-            code = int(cw.get("weathercode", -1))
-            t = (cw.get("time") or "").strip()
-        except Exception:
-            return None
-
-        desc = WEATHER_CODE_RU.get(code, f"погодный код {code}")
-        data = {"temp_c": temp, "wind_kmh": wind, "code": code, "desc": desc, "time": t, "source": "open-meteo"}
-        self._cache[key] = (now, data)
-        return data
-
-
-def is_weather_query(text: str) -> bool:
-    t = (text or "").lower()
-    return bool(
-        re.search(
-            r"(погода|weather|температур|градус|прогноз|дожд|ветер|снег|осадк|облачност|гроза)",
-            t,
-        )
-    )
-
-
-def wants_geo_context(text: str) -> bool:
-    t = (text or "").lower()
-    return bool(re.search(r"(погода|weather|температур|градус|прогноз|дожд|ветер|снег|осадк|облачност|гроза|местополож|локаци|где\s+я)", t))
-
-
 
 # =========================
 # HTTP JSON
@@ -395,6 +184,75 @@ def http_json(method: str, url: str, payload: Optional[dict] = None, timeout_sec
     except Exception as e:
         return 0, {"detail": f"{e.__class__.__name__}: {e}"}
 
+
+
+
+# =========================
+# Public JSON (no AA headers)
+# =========================
+def fetch_public_json(url: str, timeout_sec: int = 6) -> dict:
+    try:
+        req = request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) OzonatorAgentsClient",
+            },
+            method="GET",
+        )
+        with request.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(raw) if raw.strip() else {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def detect_geo_context() -> dict:
+    """Best-effort IP-based location. Returns safe fields."""
+    providers = [
+        ("ipapi", "https://ipapi.co/json/"),
+        ("ipinfo", "https://ipinfo.io/json"),
+    ]
+    for _name, url in providers:
+        data = fetch_public_json(url, timeout_sec=6)
+        if not data:
+            continue
+
+        city = str(data.get("city") or "").strip()
+        region = str(data.get("region") or data.get("region_name") or "").strip()
+        country_name = str(data.get("country_name") or data.get("country") or "").strip()
+        timezone_name = str(data.get("timezone") or "").strip()
+
+        lat = data.get("latitude") or data.get("lat")
+        lon = data.get("longitude") or data.get("lon")
+        # ipinfo returns "loc": "lat,lon"
+        if (lat is None or lon is None) and isinstance(data.get("loc"), str) and "," in data["loc"]:
+            try:
+                a, b = data["loc"].split(",", 1)
+                lat = float(a.strip())
+                lon = float(b.strip())
+            except Exception:
+                lat = None
+                lon = None
+
+        geo: dict = {}
+        if city:
+            geo["city"] = city
+        if region:
+            geo["region"] = region
+        if country_name:
+            geo["country_name"] = country_name
+        if timezone_name:
+            geo["timezone"] = timezone_name
+        if isinstance(lat, (int, float)):
+            geo["lat"] = float(lat)
+        if isinstance(lon, (int, float)):
+            geo["lon"] = float(lon)
+
+        if geo:
+            return geo
+    return {}
 
 # =========================
 # Extractors
@@ -466,7 +324,7 @@ class AAClient:
     def _prefixes(self) -> List[str]:
         return ["", "/api", "/v1"]
 
-    def create_task(self, user_text: str, client_meta: Optional[Dict[str, Any]] = None) -> int:
+    def create_task(self, user_text: str, conversation_history: Optional[List[Dict[str, str]]] = None, client_geo: Optional[dict] = None) -> int:
         body = {
             "target_agent": "AA",
             "task_type": "user_task",
@@ -475,9 +333,24 @@ class AAClient:
                 "user_request": user_text,
                 "llm_provider": DEFAULT_LLM_PROVIDER,
                 "llm_model": DEFAULT_LLM_MODEL,
-                "client_meta": {"source": "desktop", "client": "OzonatorAgentsClient", **(client_meta or {})},
+                "client_meta": {"source": "desktop", "client": "OzonatorAgentsClient"},
             },
         }
+
+        # attach geo (safe) if provided
+        if isinstance(client_geo, dict) and client_geo:
+            try:
+                body_payload = body.get("payload")
+                if isinstance(body_payload, dict):
+                    meta = body_payload.get("client_meta")
+                    if not isinstance(meta, dict):
+                        meta = {}
+                        body_payload["client_meta"] = meta
+                    meta["geo"] = client_geo
+            except Exception:
+                pass
+
+
 
         last_err = None
         # cold-start friendly retries
@@ -584,21 +457,6 @@ class AAClient:
         return []
 
 
-    def warmup(self) -> None:
-        """
-        Держит сервис 'тёплым' и уменьшает задержки из-за cold start.
-        Ошибки игнорируем: это best-effort.
-        """
-        paths = ("/health", "/openapi.json")
-        for pref in self._prefixes():
-            for path in paths:
-                url = f"{self.base_url}{pref}{path}"
-                code, _ = http_json("GET", url, None, timeout_sec=WARMUP_TIMEOUT_SEC)
-                if code:
-                    self.api_prefix = pref
-                    return
-
-
 # =========================
 # UI data
 # =========================
@@ -640,9 +498,6 @@ class App(tk.Tk):
         self.geometry("1280x800")
         self.minsize(1040, 680)
         self.configure(bg=TG_BG)
-        # Auto context (geo/weather)
-        self.geo = GeoResolver()
-        self.weather = WeatherResolver()
         try:
             self.state("zoomed")
         except Exception:
@@ -658,22 +513,15 @@ class App(tk.Tk):
         self._polling = False
         self._stop = False
 
-        # polling internals
-        self._poll_started_at = 0.0
-        self._last_poll_at = 0.0
-        self._poll_inflight = False
-        self._last_question_text = ""
-
-
-        # in-memory conversation for context (do NOT persist to disk)
-        self.session_messages: List[Dict[str, str]] = []
         self._load_history()
+        self._load_conversation()
+        self.geo_context: dict = {}
+        self._start_geo_detection()
         self._build_ui()
         self._refresh_history_list()
 
         self.after(200, self._drain_queue)
-        self.after(POLL_TICK_MS, self._tick)
-        self.after(800, self._warmup_tick)
+        self.after(int(POLL_INTERVAL_SEC * 1000), self._tick)
 
     def _configure_theme(self):
         self.font_ui_8 = tkfont.Font(family="Segoe UI", size=8)
@@ -689,6 +537,19 @@ class App(tk.Tk):
         self.option_add("*Menu.foreground", TG_TEXT)
         self.option_add("*Menu.activeBackground", TG_ACCENT)
         self.option_add("*Menu.activeForeground", "#ffffff")
+
+
+def _start_geo_detection(self):
+    def worker():
+        try:
+            geo = detect_geo_context()
+            if isinstance(geo, dict) and geo:
+                self.geo_context = geo
+                safe_log(f"geo_context detected: {geo}")
+        except Exception:
+            pass
+    threading.Thread(target=worker, daemon=True).start()
+
 
     def _build_ui(self):
         header = tk.Frame(self, bg=TG_HEADER, height=64)
@@ -865,10 +726,6 @@ class App(tk.Tk):
         )
         self.input.pack(side="left", fill="both", expand=True, padx=8, pady=8)
 
-        # Enter -> send, Shift+Enter -> new line
-        self.input.bind("<Return>", self._on_enter)
-        self.input.bind("<Shift-Return>", self._on_shift_enter)
-
         actions = tk.Frame(bottom, bg=TG_PANEL)
         actions.pack(side="left", padx=(0, 8), pady=8)
         tk.Button(
@@ -914,6 +771,67 @@ class App(tk.Tk):
 
     def _save_history(self):
         _json_save(HISTORY_FILE, [i.to_dict() for i in self.items])
+
+
+def _load_conversation(self):
+    data = _json_load(CONV_FILE, [])
+    self.conversation: List[Dict[str, str]] = []
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            content = str(item.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                self.conversation.append({"role": role, "content": content})
+
+def _save_conversation(self):
+    try:
+        _json_save(CONV_FILE, self.conversation[-200:])
+    except Exception:
+        pass
+
+def _record_conv(self, role: str, content: str):
+    role = (role or "").strip().lower()
+    content = (content or "").strip()
+    if role not in ("user", "assistant") or not content:
+        return
+    self.conversation.append({"role": role, "content": content})
+    # soft limits
+    if len(self.conversation) > 300:
+        self.conversation = self.conversation[-220:]
+    self._save_conversation()
+
+def _build_conversation_history_for_request(self, current_user_text: str, *, max_items: int = 20, max_chars: int = 6000) -> List[Dict[str, str]]:
+    """
+    Returns last messages excluding the CURRENT user message (it will be sent separately as user_request).
+    """
+    cur = (current_user_text or "").strip()
+    items = list(self.conversation)
+    if items and items[-1].get("role") == "user" and items[-1].get("content") == cur:
+        items = items[:-1]
+
+    prepared: List[Dict[str, str]] = []
+    total = 0
+    for it in reversed(items):
+        role = it.get("role")
+        content = it.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+        c = re.sub(r"\s+", " ", content.strip())
+        if not c:
+            continue
+        if len(c) > 1200:
+            c = c[:1200]
+        projected = total + len(c)
+        if prepared and projected > max_chars:
+            break
+        prepared.append({"role": role, "content": c})
+        total = projected
+        if len(prepared) >= max_items:
+            break
+    prepared.reverse()
+    return prepared
 
     def _refresh_history_list(self):
         self.lb.delete(0, tk.END)
@@ -985,146 +903,28 @@ class App(tk.Tk):
 
     def _append_user(self, text: str):
         self._append("Вы", text)
-        self._track_message("user", text)
+        self._record_conv("user", text)
 
     def _append_aa(self, text: str):
         self._append("AA", text)
-        self._track_message("assistant", text)
-
-    def _track_message(self, role: str, text: str):
-        """Храним историю диалога в памяти. На диск НЕ пишем."""
-        t = (text or "").strip()
-        if not t:
-            return
-        if role not in ("user", "assistant"):
-            return
-        self.session_messages.append({"role": role, "content": t})
-        if len(self.session_messages) > CTX_MAX_STORED_MESSAGES:
-            self.session_messages = self.session_messages[-CTX_MAX_STORED_MESSAGES:]
-
-    def _build_context_block(self, exclude_last_user_text: Optional[str] = None) -> str:
-        msgs = [
-            m
-            for m in self.session_messages
-            if m.get("role") in ("user", "assistant") and (m.get("content") or "").strip()
-        ]
-        if exclude_last_user_text and msgs and msgs[-1]["role"] == "user":
-            if msgs[-1]["content"].strip() == exclude_last_user_text.strip():
-                msgs = msgs[:-1]
-        if not msgs:
-            return ""
-
-        if len(msgs) > CTX_MAX_MESSAGES:
-            head = msgs[:CTX_HEAD_MESSAGES]
-            tail = msgs[-(CTX_MAX_MESSAGES - CTX_HEAD_MESSAGES):]
-            msgs_use = head + tail
-        else:
-            msgs_use = msgs
-
-        lines: List[str] = []
-        for m in msgs_use:
-            who = "Вы" if m["role"] == "user" else "AA"
-            c = (m["content"] or "").replace("\r", "").strip()
-            c = c.replace("\n", " / ")
-            if len(c) > CTX_MAX_CHARS_PER_MSG:
-                c = c[:CTX_MAX_CHARS_PER_MSG].rstrip() + "…"
-            lines.append(f"{who}: {c}")
-
-        block = (
-            "КОНТЕКСТ ПЕРЕПИСКИ (для понимания; не цитировать):\n"
-            + "\n".join(lines)
-            + "\n---\nОТВЕТЬ ТОЛЬКО НА ПОСЛЕДНИЙ ЗАПРОС НИЖЕ."
-        )
-        if len(block) > CTX_MAX_CHARS:
-            block = block[-CTX_MAX_CHARS:]
-            nl = block.find("\n")
-            if nl != -1:
-                block = block[nl + 1 :]
-                block = "КОНТЕКСТ ПЕРЕПИСКИ (сокращено):\n" + block
-        return block
+        self._record_conv("assistant", text)
 
     # ---------- actions ----------
     def _clear_input(self):
         self.input.delete("1.0", tk.END)
 
-    def _on_enter(self, _evt=None):
-        # Отправка по Enter
-        self._send()
-        return "break"
-
-    def _on_shift_enter(self, _evt=None):
-        # Перенос строки по Shift+Enter
-        self.input.insert(tk.INSERT, "\n")
-        return "break"
-
-    def _build_user_request(self, user_text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
-        """
-        Формируем user_request так, чтобы:
-        - AA держал контекст (берём последние реплики из чата);
-        - вопросы про погоду/местоположение работали без уточнений.
-
-        Важно: контекст хранится только в памяти (не пишем на диск).
-        """
-        text = (user_text or "").strip()
-        if not text:
-            return text, None
-
-        parts: List[str] = []
-        ctx = self._build_context_block(exclude_last_user_text=text)
-        if ctx:
-            parts.append(ctx)
-
-        meta: Dict[str, Any] = {}
-        if wants_geo_context(text):
-            geo = None
-            try:
-                geo = self.geo.get()
-            except Exception:
-                geo = None
-
-            if geo:
-                loc_parts = [geo.get("city"), geo.get("region"), geo.get("country")]
-                loc = ", ".join([p for p in loc_parts if p])
-                if loc:
-                    parts.append(
-                        "Локация пользователя определена автоматически: "
-                        + loc
-                        + ". Считай это верным и не запрашивай подтверждение."
-                    )
-
-                # координаты НЕ вставляем в user_request (чтобы их не повторяли в ответе)
-                meta["geo"] = geo
-
-                if is_weather_query(text):
-                    wx = None
-                    try:
-                        wx = self.weather.get_current(float(geo.get("lat")), float(geo.get("lon")))
-                    except Exception:
-                        wx = None
-                    if wx and wx.get("desc") is not None:
-                        parts.append(
-                            f"Текущая погода (авто): {wx.get('desc')}, {wx.get('temp_c'):.1f}°C, ветер {wx.get('wind_kmh'):.0f} км/ч."
-                        )
-                        meta["weather"] = wx
-
-        parts.append(text)
-        final = "\n\n".join([p for p in parts if (p or "").strip()])
-        return final, (meta or None)
-
     def _send(self):
-
         user_text = self.input.get("1.0", tk.END).strip()
         if not user_text:
             return
         self._clear_input()
         self._append_user(user_text)
-        # Быстрый отклик: обновляем строку состояния (без сообщений в чате)
         self.status_var.set("Отправка задачи…")
 
         def worker():
             try:
-                enriched_text, meta = self._build_user_request(user_text)
-                task_id = self.client.create_task(enriched_text, client_meta=meta)
+                conv_hist = self._build_conversation_history_for_request(user_text)
+                task_id = self.client.create_task(user_text, conversation_history=conv_hist, client_geo=self.geo_context)
                 # store task
                 it = TaskItem(
                     id=task_id,
@@ -1155,57 +955,21 @@ class App(tk.Tk):
             return
         self._polling = True
         self.last_status = None
-        self._last_question_text = ""
-        self._poll_started_at = time.time()
-        self._last_poll_at = 0.0
-        self._poll_inflight = False
 
     def _tick(self):
         if self._stop:
             return
         try:
-            if self._polling and self.current_task_id is not None and not self._poll_inflight:
-                now = time.time()
-                elapsed = now - (self._poll_started_at or now)
-                if elapsed < 10:
-                    interval = POLL_FAST_INTERVAL_SEC
-                elif elapsed < POLL_SLOW_AFTER_SEC:
-                    interval = POLL_NORMAL_INTERVAL_SEC
-                elif elapsed < POLL_SLOW2_AFTER_SEC:
-                    interval = POLL_SLOW_INTERVAL_SEC
-                else:
-                    interval = POLL_SLOW2_INTERVAL_SEC
-
-                if (now - (self._last_poll_at or 0.0)) >= interval:
-                    self._last_poll_at = now
-                    self._poll_inflight = True
-
-                    def poll_worker(task_id: int):
-                        try:
-                            task = self.client.get_task(task_id)
-                            self.q.put(("task_update", task_id, task))
-                        except Exception as e:
-                            self.q.put(("poll_error", task_id, str(e)))
-                        finally:
-                            self.q.put(("poll_done", task_id, None))
-
-                    threading.Thread(target=poll_worker, args=(self.current_task_id,), daemon=True).start()
+            if self._polling and self.current_task_id is not None:
+                def poll_worker(task_id: int):
+                    try:
+                        task = self.client.get_task(task_id)
+                        self.q.put(("task_update", task_id, task))
+                    except Exception as e:
+                        self.q.put(("poll_error", task_id, str(e)))
+                threading.Thread(target=poll_worker, args=(self.current_task_id,), daemon=True).start()
         finally:
-            self.after(POLL_TICK_MS, self._tick)
-
-    def _warmup_tick(self):
-        if self._stop:
-            return
-
-        def worker():
-            try:
-                # best-effort: держим AA 'тёплым'
-                self.client.warmup()
-            except Exception as e:
-                safe_log(f"warmup exception: {e}")
-
-        threading.Thread(target=worker, daemon=True).start()
-        self.after(int(WARMUP_INTERVAL_SEC * 1000), self._warmup_tick)
+            self.after(int(POLL_INTERVAL_SEC * 1000), self._tick)
 
     def _show_logs(self):
         if self.current_task_id is None:
@@ -1301,12 +1065,6 @@ class App(tk.Tk):
                 self._append("Ошибка", detail)
             return
 
-        if kind == "poll_done":
-            _, task_id, _ = msg
-            if self.current_task_id == task_id:
-                self._poll_inflight = False
-            return
-
         if kind == "show_logs":
             _, task_id, txt = msg
             if self.current_task_id == task_id:
@@ -1326,9 +1084,10 @@ class App(tk.Tk):
 
             # show question to user if present
             qtxt = extract_question_to_user(task)
-            if qtxt and qtxt != self._last_question_text:
-                self._last_question_text = qtxt
-                self._append_aa(qtxt)
+            if qtxt:
+                qnorm = qtxt.strip().lower()
+                if qnorm not in ("принято. выполняю.", "принято. выполняю"):
+                    self._append_aa(qtxt)
 
             # show final answer if done
             if str(task.get("status") or "").upper() == "DONE":
@@ -1339,7 +1098,6 @@ class App(tk.Tk):
                     # if DONE but empty — show minimal info
                     self._append_aa("Готово. Финальный ответ пустой (проверь логи задачи).")
                 self._polling = False
-                self._poll_inflight = False
                 return
 
             if str(task.get("status") or "").upper() in ("FAILED", "CANCELLED"):
@@ -1352,7 +1110,6 @@ class App(tk.Tk):
                     detail = task["error"]
                 self._append("Ошибка", detail or "Задача завершилась ошибкой (см. логи).")
                 self._polling = False
-                self._poll_inflight = False
                 return
 
             # keep polling
