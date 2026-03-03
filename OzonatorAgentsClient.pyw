@@ -81,6 +81,110 @@ TG_AA_BG = "#1f2c3a"
 TG_SYSTEM_BG = "#22303d"
 TG_INPUT_BG = "#17212b"
 
+# Embedded Telegram-style avatar for Екатерина (circular PNG, base64)
+AVATAR_PNG_B64 = '''
+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
+KKsMpRX/B2UX0kiR5kJEAAAAAElFTkSuQmCC
+'''
+
+
 
 # =========================
 # Helpers
@@ -495,6 +599,65 @@ class AAClient:
 # =========================
 # UI data
 # =========================
+
+class RoundIconButton(tk.Canvas):
+    """Telegram-like round icon button (no external deps)."""
+
+    def __init__(
+        self,
+        master,
+        diameter: int = 44,
+        text: str = "➤",
+        command=None,
+        bg_color: str = TG_ACCENT,
+        hover_color: str = TG_ACCENT_HOVER,
+        text_color: str = "#ffffff",
+        font_obj=None,
+        **kwargs,
+    ):
+        super().__init__(
+            master,
+            width=diameter,
+            height=diameter,
+            bg=master.cget("bg"),
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+            **kwargs,
+        )
+        self._diameter = diameter
+        self._bg_color = bg_color
+        self._hover_color = hover_color
+        self._command = command
+
+        self._oval = self.create_oval(2, 2, diameter - 2, diameter - 2, fill=bg_color, outline="")
+        self._txt = self.create_text(
+            diameter // 2,
+            diameter // 2,
+            text=text,
+            fill=text_color,
+            font=font_obj,
+        )
+
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        # make text clickable too
+        self.tag_bind(self._txt, "<Button-1>", self._on_click)
+        self.tag_bind(self._txt, "<Enter>", self._on_enter)
+        self.tag_bind(self._txt, "<Leave>", self._on_leave)
+
+    def _on_click(self, _evt=None):
+        if callable(self._command):
+            self._command()
+
+    def _on_enter(self, _evt=None):
+        self.itemconfigure(self._oval, fill=self._hover_color)
+
+    def _on_leave(self, _evt=None):
+        self.itemconfigure(self._oval, fill=self._bg_color)
+
+
 @dataclass
 class TaskItem:
     id: int
@@ -578,16 +741,17 @@ class App(tk.Tk):
         header = tk.Frame(self, bg=TG_HEADER, height=64)
         header.pack(fill="x")
         header.pack_propagate(False)
+        # Avatar (circle) like in Telegram
+        try:
+            self.avatar_img = tk.PhotoImage(data="".join(AVATAR_PNG_B64.split()))
+        except Exception:
+            self.avatar_img = None
 
         avatar = tk.Label(
             header,
-            text="ЕК",
-            bg=TG_ACCENT,
-            fg="#ffffff",
-            font=self.font_ui_10_bold,
-            width=3,
-            padx=8,
-            pady=6,
+            image=self.avatar_img,
+            bg=TG_HEADER,
+            bd=0,
         )
         avatar.pack(side="left", padx=(16, 12), pady=10)
 
@@ -602,9 +766,9 @@ class App(tk.Tk):
         ).pack(anchor="w")
         tk.Label(
             title_wrap,
-            text=APP_NAME,
+            text="● online",
             bg=TG_HEADER,
-            fg=TG_MUTED,
+            fg="#4cd964",
             font=self.font_ui_9,
         ).pack(anchor="w", pady=(2, 0))
 
@@ -631,16 +795,9 @@ class App(tk.Tk):
         self.lb = None
         right = tk.Frame(body, bg=TG_BG)
         right.pack(side="left", fill="both", expand=True)
-
-        self.status_var = tk.StringVar(value="Готово к работе. Введите задачу и нажмите «Отправить»." )
-        tk.Label(
-            right,
-            textvariable=self.status_var,
-            bg=TG_BG,
-            fg=TG_MUTED,
-            font=self.font_ui_9,
-            anchor="w",
-        ).pack(fill="x", pady=(0, 10))
+        # (UI) Верхнюю строку статуса убрали по ТЗ.
+        # status_var оставляем для внутренних обновлений/логов.
+        self.status_var = tk.StringVar(value="")
 
         chat_wrap = tk.Frame(right, bg=TG_BG, bd=0, highlightthickness=1, highlightbackground=TG_BORDER)
         chat_wrap.pack(fill="both", expand=True)
@@ -725,36 +882,23 @@ class App(tk.Tk):
         self.input.bind('<Shift-KP_Enter>', self._on_input_shift_enter)
 
         actions = tk.Frame(bottom, bg=TG_PANEL)
-        actions.pack(side="left", padx=(0, 8), pady=8)
-        tk.Button(
+        actions.pack(side="left", padx=(0, 10), pady=8)
+
+        # Telegram-like send button (round icon).
+        self.send_btn = RoundIconButton(
             actions,
-            text="➤ Отправить",
+            diameter=46,
+            text="➤",
             command=self._send,
-            bg=TG_ACCENT,
-            fg="#ffffff",
-            activebackground=TG_ACCENT_HOVER,
-            activeforeground="#ffffff",
-            relief="flat",
-            bd=0,
-            padx=14,
-            pady=9,
-            cursor="hand2",
-            font=self.font_ui_10_bold,
-        ).pack(fill="x")
-        tk.Button(
-            actions,
-            text="Очистить",
-            command=self._clear_input,
-            bg=TG_PANEL_ALT,
-            fg=TG_TEXT,
-            activebackground=TG_BORDER,
-            activeforeground=TG_TEXT,
-            relief="flat",
-            bd=0,
-            padx=14,
-            pady=8,
-            cursor="hand2",
-        ).pack(fill="x", pady=(8, 0))
+            bg_color=TG_ACCENT,
+            hover_color=TG_ACCENT_HOVER,
+            font_obj=self.font_ui_12_bold,
+        )
+        self.send_btn.pack()
+
+        # Input clear button removed per UI request.
+        # Shortcut: Ctrl+L clears input.
+        self.input.bind('<Control-l>', lambda e: (self._clear_input(), 'break'))
 
 
     # ---------- history ----------
