@@ -709,17 +709,72 @@ def _normalize_str_list(value: Any) -> list[str]:
 def _normalize_conversation_history(
     payload: dict[str, Any] | None,
     *,
-    max_items: int = 24,
-    max_chars: int = 7000,
+    max_items: int | None = None,
+    max_chars: int | None = None,
+    max_each: int | None = None,
 ) -> list[dict[str, str]]:
     """
     payload.conversation_history = [{"role":"user|assistant","content":"..."}]
-    Урезаем историю, чтобы ускорять ответы.
+
+    Важно: берём ХВОСТ (самые свежие сообщения), иначе агент «теряет нить».
     """
     if not isinstance(payload, dict):
         return []
 
+    if max_items is None:
+        max_items = int(os.getenv("OZONATOR_HISTORY_MAX_ITEMS") or 80)
+    if max_chars is None:
+        max_chars = int(os.getenv("OZONATOR_HISTORY_MAX_CHARS") or 30000)
+    if max_each is None:
+        max_each = int(os.getenv("OZONATOR_HISTORY_MAX_EACH") or 1400)
+
     raw = payload.get("conversation_history") or payload.get("conversation") or []
+    if not isinstance(raw, list):
+        return []
+
+    prepared_rev: list[dict[str, str]] = []
+    total = 0
+
+    for item in reversed(raw):
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(item.get("content") or "").strip()
+        content = re.sub(r"\s+", " ", content)
+        if not content:
+            continue
+        if len(content) > max_each:
+            content = content[:max_each]
+
+        if prepared_rev and total + len(content) > max_chars:
+            break
+
+        prepared_rev.append({"role": role, "content": content})
+        total += len(content)
+
+        if len(prepared_rev) >= max_items:
+            break
+
+    prepared_rev.reverse()
+    return prepared_rev
+
+
+def _normalize_conversation_pins(
+    payload: dict[str, Any] | None,
+    *,
+    max_items: int = 6,
+    max_chars: int = 4000,
+    max_each: int = 1400,
+) -> list[dict[str, str]]:
+    """
+    payload.conversation_pins = [{"role":"user|assistant","content":"..."}]
+    Якоря (обычно первые реплики), чтобы лучше отвечать на вопросы типа «первый вопрос».
+    """
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("conversation_pins") or payload.get("pins") or []
     if not isinstance(raw, list):
         return []
 
@@ -736,14 +791,12 @@ def _normalize_conversation_history(
         content = re.sub(r"\s+", " ", content)
         if not content:
             continue
-        if len(content) > 1400:
-            content = content[:1400]
+        if len(content) > max_each:
+            content = content[:max_each]
         if prepared and total + len(content) > max_chars:
             break
-
         prepared.append({"role": role, "content": content})
         total += len(content)
-
         if len(prepared) >= max_items:
             break
 
@@ -1267,7 +1320,7 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
         f"{forbid_ai_line} "
         "Отвечай на русском, кратко, точно и по делу. "
         "Восклицательные знаки используй только при крайней необходимости; в письмах «!» воспринимается как крик. "
-        "Всегда опирайся ТОЛЬКО на факты из последнего сообщения пользователя и переданной истории диалога. "
+        "Всегда опирайся ТОЛЬКО на факты из последнего сообщения пользователя и переданной истории диалога. Если пользователь спрашивает о том, что было раньше, отвечай только по переданной истории. Если в истории этого нет — прямо скажи, что в текущей истории этого нет, и попроси прислать нужный фрагмент. "
         "НЕ гадай и НЕ перечисляй возможные трактовки. "
         "Если во входном сообщении есть изображения — они переданы тебе, анализируй их. НИКОГДА не утверждай, что ты их не видишь. НИКОГДА не делай предположений о личности людей на фото (например, что это пользователь), если он сам это не сказал. "
         "Если по контексту нельзя понять, что требуется (или не хватает критичных данных), задай ОДИН уточняющий вопрос и остановись. "
@@ -1278,6 +1331,7 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
         f"SelfProfile(JSON): {json.dumps(prof, ensure_ascii=False)}"
     )
 
+    pins = _normalize_conversation_pins(payload)
     history = _normalize_conversation_history(payload)
 
     try:
@@ -1288,6 +1342,8 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
             return ""
 
         messages = [{"role": "system", "content": system_msg}]
+        if pins:
+            messages.extend(pins)
         messages.extend(history)
         if image_parts:
             vision_text = (

@@ -27,6 +27,7 @@ import time
 import tkinter as tk
 import uuid
 import mimetypes
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from tkinter import filedialog, messagebox
@@ -61,10 +62,11 @@ CLIENT_IMAGE_MAX_DIM = int(os.getenv("OZONATOR_CLIENT_IMAGE_MAX_DIM") or 1600)
 CLIENT_IMAGE_PREVIEW_ONLY = (os.getenv("OZONATOR_CLIENT_IMAGE_PREVIEW_ONLY") or "1").strip().lower() not in ("0", "false", "no")
 
 try:
-    from PIL import Image  # type: ignore
+    from PIL import Image, ImageGrab  # type: ignore
     PIL_AVAILABLE = True
 except Exception:
     Image = None  # type: ignore
+    ImageGrab = None  # type: ignore
     PIL_AVAILABLE = False
 
 
@@ -220,7 +222,10 @@ def _prepare_file_for_upload(file_path: str):
             return file_name, ctype, raw, note
 
     return file_name, ctype, raw, "отправлен оригинал"
-HISTORY_MAX_ITEMS = 24
+HISTORY_MAX_ITEMS = int(os.getenv("OZONATOR_HISTORY_MAX_ITEMS") or 80)
+HISTORY_MAX_CHARS = int(os.getenv("OZONATOR_HISTORY_MAX_CHARS") or 30000)
+HISTORY_MAX_EACH = int(os.getenv("OZONATOR_HISTORY_MAX_EACH") or 1400)
+HISTORY_HARD_MAX = int(os.getenv("OZONATOR_HISTORY_HARD_MAX") or 400)
 
 AA_DISPLAY_NAME = "Екатерина"
 
@@ -529,14 +534,28 @@ class App(tk.Tk):
         self.btn_files = tk.Button(bottom, text="Файлы", command=self._pick_files)
         self.btn_files.pack(side=tk.LEFT)
 
-        self.entry = tk.Entry(bottom, font=("Segoe UI", 12))
-        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
+        input_wrap = tk.Frame(bottom)
+        input_wrap.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
+
+        self.entry = tk.Text(input_wrap, font=("Segoe UI", 12), height=3, wrap="word")
+        self.entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        in_scroll = tk.Scrollbar(input_wrap, command=self.entry.yview)
+        in_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.entry.configure(yscrollcommand=in_scroll.set)
         self.entry.focus_set()
+
+        # Ctrl+Enter — отправить (Enter оставляем как в блокноте: новая строка)
+        self.entry.bind("<Control-Return>", lambda _e: self._on_send() or "break")
+        self.entry.bind("<Control-KP_Enter>", lambda _e: self._on_send() or "break")
+        self.entry.bind("<Control-v>", self._on_paste_into_input)
+        self.entry.bind("<<Paste>>", self._on_paste_into_input)
 
         self.btn_send = tk.Canvas(bottom, width=46, height=46, highlightthickness=0)
         self.btn_send.pack(side=tk.RIGHT, padx=(10, 0))
         self._draw_send_button()
         self.btn_send.bind("<Button-1>", lambda _e: self._on_send())
+
+        self._install_context_menus()
 
     def _draw_avatar(self):
         self.avatar.delete("all")
@@ -691,8 +710,8 @@ class App(tk.Tk):
                 self._transcript.append({"stamp": stamp, "role": "assistant", "who": AA_DISPLAY_NAME, "content": aa_text})
                 self._conversation_history.append({"role": "assistant", "content": aa_text})
 
-        if len(self._conversation_history) > HISTORY_MAX_ITEMS:
-            self._conversation_history = self._conversation_history[-HISTORY_MAX_ITEMS:]
+        if len(self._conversation_history) > HISTORY_HARD_MAX:
+            self._conversation_history = self._conversation_history[-HISTORY_HARD_MAX:]
         if len(self._transcript) > STATE_MAX_ITEMS:
             self._transcript = self._transcript[-STATE_MAX_ITEMS:]
         self._save_state()
@@ -730,7 +749,7 @@ class App(tk.Tk):
         self._typing_range = None
 
     def _clear_input(self):
-        self.entry.delete(0, tk.END)
+        self.entry.delete("1.0", tk.END)
 
     def _pick_files(self):
         paths = filedialog.askopenfilenames(title="Выбери файлы")
@@ -766,8 +785,9 @@ class App(tk.Tk):
             "never_discuss_ai": True,
         }
 
-        # history
-        history = list(self._conversation_history)[-HISTORY_MAX_ITEMS:]
+        # history (берём хвост + укладываемся в лимит по символам)
+        history = self._select_history_for_context()
+        pins = self._build_conversation_pins(history)
 
         attachments_meta = []
         for p in self._attached_files:
@@ -787,16 +807,199 @@ class App(tk.Tk):
             "user_key": self.user_key,
             "user_prefs": user_prefs,
             "conversation_history": history,
+            "conversation_pins": pins,
             "attachments": attachments_meta,
         }
 
     def _push_history(self, role: str, content: str):
         self._conversation_history.append({"role": role, "content": content})
-        if len(self._conversation_history) > HISTORY_MAX_ITEMS:
-            self._conversation_history = self._conversation_history[-HISTORY_MAX_ITEMS:]
+        if len(self._conversation_history) > HISTORY_HARD_MAX:
+            self._conversation_history = self._conversation_history[-HISTORY_HARD_MAX:]
+
+
+    def _select_history_for_context(self) -> list[dict]:
+        """Готовим историю для LLM:
+        - берём самые последние сообщения
+        - ограничиваем суммарный размер, чтобы не терять нить диалога
+        """
+        prepared: list[dict[str, str]] = []
+        total = 0
+
+        # идём с конца (самое новое), потом разворачиваем обратно
+        for item in reversed(self._conversation_history):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(item.get("content") or "").strip()
+            content = re.sub(r"\s+", " ", content)
+            if not content:
+                continue
+            if len(content) > HISTORY_MAX_EACH:
+                content = content[:HISTORY_MAX_EACH]
+
+            # лимит по суммарным символам
+            if prepared and (total + len(content)) > HISTORY_MAX_CHARS:
+                break
+
+            prepared.append({"role": role, "content": content})
+            total += len(content)
+
+            if len(prepared) >= HISTORY_MAX_ITEMS:
+                break
+
+        prepared.reverse()
+        return prepared
+
+    def _build_conversation_pins(self, history: list[dict]) -> list[dict]:
+        """Пины — короткие «якоря», чтобы Екатерина не путалась в начале диалога.
+        Особенно важно для вопросов типа «какой был первый вопрос».
+        """
+        history_set = {(str(x.get("role")), str(x.get("content"))) for x in (history or []) if isinstance(x, dict)}
+        pins: list[dict[str, str]] = []
+
+        # берём первые 3 сообщения user/assistant из полного транскрипта
+        for it in self._transcript:
+            if not isinstance(it, dict):
+                continue
+            role = str(it.get("role") or "").strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(it.get("content") or "").strip()
+            if not content:
+                continue
+            content_norm = re.sub(r"\s+", " ", content)
+            if len(content_norm) > HISTORY_MAX_EACH:
+                content_norm = content_norm[:HISTORY_MAX_EACH]
+            key = (role, content_norm)
+            if key in history_set:
+                continue
+            pins.append({"role": role, "content": content_norm})
+            if len(pins) >= 3:
+                break
+
+        return pins
+
+    def _on_paste_into_input(self, _event=None):
+        """Вставка из буфера:
+        - текст вставится как обычно
+        - если в буфере картинка/файлы — добавим как вложения
+        """
+        if not PIL_AVAILABLE or ImageGrab is None:
+            return None
+
+        try:
+            clip = ImageGrab.grabclipboard()
+        except Exception:
+            clip = None
+
+        # 1) если в буфере список файлов — прикрепляем
+        if isinstance(clip, list):
+            added = []
+            for p in clip:
+                try:
+                    p = str(p)
+                    if os.path.isfile(p):
+                        self._attached_files.append(p)
+                        added.append(os.path.basename(p) or "file")
+                except Exception:
+                    continue
+            if added:
+                self._add_message("meta", "Ты", "Добавлено из буфера: " + ", ".join(added), include_in_context=False)
+                self._update_status()
+                return "break"
+            return None
+
+        # 2) если в буфере картинка — сохраняем во временный файл и прикрепляем
+        try:
+            if Image is not None and isinstance(clip, Image.Image):  # type: ignore[attr-defined]
+                base_dir = os.path.join(_app_data_dir(), "clipboard")
+                os.makedirs(base_dir, exist_ok=True)
+                fn = f"clipboard_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.png"
+                path = os.path.join(base_dir, fn)
+                clip.save(path, format="PNG")
+                self._attached_files.append(path)
+                self._add_message("meta", "Ты", f"Вставлено изображение из буфера: {fn}", include_in_context=False)
+                self._update_status()
+                return "break"
+        except Exception:
+            return None
+
+        return None
+
+    def _install_context_menus(self):
+        # Контекстное меню для поля ввода
+        self._menu_input = tk.Menu(self, tearoff=0)
+        self._menu_input.add_command(label="Вырезать", command=lambda: self.entry.event_generate("<<Cut>>"))
+        self._menu_input.add_command(label="Копировать", command=lambda: self.entry.event_generate("<<Copy>>"))
+        self._menu_input.add_command(label="Вставить", command=lambda: self.entry.event_generate("<<Paste>>"))
+        self._menu_input.add_separator()
+        self._menu_input.add_command(label="Выделить всё", command=lambda: self._select_all(self.entry))
+
+        def popup_input(e):
+            try:
+                self.entry.focus_set()
+                self._menu_input.tk_popup(e.x_root, e.y_root)
+            finally:
+                try:
+                    self._menu_input.grab_release()
+                except Exception:
+                    pass
+
+        self.entry.bind("<Button-3>", popup_input)
+        self.entry.bind("<Button-2>", popup_input)
+
+        # Горячие клавиши как в блокноте
+        self.entry.bind("<Control-a>", lambda e: (self._select_all(self.entry), "break")[1])
+        self.entry.bind("<Control-A>", lambda e: (self._select_all(self.entry), "break")[1])
+
+        # Контекстное меню для чата (только копирование)
+        self._menu_chat = tk.Menu(self, tearoff=0)
+        self._menu_chat.add_command(label="Копировать", command=lambda: self._copy_selection(self.chat))
+        self._menu_chat.add_separator()
+        self._menu_chat.add_command(label="Выделить всё", command=lambda: self._select_all(self.chat))
+
+        def popup_chat(e):
+            try:
+                self.chat.focus_set()
+                self._menu_chat.tk_popup(e.x_root, e.y_root)
+            finally:
+                try:
+                    self._menu_chat.grab_release()
+                except Exception:
+                    pass
+
+        self.chat.bind("<Button-3>", popup_chat)
+        self.chat.bind("<Button-2>", popup_chat)
+        self.chat.bind("<Button-1>", lambda _e: self.chat.focus_set())
+
+        self.chat.bind("<Control-c>", lambda e: (self._copy_selection(self.chat), "break")[1])
+        self.chat.bind("<Control-C>", lambda e: (self._copy_selection(self.chat), "break")[1])
+        self.chat.bind("<Control-a>", lambda e: (self._select_all(self.chat), "break")[1])
+        self.chat.bind("<Control-A>", lambda e: (self._select_all(self.chat), "break")[1])
+
+    def _select_all(self, widget: tk.Text):
+        try:
+            widget.tag_add("sel", "1.0", "end-1c")
+            widget.mark_set("insert", "1.0")
+            widget.see("insert")
+        except Exception:
+            pass
+
+    def _copy_selection(self, widget: tk.Text):
+        try:
+            sel = widget.get("sel.first", "sel.last")
+        except Exception:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(sel)
+        except Exception:
+            pass
 
     def _on_send(self):
-        user_text = self.entry.get().strip()
+        user_text = self.entry.get("1.0", "end-1c").strip()
         if not user_text:
             return
 
