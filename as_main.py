@@ -537,7 +537,12 @@ def _strip_and_apply_self_profile_updates(text: str) -> str:
 _DEFAULT_GROQ_BASE = "https://api.groq.com/openai/v1"
 _DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
 _DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
-_DEFAULT_OPENAI_VISION_MODEL = "gpt-4o-mini"
+_DEFAULT_GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+_DEPRECATED_GROQ_VISION_MODELS = {
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview",
+    "llava-v1.5-7b-4096-preview",
+}
 
 
 def _clean_api_key(raw: str) -> str:
@@ -549,18 +554,6 @@ def _clean_api_key(raw: str) -> str:
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
         s = s[1:-1].strip()
     s = "".join(ch for ch in s if 33 <= ord(ch) <= 126)
-    return s
-
-def _mask_secrets_in_text(s: str) -> str:
-    """
-    Убирает возможные секреты из диагностических сообщений.
-    Важно: НЕ логируем и НЕ возвращаем ключи.
-    """
-    if not s:
-        return ""
-    s = re.sub(r"gsk_[A-Za-z0-9_\-]{10,}", "gsk_***", s)
-    s = re.sub(r"sk-[A-Za-z0-9]{10,}", "sk-***", s)
-    s = re.sub(r"(?i)bearer\s+[A-Za-z0-9_\-]{10,}", "Bearer ***", s)
     return s
 
 
@@ -637,25 +630,18 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
 
     image_parts = image_parts or []
     if image_parts:
-        # Если прилетели изображения — пытаемся выбрать vision-модель.
-        vision_model = (
-            os.getenv("OZONATOR_LLM_VISION_MODEL")
-            or os.getenv("GROQ_VISION_MODEL")
-            or os.getenv("OPENAI_VISION_MODEL")
-            or ""
-        ).strip()
-        if vision_model:
-            model = vision_model
-        else:
-            low_m = (model or "").lower()
-            if key.startswith("gsk_"):
-                # Groq: автоматически выбираем vision-модель
-                if ("vision" not in low_m and "image" not in low_m):
-                    model = "llama-3.2-11b-vision-preview"
+        # Если прилетели изображения — выбираем актуальную vision-модель (у Groq старые llama-3.2-*-vision-preview уже сняты с поддержки).
+        vision_model = (os.getenv("OZONATOR_LLM_VISION_MODEL") or os.getenv("GROQ_VISION_MODEL") or "").strip()
+        if key.startswith("gsk_"):
+            v_low = vision_model.strip().lower()
+            if (not vision_model) or (v_low in _DEPRECATED_GROQ_VISION_MODELS):
+                model = _DEFAULT_GROQ_VISION_MODEL
             else:
-                # OpenAI/compatible: если выбрана текстовая модель — переключаемся на vision по умолчанию
-                if ("gpt-4o" not in low_m) and ("vision" not in low_m) and ("image" not in low_m):
-                    model = _DEFAULT_OPENAI_VISION_MODEL
+                model = vision_model
+        else:
+            # Для OpenAI/других OpenAI‑compatible провайдеров — используем то, что задано пользователем.
+            if vision_model:
+                model = vision_model
 
     prefs = payload.get("user_prefs") if isinstance(payload.get("user_prefs"), dict) else {}
     user_name = str(prefs.get("user_name") or "Александр").strip() or "Александр"
@@ -744,46 +730,49 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
                 raw = r.read()
         except urllib_error.HTTPError as e:
             status = int(getattr(e, "code", 0) or 0)
-            err_raw = b""
-            try:
-                err_raw = e.read()  # type: ignore[attr-defined]
-            except Exception:
-                err_raw = b""
-
             if status == 403:
-                return "Ошибка: запрос к провайдеру заблокирован (403 Forbidden)."
+                return f"{addr}, у меня ошибка: запрос к провайдеру заблокирован (403 Forbidden)."
             if status == 401:
-                return "Ошибка: ключ отклонён (401 Unauthorized)."
+                return f"{addr}, у меня ошибка: ключ провайдера отклонён (401 Unauthorized)."
 
             # Пытаемся вытащить человекочитаемое сообщение (без секретов)
             try:
+                err_raw = e.read()  # type: ignore[attr-defined]
                 if err_raw:
                     err_data = json.loads(err_raw.decode("utf-8", errors="ignore"))
                     if isinstance(err_data, dict):
                         err_obj = err_data.get("error") if isinstance(err_data.get("error"), dict) else {}
                         msg = err_obj.get("message") if isinstance(err_obj.get("message"), str) else ""
                         if msg.strip():
-                            msg = _mask_secrets_in_text(msg.strip())
+                            msg = msg.strip()
                             if len(msg) > 240:
                                 msg = msg[:240] + "…"
-                            return f"Ошибка: {msg}"
+                            low_msg = msg.lower()
+                            # Если модель была снята с поддержки — пробуем автоматически переключиться на актуальную vision‑модель Groq.
+                            if image_parts and key.startswith("gsk_") and ("decommissioned" in low_msg or "no longer supported" in low_msg):
+                                try:
+                                    body2 = dict(body)
+                                    body2["model"] = _DEFAULT_GROQ_VISION_MODEL
+                                    req2 = urllib_request.Request(
+                                        url,
+                                        data=json.dumps(body2, ensure_ascii=False).encode("utf-8"),
+                                        headers=req.headers,
+                                        method="POST",
+                                    )
+                                    with urllib_request.urlopen(req2, timeout=60) as r2:
+                                        raw2 = r2.read()
+                                    data2 = json.loads(raw2.decode("utf-8")) if raw2 else {}
+                                    ans2 = _extract_chat_completion_text(data2)
+                                    if isinstance(ans2, str) and ans2.strip():
+                                        return _strip_and_apply_self_profile_updates(ans2.strip())
+                                except Exception:
+                                    pass
+
+                            return f"{addr}, я получила ошибку от провайдера: {msg}"
             except Exception:
                 pass
 
-            # Фолбэк: короткий снэпшот тела ошибки
-            try:
-                if err_raw:
-                    snippet = err_raw.decode("utf-8", errors="ignore").strip()
-                    snippet = re.sub(r"\s+", " ", snippet)
-                    snippet = _mask_secrets_in_text(snippet)
-                    if snippet:
-                        if len(snippet) > 240:
-                            snippet = snippet[:240] + "…"
-                        return f"Ошибка HTTP {status}: {snippet}"
-            except Exception:
-                pass
-
-            return f"Ошибка HTTP {status} при обращении к провайдеру модели."
+            return ""
 
         data = json.loads(raw.decode("utf-8")) if raw else {}
         return _strip_and_apply_self_profile_updates(_extract_chat_completion_text(data))
@@ -904,34 +893,13 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     ai_answer = _llm_answer(llm_question, payload, image_parts=image_parts)
     if ai_answer:
         return ai_answer
+
     if image_parts:
-        key = _pick_llm_key()
-        if not key:
-            return (
-                "Саша, я получила фото, но на сервере сейчас не настроен ключ для обращения к провайдеру модели. "
-                "Поэтому я отвечаю в офлайн-режиме и картинки разобрать не могу. "
-                "Один шаг: в Render → сервис AS → Environment добавь GROQ_API_KEY (предпочтительно) "
-                "или OPENAI_API_KEY и перезапусти AS. После этого снова отправь фото — я разберу его."
-            )
-
-        probe = _llm_answer("Ответь одним словом: ОК.", payload)
-        if not probe or probe.strip().lower().startswith("ошибка"):
-            # Если текстовый вызов тоже не проходит — это не про vision, а про доступ/ключ/URL
-            base_hint = (
-                "GROQ_API_KEY (предпочтительно)" if key.startswith("gsk_") else "OPENAI_API_KEY"
-            )
-            return (
-                "Саша, я получила фото, но сейчас сервер не может нормально обратиться к провайдеру модели (ключ/URL/доступ). "
-                f"Один шаг: в Render → сервис AS → Environment проверь {base_hint} (и при необходимости OPENAI_API_URL), "
-                "затем перезапусти AS. После этого снова отправь фото."
-            )
-
-        provider = "Groq" if key.startswith("gsk_") else "OpenAI/compatible"
-        rec_model = "llama-3.2-11b-vision-preview" if key.startswith("gsk_") else _DEFAULT_OPENAI_VISION_MODEL
         return (
-            f"Саша, я получила фото, но провайдер {provider} не принял изображение в текущей настройке модели. "
-            f"Один шаг: в Render → сервис AS → Environment задай OZONATOR_LLM_VISION_MODEL = {rec_model} и перезапусти AS. "
-            "После этого снова отправь фото — я разберу его по содержимому."
+            "Саша, я получила фото, но текущая настройка модели на сервере не принимает изображения. "
+            "Поставь в Render для сервиса AS переменную OZONATOR_LLM_VISION_MODEL "
+            "= meta-llama/llama-4-scout-17b-16e-instruct и перезапусти AS. "
+            "После этого снова отправь фото — я смогу его разобрать."
         )
 
     heur = _heuristic_answer(main_goal)(main_goal)
