@@ -40,9 +40,9 @@ DEFAULT_LLM_PROVIDER = (os.getenv("OZONATOR_LLM_PROVIDER") or "groq").strip()
 DEFAULT_LLM_MODEL = (os.getenv("OZONATOR_LLM_MODEL") or "llama-3.3-70b-versatile").strip()
 
 CREATE_RETRIES = 2
-HTTP_TIMEOUT = 25
-
-
+HTTP_TIMEOUT = int(os.getenv("OZONATOR_HTTP_TIMEOUT") or 90)
+UPLOAD_TIMEOUT = int(os.getenv("OZONATOR_UPLOAD_TIMEOUT") or max(180, HTTP_TIMEOUT))
+UPLOAD_RETRIES = int(os.getenv("OZONATOR_UPLOAD_RETRIES") or 2)
 SEND_TIMEOUT_SEC = 75  # ожидание получения task_id (create_task)
 FAST_POLL_MS = 250
 NORMAL_POLL_MS = 1000
@@ -85,10 +85,10 @@ class AAClient:
             h["X-Admin-Token"] = AA_ADMIN_TOKEN
         return h
 
-    def _request_raw(self, method: str, url: str, body: bytes | None, headers: dict) -> ApiResponse:
+    def _request_raw(self, method: str, url: str, body: bytes | None, headers: dict, timeout: int = HTTP_TIMEOUT) -> ApiResponse:
         req = urllib_request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib_request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            with urllib_request.urlopen(req, timeout=timeout) as r:
                 raw = r.read()
                 txt = raw.decode("utf-8") if raw else ""
                 return ApiResponse(True, r.status, json.loads(txt) if txt else {}, None)
@@ -106,14 +106,14 @@ class AAClient:
         except Exception as e:
             return ApiResponse(False, 0, None, f"{e.__class__.__name__}: {e}")
 
-    def _request_json(self, method: str, url: str, body: dict | None) -> ApiResponse:
+    def _request_json(self, method: str, url: str, body: dict | None, timeout: int = HTTP_TIMEOUT) -> ApiResponse:
         data = None
         if body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
 
         req = urllib_request.Request(url, data=data, headers=self._headers(), method=method)
         try:
-            with urllib_request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            with urllib_request.urlopen(req, timeout=timeout) as r:
                 raw = r.read()
                 txt = raw.decode("utf-8") if raw else ""
                 return ApiResponse(True, r.status, json.loads(txt) if txt else {}, None)
@@ -216,23 +216,36 @@ class AAClient:
         tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
         body = head + content + tail
 
-        last_err = None
-        for pref in self._prefixes():
-            self.api_prefix = pref
-            url = self._mk(f"/tasks/{task_id}/files/upload")
-            headers = self._headers().copy()
-            headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
-            headers["Accept"] = "application/json"
-            resp = self._request_raw("POST", url, body, headers)
-            if resp.ok:
-                return
+        # Динамический таймаут: по умолчанию UPLOAD_TIMEOUT,
+        # но для больших файлов/медленного канала увеличиваем.
+        # 200_000 B/s ~ 0.2MB/s (консервативно), +60s запас.
+        dyn = int(len(body) / 200_000) + 60
+        upload_timeout = max(UPLOAD_TIMEOUT, dyn)
+        upload_timeout = min(upload_timeout, 900)
 
-            detail = ""
-            if isinstance(resp.data, dict):
-                detail = str(resp.data.get("detail") or resp.data.get("message") or "").strip()
-            last_err = (f"{resp.error or 'upload_failed'} (status={resp.status}) {detail}").strip()
+        last_err = None
+        for attempt in range(UPLOAD_RETRIES + 1):
+            for pref in self._prefixes():
+                self.api_prefix = pref
+                url = self._mk(f"/tasks/{task_id}/files/upload")
+                headers = self._headers().copy()
+                headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+                headers["Accept"] = "application/json"
+
+                resp = self._request_raw("POST", url, body, headers, timeout=upload_timeout)
+                if resp.ok:
+                    return
+
+                detail = ""
+                if isinstance(resp.data, dict):
+                    detail = str(resp.data.get("detail") or resp.data.get("message") or "").strip()
+                last_err = (f"{resp.error or 'upload_failed'} (status={resp.status}) {detail}").strip()
+
+            # сетевые/таймауты — ретраим с небольшим backoff
+            time.sleep(0.8 * (attempt + 1))
 
         raise RuntimeError(last_err or "upload_failed")
+
 
 
 class App(tk.Tk):
@@ -523,13 +536,14 @@ class App(tk.Tk):
                 def ui_fail():
                     if nonce != self._send_nonce:
                         return
+                    stage = self._send_stage or "-"
                     self._sending = False
                     self._send_stage = ""
                     self._last_send_error = err
                     self._polling = False
                     self.current_task_id = None
                     self._update_status()
-                    self._on_error(f"Не удалось отправить задачу: {err}")
+                    self._on_error(f"Не удалось отправить задачу ({stage}): {err}")
 
                 self.after(0, ui_fail)
 
@@ -643,6 +657,9 @@ class App(tk.Tk):
                 elapsed = max(0.0, time.time() - float(self._sending_started_at))
 
             txt.insert(tk.END, f"server: {self.client.base_url}\n")
+            txt.insert(tk.END, f"HTTP_TIMEOUT: {HTTP_TIMEOUT}s\n")
+            txt.insert(tk.END, f"UPLOAD_TIMEOUT: {UPLOAD_TIMEOUT}s\n")
+            txt.insert(tk.END, f"UPLOAD_RETRIES: {UPLOAD_RETRIES}\n")
             txt.insert(tk.END, f"sending: {self._sending}\n")
             txt.insert(tk.END, f"stage: {self._send_stage or '-'}\n")
             txt.insert(tk.END, f"elapsed_sec: {elapsed:.1f}\n")
