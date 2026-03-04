@@ -47,9 +47,9 @@ _ATT_MAX_FILES = 8
 _ATT_MAX_TOTAL_BYTES = 2 * 1024 * 1024
 _ATT_MAX_CHARS_PER_FILE = 20000
 
-_ATT_MAX_IMAGES = 4
-_ATT_MAX_IMAGE_BYTES_EACH = 2 * 1024 * 1024
-_ATT_MAX_TOTAL_IMAGE_BYTES = 4 * 1024 * 1024
+_ATT_MAX_IMAGES = 5
+_ATT_MAX_IMAGE_BYTES_EACH = 2_900_000
+_ATT_MAX_TOTAL_IMAGE_BYTES = 2_900_000
 
 
 def _ext(name: str) -> str:
@@ -140,6 +140,70 @@ def _guess_image_mime(file_name: str, content_type: str | None = None) -> str:
     return "image/jpeg"
 
 
+
+
+# Groq: base64 encoded image request max is 4MB (base64 payload)
+# (см. Groq Vision docs)
+_MAX_GROQ_BASE64_IMAGE_CHARS = 4 * 1024 * 1024
+
+
+def _prepare_image_for_vision(file_name: str, content_type: str, raw: bytes) -> tuple[bytes, str]:
+    """Подготовка изображения для vision: размер, формат, совместимость."""
+    mime = _guess_image_mime(file_name, content_type)
+    if not raw:
+        return raw, mime
+
+    def b64_len(n: int) -> int:
+        return ((n + 2) // 3) * 4
+
+    try:
+        from PIL import Image
+    except Exception:
+        return raw, mime
+
+    try:
+        img = Image.open(io.BytesIO(raw))
+        if img.mode == "RGBA":
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        max_dim = int(os.getenv("OZONATOR_MAX_IMAGE_DIM", "2048") or 2048)
+        w, h = img.size
+        if max(w, h) > max_dim:
+            scale = max_dim / float(max(w, h))
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+
+        target_b64 = int(os.getenv("OZONATOR_MAX_IMAGE_B64", str(_MAX_GROQ_BASE64_IMAGE_CHARS)) or _MAX_GROQ_BASE64_IMAGE_CHARS)
+        quality = 90
+
+        def encode(q: int) -> bytes:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=q, optimize=True)
+            return buf.getvalue()
+
+        data = encode(quality)
+        while b64_len(len(data)) > target_b64 and quality >= 45:
+            quality -= 7
+            data = encode(quality)
+
+        attempts = 0
+        while b64_len(len(data)) > target_b64 and attempts < 3:
+            w, h = img.size
+            img = img.resize((max(1, int(w * 0.85)), max(1, int(h * 0.85))))
+            data = encode(max(45, quality))
+            attempts += 1
+
+        if b64_len(len(data)) <= target_b64:
+            return data, "image/jpeg"
+
+        return raw, mime
+    except Exception:
+        return raw, mime
+
+
 def _collect_attachments_for_llm(task_id: int) -> tuple[str, list[dict[str, Any]]]:
     """
     Возвращает:
@@ -189,11 +253,11 @@ def _collect_attachments_for_llm(task_id: int) -> tuple[str, list[dict[str, Any]
                 )
                 continue
 
-            mime = _guess_image_mime(file_name, content_type)
-            b64 = base64.b64encode(content).decode("ascii")
+            processed, mime = _prepare_image_for_vision(file_name, content_type, content)
+            b64 = base64.b64encode(processed).decode("ascii")
             data_url = f"data:{mime};base64,{b64}"
-            image_parts.append({"type": "image_url", "image_url": {"url": data_url}})
-            total_image_bytes += size_bytes
+            image_parts.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
+            total_image_bytes += len(processed)
             blocks.append(f"— {file_name}: (изображение, приложено к сообщению)")
             continue
 
@@ -531,6 +595,69 @@ def _strip_and_apply_self_profile_updates(text: str) -> str:
     return cleaned
 
 
+
+
+
+# -------------------------
+# Output post-processing: enforce feminine first-person (RU)
+# -------------------------
+
+def _case_like(src: str, dst: str) -> str:
+    if not src:
+        return dst
+    return dst[:1].upper() + dst[1:] if src[:1].isupper() else dst
+
+
+# Только базовые и самые частые формы. Правим ТОЛЬКО 1-е лицо или начало фразы.
+_FEM_RULES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bя\s+рад\b", re.I), "я рада"),
+    (re.compile(r"(^|[\.\!\?\n]\s*)(рад)(\s+за\b)", re.I), r"\1рада\3"),
+    (re.compile(r"\bя\s+сделал\b", re.I), "я сделала"),
+    (re.compile(r"\bя\s+понял\b", re.I), "я поняла"),
+    (re.compile(r"\bя\s+увидел\b", re.I), "я увидела"),
+    (re.compile(r"\bя\s+не\s+увидел\b", re.I), "я не увидела"),
+    (re.compile(r"\bя\s+получил\b", re.I), "я получила"),
+    (re.compile(r"\bя\s+посмотрел\b", re.I), "я посмотрела"),
+    (re.compile(r"\bя\s+прочитал\b", re.I), "я прочитала"),
+    (re.compile(r"\bя\s+спросил\b", re.I), "я спросила"),
+    (re.compile(r"\bя\s+готов\b", re.I), "я готова"),
+    (re.compile(r"\bя\s+уверен\b", re.I), "я уверена"),
+    (re.compile(r"\bя\s+должен\b", re.I), "я должна"),
+    (re.compile(r"\bя\s+смог\b", re.I), "я смогла"),
+]
+
+
+def _enforce_feminine_ru(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return text
+
+    out = text
+
+    # Начало сообщения: "Рад..." -> "Рада..."
+    out = re.sub(
+        r"(^|[\r\n]+)\s*(Рад)(\b)",
+        lambda m: (m.group(1) or "") + _case_like(m.group(2), "Рада"),
+        out,
+    )
+
+    for pat, repl in _FEM_RULES:
+        def _sub(m: re.Match[str]) -> str:
+            # если repl содержит групповые ссылки, не трогаем кейс
+            if "\\" in repl:
+                return m.expand(repl)
+            src = m.group(0)
+            if src[:1].isupper():
+                return repl[:1].upper() + repl[1:]
+            return repl
+
+        out = pat.sub(_sub, out)
+
+    return out
+
+
+def _safe_strip(s: str) -> str:
+    return (s or "").strip()
+
 # -------------------------
 # LLM (Groq / OpenAI-compatible Chat Completions)
 # -------------------------
@@ -538,6 +665,8 @@ _DEFAULT_GROQ_BASE = "https://api.groq.com/openai/v1"
 _DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
 _DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 _DEFAULT_GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+# Альтернативный vision‑модель (может быть доступна/устаревать; используем только как fallback)
+_DEFAULT_GROQ_VISION_MODEL_FALLBACK = "meta-llama/llama-4-maverick-17b-128e-instruct"
 _DEPRECATED_GROQ_VISION_MODELS = {
     "llama-3.2-11b-vision-preview",
     "llama-3.2-90b-vision-preview",
@@ -666,7 +795,7 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
     )
 
     system_msg = (
-        f"Ты — Екатерина. Говори от первого лица и о себе всегда в женском роде (я сделала, я посмотрела, я готова). Мы с пользователем давно знакомы, общение по-свойски. "
+        f"Ты — Екатерина. Говори от первого лица и о себе ВСЕГДА в женском роде (я сделала, я посмотрела, я готова). НИКОГДА не используй формы мужского рода про себя. Мы с пользователем давно знакомы, общение по-свойски. "
         f"Пользователя зовут {user_name}. Всегда обращайся к нему на {pronoun}. "
         f"Используй обращение «{addr}» (можно переключаться по контексту между: {', '.join(variants)}). "
         "Не представляйся и не объясняй, кто ты. "
@@ -675,7 +804,7 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
         "Восклицательные знаки используй только при крайней необходимости; в письмах «!» воспринимается как крик. "
         "Всегда опирайся ТОЛЬКО на факты из последнего сообщения пользователя и переданной истории диалога. "
         "НЕ гадай и НЕ перечисляй возможные трактовки. "
-        "Если во входном сообщении есть изображения — они переданы тебе, анализируй их и не утверждай, что ты их не видишь. "
+        "Если во входном сообщении есть изображения — они переданы тебе, анализируй их. НИКОГДА не утверждай, что ты их не видишь. НИКОГДА не делай предположений о личности людей на фото (например, что это пользователь), если он сам это не сказал. "
         "Если по контексту нельзя понять, что требуется (или не хватает критичных данных), задай ОДИН уточняющий вопрос и остановись. "
         "Твой SelfProfile (внутренний образ) должен быть стабильным и сохраняться между сообщениями и рестартами. "
         "Не рассказывай о себе без повода. "
@@ -696,17 +825,28 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
         messages = [{"role": "system", "content": system_msg}]
         messages.extend(history)
         if image_parts:
-            user_content = [{"type": "text", "text": question_ru}, *image_parts]
+            vision_text = (
+                "Проанализируй изображение(я) и ответь на вопрос пользователя. "
+                "Сначала зафиксируй наблюдения: (1) люди/лица (есть ли человек, сколько, где; если не уверена — так и скажи), "
+                "(2) основные объекты/сцена, (3) текст/надписи. "
+                "Не выдумывай детали и не делай предположений о личности людей на фото. "
+                "Верни ответ СТРОГО в JSON-объекте с ключами: people_present (true/false/unknown), people, objects, text, answer. "
+                f"\nВопрос пользователя: {question_ru}"
+            )
+            user_content = [{"type": "text", "text": vision_text}, *image_parts]
             messages.append({"role": "user", "content": user_content})
         else:
             messages.append({"role": "user", "content": question_ru})
-
         body = {
             "model": model,
             "messages": messages,
             "temperature": 0.2,
-            "max_tokens": 500,
+            "max_tokens": 600,
         }
+
+        # Groq vision поддерживает JSON mode (response_format)
+        if image_parts and key.startswith("gsk_"):
+            body["response_format"] = {"type": "json_object"}
 
         req = urllib_request.Request(
             url,
@@ -764,7 +904,7 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
                                     data2 = json.loads(raw2.decode("utf-8")) if raw2 else {}
                                     ans2 = _extract_chat_completion_text(data2)
                                     if isinstance(ans2, str) and ans2.strip():
-                                        return _strip_and_apply_self_profile_updates(ans2.strip())
+                                        return _enforce_feminine_ru(_strip_and_apply_self_profile_updates(ans2.strip()))
                                 except Exception:
                                     pass
 
@@ -775,7 +915,86 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
             return ""
 
         data = json.loads(raw.decode("utf-8")) if raw else {}
-        return _strip_and_apply_self_profile_updates(_extract_chat_completion_text(data))
+        ans_text = _safe_strip(_extract_chat_completion_text(data))
+
+        # Если мы просили JSON (vision) — распарсим и вернём человеческий answer
+        if image_parts:
+            obj = None
+            try:
+                if ans_text.startswith("{"):
+                    obj = json.loads(ans_text)
+            except Exception:
+                obj = None
+
+            if isinstance(obj, dict):
+                people_present = obj.get("people_present")
+                people = _safe_strip(str(obj.get("people") or ""))
+                objects = _safe_strip(str(obj.get("objects") or ""))
+                txt = _safe_strip(str(obj.get("text") or ""))
+                answer = _safe_strip(str(obj.get("answer") or ""))
+
+                ql = (question_ru or "").lower()
+                need_people_check = any(k in ql for k in [
+                    "кто на фото", "кто на снимке", "есть ли человек", "человек", "лицо", "люди", "персона",
+                    "что на фото", "что на снимке", "что изображено",
+                ])
+
+                if need_people_check and str(people_present).lower() in {"false", "0", "no", "none", "unknown", ""}:
+                    try:
+                        vision_text2 = (
+                            "Проверь ТОЛЬКО наличие людей/частей тела/лица на изображении(ях). "
+                            "Если человек есть даже частично — скажи об этом. "
+                            "Верни СТРОГО JSON: people_present (true/false/unknown), people."
+                        )
+                        messages2 = [{"role": "system", "content": system_msg}]
+                        messages2.extend(history)
+                        messages2.append({
+                            "role": "user",
+                            "content": [{"type": "text", "text": vision_text2}, *image_parts],
+                        })
+                        body2 = {
+                            "model": model,
+                            "messages": messages2,
+                            "temperature": 0.1,
+                            "max_tokens": 300,
+                            "response_format": {"type": "json_object"},
+                        }
+                        req2 = urllib_request.Request(
+                            url,
+                            data=json.dumps(body2, ensure_ascii=False).encode("utf-8"),
+                            headers=req.headers,
+                            method="POST",
+                        )
+                        with urllib_request.urlopen(req2, timeout=60) as r2:
+                            raw2 = r2.read()
+                        data2 = json.loads(raw2.decode("utf-8")) if raw2 else {}
+                        ans2 = _safe_strip(_extract_chat_completion_text(data2))
+                        obj2 = json.loads(ans2) if ans2.startswith("{") else None
+                        if isinstance(obj2, dict) and str(obj2.get("people_present")).lower() in {"true", "1", "yes"}:
+                            people_present = obj2.get("people_present")
+                            people = _safe_strip(str(obj2.get("people") or people))
+                    except Exception:
+                        pass
+
+                if not answer:
+                    parts = []
+                    if str(people_present).lower() in {"true", "1", "yes"} and people:
+                        parts.append(f"Люди: {people}.")
+                    elif str(people_present).lower() in {"false", "0", "no"}:
+                        parts.append("Людей на фото не вижу уверенно.")
+                    elif str(people_present).lower() == "unknown":
+                        parts.append("По людям на фото не уверена (качество/ракурс).")
+                    if objects:
+                        parts.append(f"Объекты/сцена: {objects}.")
+                    if txt:
+                        parts.append(f"Текст на изображении: {txt}.")
+                    answer = " ".join(parts).strip()
+
+                ans_text = answer or ans_text
+
+        ans_text = _strip_and_apply_self_profile_updates(ans_text)
+        ans_text = _enforce_feminine_ru(ans_text)
+        return ans_text
     except Exception:
         return ""
 
@@ -892,7 +1111,7 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
 
     ai_answer = _llm_answer(llm_question, payload, image_parts=image_parts)
     if ai_answer:
-        return ai_answer
+        return _enforce_feminine_ru(ai_answer)
 
     if image_parts:
         return (
@@ -902,7 +1121,7 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
             "После этого снова отправь фото — я смогу его разобрать."
         )
 
-    heur = _heuristic_answer(main_goal)(main_goal)
+    heur = _heuristic_answer(main_goal)
     if heur:
         return heur
 

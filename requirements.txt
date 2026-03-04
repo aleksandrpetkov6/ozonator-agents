@@ -4,3 +4,4 @@ psycopg[binary]
 redis
 python-multipart
 openpyxl
+Pillow
