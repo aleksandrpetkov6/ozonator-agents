@@ -5,5 +5,4 @@ redis
 python-multipart
 openpyxl
 Pillow
-imageio==2.34.2
-imageio-ffmpeg==0.5.1
+imageio-ffmpeg

@@ -8,7 +8,9 @@ import re
 import base64
 import io
 import csv
+import subprocess
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
@@ -16,11 +18,6 @@ import psycopg
 import redis
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-
-try:
-    import imageio.v2 as imageio  # type: ignore
-except Exception:
-    imageio = None  # type: ignore
 
 from app.config import get_settings
 from db.health import check_postgres, check_redis
@@ -56,6 +53,20 @@ _ATT_MAX_CHARS_PER_FILE = 20000
 _ATT_MAX_IMAGES = 5
 _ATT_MAX_IMAGE_BYTES_EACH = 2_900_000
 _ATT_MAX_TOTAL_IMAGE_BYTES = 2_900_000
+
+
+_VIDEO_EXTS = {"mp4", "mov", "mkv", "avi", "webm", "m4v"}
+_VIDEO_FPS = float(os.getenv("OZONATOR_VIDEO_FPS", "1") or 1)  # 1 кадр/сек
+_VIDEO_BATCH_SIZE = int(os.getenv("OZONATOR_VIDEO_BATCH_SIZE", "8") or 8)  # кадров на 1 vision-вызов
+_VIDEO_MAX_FRAMES = int(os.getenv("OZONATOR_VIDEO_MAX_FRAMES", "900") or 900)  # защита от очень длинных видео
+_VIDEO_FRAME_DIM = int(os.getenv("OZONATOR_VIDEO_FRAME_DIM", "1024") or 1024)
+
+_VIDEO_AUDIO_MAX_BYTES = int(os.getenv("OZONATOR_VIDEO_AUDIO_MAX_BYTES", "24000000") or 24000000)
+_ASR_MODEL = (os.getenv("OZONATOR_ASR_MODEL") or "whisper-large-v3-turbo").strip()
+_ASR_LANGUAGE = (os.getenv("OZONATOR_ASR_LANGUAGE") or "ru").strip()
+
+_VIDEO_MAX_TRANSCRIPT_CHARS = int(os.getenv("OZONATOR_VIDEO_MAX_TRANSCRIPT_CHARS", "12000") or 12000)
+_VIDEO_MAX_TIMELINE_LINES = int(os.getenv("OZONATOR_VIDEO_MAX_TIMELINE_LINES", "1200") or 1200)
 
 
 def _ext(name: str) -> str:
@@ -210,107 +221,312 @@ def _prepare_image_for_vision(file_name: str, content_type: str, raw: bytes) -> 
         return raw, mime
 
 
+_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
 
-_VIDEO_EXTS = {"mp4", "mov", "m4v", "avi", "mkv", "webm"}
+def _ffmpeg_exe() -> str:
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
 
-def _prepare_video_frames_for_vision(file_name: str, content_type: str, raw: bytes, *, max_frames: int = 4) -> list[tuple[bytes, str]]:
-    """Извлекаем несколько кадров из видео и подготавливаем их как изображения для vision.
 
-    Подход: сохраняем во временный файл и читаем через imageio/ffmpeg.
-    Если imageio недоступен или чтение не удалось — возвращаем пусто.
-    """
-    if not raw or max_frames <= 0:
-        return []
-    if imageio is None:
-        return []
+def _probe_video_duration_seconds(path: str) -> float:
+    exe = _ffmpeg_exe()
+    try:
+        p = subprocess.run([exe, "-hide_banner", "-i", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        m = _DURATION_RE.search(p.stderr.decode("utf-8", "ignore"))
+        if not m:
+            return 0.0
+        h = int(m.group(1))
+        mi = int(m.group(2))
+        s = float(m.group(3))
+        return h * 3600 + mi * 60 + s
+    except Exception:
+        return 0.0
+
+
+def _multipart_encode(fields: dict[str, str], files: list[tuple[str, str, str, bytes]]) -> tuple[bytes, str]:
+    boundary = "----ozonator" + uuid.uuid4().hex
+    body = io.BytesIO()
+
+    for k, v in (fields or {}).items():
+        body.write(f"--{boundary}\r\n".encode("utf-8"))
+        body.write(f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode("utf-8"))
+        body.write((v or "").encode("utf-8"))
+        body.write(b"\r\n")
+
+    for field, filename, ctype, data in files:
+        body.write(f"--{boundary}\r\n".encode("utf-8"))
+        body.write(f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'.encode("utf-8"))
+        body.write(f"Content-Type: {ctype}\r\n\r\n".encode("utf-8"))
+        body.write(data or b"")
+        body.write(b"\r\n")
+
+    body.write(f"--{boundary}--\r\n".encode("utf-8"))
+    return body.getvalue(), f"multipart/form-data; boundary={boundary}"
+
+
+def _audio_transcriptions_url(chat_url: str) -> str:
+    u = (chat_url or "").strip()
+    if "/chat/completions" in u:
+        return u.rsplit("/chat/completions", 1)[0] + "/audio/transcriptions"
+    return u.rstrip("/") + "/audio/transcriptions"
+
+
+def _asr_transcribe(audio_bytes: bytes, mime: str, filename: str, *, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    payload = payload or {}
+    key = _pick_llm_key()
+    if not key or not audio_bytes:
+        return None
 
     try:
-        # Временный файл нужен, потому что ffmpeg-ридер обычно ждёт путь.
-        ext = _ext(file_name) or "mp4"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
+        import urllib.request as urllib_request
+        import urllib.error as urllib_error
 
-        frames: list[tuple[bytes, str]] = []
-        try:
-            reader = imageio.get_reader(tmp_path, format="ffmpeg")
-            meta = {}
-            try:
-                meta = reader.get_meta_data() or {}
-            except Exception:
-                meta = {}
+        chat_url = _normalize_llm_url(os.getenv("OPENAI_API_URL", ""), key=key)
+        url = _audio_transcriptions_url(chat_url)
 
-            nframes = None
-            # imageio может отдавать nframes, но иногда это inf/None
-            for key in ("nframes", "n_frames", "nImages"):
-                v = meta.get(key)
-                if isinstance(v, (int, float)) and v and v != float("inf"):
-                    nframes = int(v)
-                    break
-            if not nframes:
-                try:
-                    nframes = int(reader.count_frames())
-                except Exception:
-                    nframes = None
+        fields = {"model": _ASR_MODEL, "response_format": "verbose_json", "temperature": "0"}
+        if _ASR_LANGUAGE:
+            fields["language"] = _ASR_LANGUAGE
 
-            # Индексы кадров равномерно по ролику (или первые, если nframes неизвестно)
-            indices: list[int] = []
-            if nframes and nframes > 0:
-                if max_frames == 1:
-                    indices = [max(0, nframes // 2)]
-                else:
-                    indices = [int(round(i * (nframes - 1) / (max_frames - 1))) for i in range(max_frames)]
-                # уникализируем и сортируем
-                indices = sorted(set(max(0, min(nframes - 1, x)) for x in indices))
-            else:
-                indices = list(range(max_frames))
+        body, ctype = _multipart_encode(fields, [("file", filename, mime, audio_bytes)])
 
-            from PIL import Image  # Pillow уже в requirements
-            for i, idx in enumerate(indices):
-                if len(frames) >= max_frames:
-                    break
-                try:
-                    arr = reader.get_data(idx)
-                except Exception:
-                    # если random access не работает — пробуем последовательное чтение
-                    try:
-                        arr = next(reader)
-                    except Exception:
-                        break
+        req = urllib_request.Request(url, data=body, method="POST")
+        req.add_header("Authorization", f"Bearer {key}")
+        req.add_header("Content-Type", ctype)
+        req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", "Mozilla/5.0 OzonatorAgents-AS")
 
-                try:
-                    img = Image.fromarray(arr)
-                except Exception:
-                    continue
-
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=85, optimize=True)
-                jpg = buf.getvalue()
-
-                prepared, mime = _prepare_image_for_vision(f"{file_name}#frame{idx}.jpg", "image/jpeg", jpg)
-                if prepared:
-                    frames.append((prepared, mime))
-        finally:
-            try:
-                reader.close()
-            except Exception:
-                pass
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-
-        return frames
+        with urllib_request.urlopen(req, timeout=120) as r:
+            raw = r.read()
+        return json.loads(raw.decode("utf-8", "replace"))
     except Exception:
-        return []
+        return None
 
 
-def _collect_attachments_for_llm(task_id: int) -> tuple[str, list[dict[str, Any]]]:
+def _format_asr_verbose(resp: dict[str, Any] | None) -> str:
+    if not isinstance(resp, dict):
+        return ""
+    segs = resp.get("segments")
+    if isinstance(segs, list) and segs:
+        out = []
+        for s in segs:
+            if not isinstance(s, dict):
+                continue
+            t0 = float(s.get("start") or 0.0)
+            t1 = float(s.get("end") or 0.0)
+            txt = str(s.get("text") or "").strip()
+            if not txt:
+                continue
+
+            def fmt(t: float) -> str:
+                mm = int(t // 60)
+                ss = int(t % 60)
+                return f"{mm:02d}:{ss:02d}"
+
+            out.append(f"[{fmt(t0)}–{fmt(t1)}] {txt}")
+        return "\n".join(out).strip()
+    txt = str(resp.get("text") or "").strip()
+    return txt
+
+
+def _extract_audio_bytes(video_path: str) -> tuple[bytes, str, str]:
+    exe = _ffmpeg_exe()
+    with tempfile.TemporaryDirectory() as td:
+        wav_path = os.path.join(td, "audio.wav")
+        subprocess.run(
+            [exe, "-hide_banner", "-loglevel", "error", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", wav_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if os.path.exists(wav_path):
+            data = open(wav_path, "rb").read()
+            if len(data) <= _VIDEO_AUDIO_MAX_BYTES:
+                return data, "audio/wav", "audio.wav"
+
+        mp3_path = os.path.join(td, "audio.mp3")
+        subprocess.run(
+            [exe, "-hide_banner", "-loglevel", "error", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", mp3_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if os.path.exists(mp3_path):
+            data = open(mp3_path, "rb").read()
+            return data, "audio/mpeg", "audio.mp3"
+
+    return b"", "", ""
+
+
+def _extract_frames_1fps(video_path: str) -> list[tuple[int, bytes, str]]:
+    exe = _ffmpeg_exe()
+    frames: list[tuple[int, bytes, str]] = []
+    with tempfile.TemporaryDirectory() as td:
+        out_pattern = os.path.join(td, "frame_%06d.jpg")
+        vf = f"fps={_VIDEO_FPS},scale='min({_VIDEO_FRAME_DIM},iw)':-2"
+        subprocess.run(
+            [exe, "-hide_banner", "-loglevel", "error", "-y", "-i", video_path, "-vf", vf, "-q:v", "4", out_pattern],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        names = sorted([n for n in os.listdir(td) if n.startswith("frame_") and n.lower().endswith(".jpg")])
+        for idx, name in enumerate(names):
+            t_sec = int(idx / _VIDEO_FPS) if _VIDEO_FPS else idx
+            raw = open(os.path.join(td, name), "rb").read()
+            processed, mime = _prepare_image_for_vision(name, "image/jpeg", raw)
+            frames.append((t_sec, processed, mime))
+            if len(frames) >= _VIDEO_MAX_FRAMES:
+                break
+    return frames
+
+
+def _llm_chat_raw(messages: list[dict[str, Any]], *, model: str, url: str, key: str, max_tokens: int = 900, temperature: float = 0.2) -> str:
+    try:
+        import urllib.request as urllib_request
+        import urllib.error as urllib_error
+
+        body = json.dumps({"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}, ensure_ascii=False).encode("utf-8")
+
+        req = urllib_request.Request(
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Accept": "application/json",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 OzonatorAgents-AS"
+                ),
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Authorization": f"Bearer {key}",
+            },
+            method="POST",
+        )
+
+        with urllib_request.urlopen(req, timeout=120) as r:
+            raw = r.read()
+        resp = json.loads(raw.decode("utf-8", "replace"))
+        return _extract_chat_completion_text(resp)
+    except Exception:
+        return ""
+
+
+def _vision_timeline_batch(frames: list[tuple[int, bytes, str]], *, memory: str, payload: dict[str, Any] | None = None) -> tuple[list[str], str]:
+    payload = payload or {}
+    key = _pick_llm_key()
+    if not key or not frames:
+        return [], memory
+
+    chat_url = _normalize_llm_url(os.getenv("OPENAI_API_URL", ""), key=key)
+    model = _pick_llm_model(payload)
+
+    # Если есть изображения — выбираем актуальную vision-модель (у Groq старые llama-3.2-*-vision-preview уже сняты с поддержки).
+    vision_model = (os.getenv("OZONATOR_LLM_VISION_MODEL") or os.getenv("GROQ_VISION_MODEL") or "").strip()
+    if key.startswith("gsk_"):
+        v_low = vision_model.strip().lower()
+        if (not vision_model) or (v_low in _DEPRECATED_GROQ_VISION_MODELS):
+            model = _DEFAULT_GROQ_VISION_MODEL
+        else:
+            model = vision_model
+    else:
+        if vision_model:
+            model = vision_model
+
+    times = ", ".join([f"{t}s" for t, _, _ in frames])
+    prompt = (
+        "Это последовательные кадры ОДНОГО видео, строго по времени (1 кадр = 1 секунда). "
+        f"Временные метки кадров по порядку: {times}.\n"
+        f"Сквозной контекст до этого (если пусто — это начало): {memory or 'нет'}.\n\n"
+        "Сделай:\n"
+        "1) Для каждого кадра — ОДНА строка строго формата: t=<сек>: <что видно/что происходит>.\n"
+        "2) В конце ОДНА строка: MEMORY: <обновлённый сквозной контекст для следующих кадров: кто/где/что происходит, что меняется>.\n"
+        "Не выдумывай, пиши только по кадрам."
+    )
+
+    image_parts = []
+    for _t, data, mime in frames:
+        b64 = base64.b64encode(data).decode("ascii")
+        image_parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "low"}})
+
+    system_msg = "Ты — Екатерина. Отвечай на русском, коротко и по делу. Не обсуждай тему ИИ."
+    messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": [{"type": "text", "text": prompt}, *image_parts]}]
+
+    text = _llm_chat_raw(messages, model=model, url=chat_url, key=key, max_tokens=1200, temperature=0.2).strip()
+    if not text:
+        return [], memory
+
+    new_memory = memory
+    if "MEMORY:" in text:
+        before, after = text.split("MEMORY:", 1)
+        new_memory = after.strip()
+        lines = [ln.strip() for ln in before.splitlines() if ln.strip()]
+    else:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    return lines, new_memory
+
+
+def _analyze_video_to_block(file_name: str, content_type: str, content: bytes, *, payload: dict[str, Any] | None = None) -> str:
+    payload = payload or {}
+    if not content:
+        return f"— {file_name}: (видео пустое)"
+
+    with tempfile.TemporaryDirectory() as td:
+        ext = _ext(file_name) or "mp4"
+        video_path = os.path.join(td, f"video.{ext}")
+        with open(video_path, "wb") as f:
+            f.write(content)
+
+        dur = _probe_video_duration_seconds(video_path)
+
+        audio_bytes, audio_mime, audio_fn = _extract_audio_bytes(video_path)
+        transcript = ""
+        if audio_bytes:
+            asr = _asr_transcribe(audio_bytes, audio_mime, audio_fn, payload=payload)
+            transcript = _format_asr_verbose(asr)
+
+        frames = _extract_frames_1fps(video_path)
+        memory = ""
+        timeline: list[str] = []
+
+        for i in range(0, len(frames), _VIDEO_BATCH_SIZE):
+            batch = frames[i : i + _VIDEO_BATCH_SIZE]
+            lines, memory = _vision_timeline_batch(batch, memory=memory, payload=payload)
+            timeline.extend(lines)
+
+        if len(timeline) > _VIDEO_MAX_TIMELINE_LINES:
+            timeline = timeline[:_VIDEO_MAX_TIMELINE_LINES] + ["…(таймлайн обрезан по лимиту строк)"]
+
+        transcript = _trim_text(transcript, _VIDEO_MAX_TRANSCRIPT_CHARS)
+        memory = _trim_text(memory, 3000)
+
+        parts = [f"— {file_name} (видео)"]
+        if dur:
+            parts.append(f"Длительность: ~{int(dur)} сек.")
+        if transcript:
+            parts.append("Речь/звук (транскрипция):\n" + transcript)
+        if timeline:
+            parts.append("Кадры (1 кадр/сек):\n" + "\n".join(timeline))
+        if memory:
+            parts.append("Сквозной контекст (для сопоставления кадров):\n" + memory)
+
+        return "\n".join(parts).strip()
+
+
+
+def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = None) -> tuple[str, list[dict[str, Any]]]:
     """
     Возвращает:
     1) Текстовый блок-превью вложений (таблицы/текст и пометки о пропусках).
     2) Список image_url частей (OpenAI-compatible) для vision-моделей.
     """
+    payload = payload or {}
+
     settings = get_settings()
     db_url = getattr(settings, "database_url", None)
     if not db_url:
@@ -366,37 +582,12 @@ def _collect_attachments_for_llm(task_id: int) -> tuple[str, list[dict[str, Any]
             blocks.append(f"— {file_name}: (изображение, приложено к сообщению)")
             continue
 
-
-        # --- Video (extract frames for vision) ---
+        # --- Video (frames 1fps + audio transcription) ---
         if ext in _VIDEO_EXTS or (content_type or "").lower().startswith("video/"):
-            remaining = max(0, _ATT_MAX_IMAGES - len(image_parts))
-            if remaining <= 0:
-                blocks.append(f"— {file_name}: (видео, пропущено — достигнут лимит {_ATT_MAX_IMAGES} изображений)")
-                continue
-
-            frames = _prepare_video_frames_for_vision(file_name, content_type, content, max_frames=min(4, remaining))
-            if not frames:
-                blocks.append(f"— {file_name}: (видео, не удалось извлечь кадры для анализа)")
-                continue
-
-            added = 0
-            for frame_bytes, mime in frames:
-                if not frame_bytes:
-                    continue
-                if len(image_parts) >= _ATT_MAX_IMAGES:
-                    break
-                if total_image_bytes + len(frame_bytes) > _ATT_MAX_TOTAL_IMAGE_BYTES:
-                    break
-                b64 = base64.b64encode(frame_bytes).decode("ascii")
-                data_url = f"data:{mime};base64,{b64}"
-                image_parts.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
-                total_image_bytes += len(frame_bytes)
-                added += 1
-
-            if added:
-                blocks.append(f"— {file_name}: (видео, извлечено кадров для анализа: {added})")
-            else:
-                blocks.append(f"— {file_name}: (видео, кадры извлечены, но не добавлены из-за лимитов)")
+            try:
+                blocks.append(_analyze_video_to_block(file_name, content_type, content, payload=payload))
+            except Exception:
+                blocks.append(f"— {file_name}: (видео, не удалось разобрать)")
             continue
 
         # --- Text-like ---
@@ -1222,7 +1413,7 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
 
     main_goal = user_request or payload_brief or goal or title or f"задача #{task_id}"
 
-    attachments_text, image_parts = _collect_attachments_for_llm(task_id)
+    attachments_text, image_parts = _collect_attachments_for_llm(task_id, payload)
     llm_question = (main_goal + "\n\n" + attachments_text).strip() if attachments_text else main_goal
 
     endpoints = _normalize_str_list(payload.get("endpoints") or payload.get("endpoint") or az_fix_plan.get("endpoints") or az_fix_plan.get("endpoint"))
