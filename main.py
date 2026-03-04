@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 import time
@@ -30,6 +31,71 @@ from db.files import add_task_file, get_task_file_content, list_task_files
 from schemas.tasks import TaskCreateRequest
 
 app = FastAPI(title="Ozonator Agents AA")
+
+
+def _is_image_file(file_name: str, content_type: str) -> bool:
+    ct = (content_type or "").lower().strip()
+    if ct.startswith("image/"):
+        return True
+    ext = (file_name or "").lower().rsplit(".", 1)
+    ext = ext[-1] if len(ext) == 2 else ""
+    return ext in {"jpg", "jpeg", "png", "webp", "gif"}
+
+
+def _shrink_image_to_max_bytes(raw: bytes, file_name: str, content_type: str, max_bytes: int) -> tuple[bytes, str]:
+    """Best-effort ужатие изображения, чтобы пролезло в лимит загрузки.
+
+    Возвращает (bytes, content_type). Если Pillow недоступен или ужать не получилось —
+    возвращает исходные данные.
+    """
+    if not raw or len(raw) <= max_bytes:
+        return raw, (content_type or "application/octet-stream")
+
+    try:
+        from PIL import Image
+    except Exception:
+        return raw, (content_type or "application/octet-stream")
+
+    try:
+        img = Image.open(io.BytesIO(raw))
+        # приводим к RGB (прозрачность на белый фон)
+        if img.mode == "RGBA":
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        max_dim = int(os.getenv("AA_UPLOAD_IMAGE_MAX_DIM") or "2600")
+        w, h = img.size
+        if max(w, h) > max_dim:
+            scale = max_dim / float(max(w, h))
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+
+        quality = 90
+
+        def encode(q: int) -> bytes:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=q, optimize=True)
+            return buf.getvalue()
+
+        data = encode(quality)
+        while len(data) > max_bytes and quality >= 45:
+            quality -= 7
+            data = encode(quality)
+
+        attempts = 0
+        while len(data) > max_bytes and attempts < 2:
+            w, h = img.size
+            img = img.resize((max(1, int(w * 0.85)), max(1, int(h * 0.85))))
+            data = encode(max(45, quality))
+            attempts += 1
+
+        if len(data) <= max_bytes:
+            return data, "image/jpeg"
+        return raw, (content_type or "application/octet-stream")
+    except Exception:
+        return raw, (content_type or "application/octet-stream")
 
 
 def require_admin_token(
@@ -243,6 +309,17 @@ async def upload_task_file(task_id: int, file: UploadFile = File(...)):
     max_bytes = int(getattr(settings, "aa_max_upload_bytes", 10 * 1024 * 1024) or (10 * 1024 * 1024))
     if raw is None:
         raw = b""
+
+    file_name = (file.filename or "file").strip() or "file"
+    content_type = (file.content_type or "application/octet-stream").strip()
+
+    # Если файл больше лимита — пробуем ужать изображения (типовые фото с телефона)
+    if len(raw) > max_bytes and _is_image_file(file_name, content_type):
+        shrunk, new_ct = _shrink_image_to_max_bytes(raw, file_name, content_type, max_bytes)
+        if shrunk is not None and len(shrunk) <= max_bytes:
+            raw = shrunk
+            content_type = new_ct
+
     if len(raw) > max_bytes:
         return _json_response(
             413,
@@ -255,8 +332,7 @@ async def upload_task_file(task_id: int, file: UploadFile = File(...)):
             },
         )
 
-    file_name = (file.filename or "file").strip() or "file"
-    content_type = (file.content_type or "application/octet-stream").strip()
+
 
     ok, meta, message = add_task_file(
         settings.database_url,

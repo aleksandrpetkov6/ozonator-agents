@@ -191,7 +191,7 @@ class AAClient:
         ).encode("utf-8")
         tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
         body = head + content + tail
-
+        last_err = None
         for pref in self._prefixes():
             self.api_prefix = pref
             url = self._mk(f"/tasks/{task_id}/files/upload")
@@ -202,7 +202,15 @@ class AAClient:
             if resp.ok:
                 return
 
-        raise RuntimeError("upload_failed")
+            msg = None
+            if isinstance(resp.data, dict):
+                msg = resp.data.get("message") or resp.data.get("detail")
+            if resp.status:
+                last_err = f"HTTP {resp.status}: {msg or (resp.error or 'upload_failed')}"
+            else:
+                last_err = msg or resp.error or 'upload_failed'
+
+        raise RuntimeError(last_err or "upload_failed")
 
 
 class App(tk.Tk):
