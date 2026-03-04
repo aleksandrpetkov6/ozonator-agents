@@ -29,7 +29,7 @@ import uuid
 import mimetypes
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from tkinter import filedialog, messagebox
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -74,6 +74,15 @@ STATE_VERSION = 1
 STATE_MAX_ITEMS = max(50, int(os.getenv("OZONATOR_STATE_MAX_ITEMS") or 200))
 STATE_FILE_NAME = "chat_state_v1.json"
 CONFIG_FILE_NAME = "client_config_v1.json"
+
+GEO_STATE_FILE_NAME = "geo_state_v1.json"
+GEO_TTL_SEC = max(300, int(os.getenv("OZONATOR_GEO_TTL_SEC") or str(6 * 60 * 60)))  # 6 часов
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _app_data_dir() -> str:
@@ -145,7 +154,12 @@ def _load_or_create_user_key(config_path: str, bearer: str, admin_token: str) ->
         return key
 
     key = uuid.uuid4().hex
-    _write_json_atomic(config_path, {"version": 1, "user_key": key})
+    cfg = _read_json_file(config_path) or {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    cfg["version"] = 1
+    cfg["user_key"] = key
+    _write_json_atomic(config_path, cfg)
     return key
 
 
@@ -468,6 +482,7 @@ class App(tk.Tk):
         self._state_path = os.path.join(_app_data_dir(), STATE_FILE_NAME)
         self._config_path = os.path.join(_app_data_dir(), CONFIG_FILE_NAME)
         self.user_key = _load_or_create_user_key(self._config_path, AA_BEARER, AA_ADMIN_TOKEN)
+        self._share_geo = self._load_share_geo_flag()
         self._attached_files: list[str] = []
         self._last_task_status: str = ""
         self._poll_started_at: float = 0.0
@@ -533,6 +548,10 @@ class App(tk.Tk):
 
         self.btn_files = tk.Button(bottom, text="Файлы", command=self._pick_files)
         self.btn_files.pack(side=tk.LEFT)
+
+        self.var_share_geo = tk.BooleanVar(value=bool(getattr(self, "_share_geo", True)))
+        self.chk_geo = tk.Checkbutton(bottom, text="📍", variable=self.var_share_geo, command=self._on_toggle_geo)
+        self.chk_geo.pack(side=tk.LEFT, padx=(6, 6))
 
         input_wrap = tk.Frame(bottom)
         input_wrap.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
@@ -627,6 +646,119 @@ class App(tk.Tk):
         if not isinstance(tr, list):
             return None
         return st
+
+    def _geo_state_path(self) -> str:
+        return os.path.join(_app_data_dir(), GEO_STATE_FILE_NAME)
+
+    def _load_share_geo_flag(self) -> bool:
+        cfg = _read_json_file(self._config_path) or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        if "share_geo" in cfg:
+            default_val = bool(cfg.get("share_geo"))
+        else:
+            default_val = True
+        return _env_bool("OZONATOR_SHARE_GEO", default_val)
+
+    def _save_share_geo_flag(self, value: bool) -> None:
+        cfg = _read_json_file(self._config_path) or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        cfg["version"] = int(cfg.get("version") or 1)
+        cfg["user_key"] = str(cfg.get("user_key") or self.user_key)
+        cfg["share_geo"] = bool(value)
+        _write_json_atomic(self._config_path, cfg)
+
+    def _fetch_geo_by_ip(self) -> dict | None:
+        """Геопозиция по IP (примерная): город + координаты."""
+        urls = [
+            "https://ipapi.co/json/",
+            "https://ipinfo.io/json",
+        ]
+        for url in urls:
+            try:
+                req = urllib_request.Request(
+                    url,
+                    headers={"Accept": "application/json", "User-Agent": "OzonatorAgentsClient/geo"},
+                    method="GET",
+                )
+                with urllib_request.urlopen(req, timeout=4) as r:
+                    raw = r.read()
+                data = json.loads(raw.decode("utf-8", "ignore"))
+
+                geo = {"source": "ip"}
+
+                if "ipapi.co" in url:
+                    geo["ip"] = data.get("ip")
+                    geo["city"] = data.get("city")
+                    geo["region"] = data.get("region")
+                    geo["country"] = data.get("country_name") or data.get("country")
+                    geo["timezone"] = data.get("timezone")
+                    lat = data.get("latitude")
+                    lon = data.get("longitude")
+                else:
+                    geo["ip"] = data.get("ip")
+                    geo["city"] = data.get("city")
+                    geo["region"] = data.get("region")
+                    geo["country"] = data.get("country")
+                    geo["timezone"] = data.get("timezone")
+                    loc = (data.get("loc") or "").strip()  # "lat,lon"
+                    lat, lon = (None, None)
+                    if "," in loc:
+                        a, b = loc.split(",", 1)
+                        lat, lon = a.strip(), b.strip()
+
+                try:
+                    geo["lat"] = float(lat) if lat is not None and str(lat).strip() else None
+                    geo["lon"] = float(lon) if lon is not None and str(lon).strip() else None
+                except Exception:
+                    geo["lat"], geo["lon"] = (None, None)
+
+                if geo.get("lat") is not None and geo.get("lon") is not None:
+                    return geo
+            except (urllib_error.HTTPError, urllib_error.URLError, json.JSONDecodeError):
+                continue
+            except Exception:
+                continue
+        return None
+
+    def _get_geo(self) -> dict | None:
+        if not getattr(self, "_share_geo", False):
+            return None
+
+        path = self._geo_state_path()
+        st = _read_json_file(path) or {}
+        if isinstance(st, dict):
+            geo = st.get("geo")
+            ts = st.get("fetched_at")
+            if isinstance(geo, dict) and ts:
+                try:
+                    fetched = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                    age = (datetime.now(timezone.utc) - fetched).total_seconds()
+                    if age < GEO_TTL_SEC:
+                        return geo
+                except Exception:
+                    pass
+
+        geo = self._fetch_geo_by_ip()
+        if geo:
+            _write_json_atomic(
+                path,
+                {
+                    "version": 1,
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                    "geo": geo,
+                },
+            )
+        return geo
+
+    def _on_toggle_geo(self):
+        self._share_geo = bool(self.var_share_geo.get())
+        self._save_share_geo_flag(self._share_geo)
+        try:
+            self._update_status()
+        except Exception:
+            pass
 
     def _restore_on_startup(self):
         # 1) локальная история
@@ -799,12 +931,15 @@ class App(tk.Tk):
             except Exception:
                 attachments_meta.append({"name": os.path.basename(p) or "file"})
 
+        geo = self._get_geo()
+
         return {
             "user_request": user_text,
             "llm_provider": DEFAULT_LLM_PROVIDER,
             "llm_model": DEFAULT_LLM_MODEL,
             "client_meta": {"source": "desktop", "client": "OzonatorAgentsClient"},
             "user_key": self.user_key,
+            "geo": geo,
             "user_prefs": user_prefs,
             "conversation_history": history,
             "conversation_pins": pins,

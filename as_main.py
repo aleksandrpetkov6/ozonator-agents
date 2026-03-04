@@ -705,6 +705,93 @@ def _normalize_str_list(value: Any) -> list[str]:
             out.append(s)
     return out
 
+def _extract_geo(payload: dict[str, Any]) -> dict[str, Any] | None:
+    geo = payload.get("geo")
+    if not isinstance(geo, dict):
+        return None
+    lat = geo.get("lat")
+    lon = geo.get("lon")
+    try:
+        lat = float(lat) if lat is not None else None
+        lon = float(lon) if lon is not None else None
+    except Exception:
+        return None
+    if lat is None or lon is None:
+        return None
+
+    return {
+        "lat": lat,
+        "lon": lon,
+        "city": str(geo.get("city") or "").strip() or None,
+        "region": str(geo.get("region") or "").strip() or None,
+        "country": str(geo.get("country") or "").strip() or None,
+        "source": str(geo.get("source") or "").strip() or None,
+    }
+
+
+def _is_weather_question(text: str) -> bool:
+    t = (text or "").lower()
+    keys = ["погода", "температ", "на улице", "дожд", "снег", "ветер", "осад", "градус", "гроза", "облач"]
+    return any(k in t for k in keys)
+
+
+def _weather_code_ru(code: int | None) -> str:
+    m = {
+        0: "ясно",
+        1: "в основном ясно",
+        2: "переменная облачность",
+        3: "пасмурно",
+        45: "туман",
+        48: "изморозь",
+        51: "морось слабая",
+        53: "морось умеренная",
+        55: "морось сильная",
+        61: "дождь слабый",
+        63: "дождь умеренный",
+        65: "дождь сильный",
+        71: "снег слабый",
+        73: "снег умеренный",
+        75: "снег сильный",
+        80: "ливень слабый",
+        81: "ливень умеренный",
+        82: "ливень сильный",
+        95: "гроза",
+        96: "гроза с градом",
+        99: "гроза с сильным градом",
+    }
+    try:
+        return m.get(int(code if code is not None else -1), "неизвестные условия")
+    except Exception:
+        return "неизвестные условия"
+
+
+def _open_meteo_current(lat: float, lon: float) -> dict[str, Any] | None:
+    """Текущая погода без ключа (Open-Meteo)."""
+    try:
+        import urllib.request as urllib_request
+        import urllib.parse as urllib_parse
+
+        params = urllib_parse.urlencode(
+            {
+                "latitude": str(lat),
+                "longitude": str(lon),
+                "current": "temperature_2m,apparent_temperature,precipitation,wind_speed_10m,weather_code",
+                "timezone": "auto",
+            }
+        )
+        url = f"https://api.open-meteo.com/v1/forecast?{params}"
+        req = urllib_request.Request(url, headers={"Accept": "application/json", "User-Agent": "OzonatorAgents-AS/weather"})
+        with urllib_request.urlopen(req, timeout=6) as r:
+            raw = r.read()
+        data = json.loads(raw.decode("utf-8", "ignore"))
+        cur = data.get("current") or {}
+        if not isinstance(cur, dict):
+            return None
+        return cur
+    except Exception:
+        return None
+
+
 
 def _normalize_conversation_history(
     payload: dict[str, Any] | None,
@@ -1312,9 +1399,19 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
         else ""
     )
 
+    geo = _extract_geo(payload) if isinstance(payload, dict) else None
+    geo_line = ""
+    if geo:
+        place = ", ".join([x for x in [geo.get("city"), geo.get("region"), geo.get("country")] if x]) or "неизвестно"
+        geo_line = (
+            f"Геопозиция пользователя (передана клиентом): {place} (lat={geo['lat']}, lon={geo['lon']}). "
+            "Используй это для вопросов про погоду/местоположение/локальные рекомендации. "
+        )
+
     system_msg = (
         f"Ты — Екатерина. Говори от первого лица и о себе ВСЕГДА в женском роде (я сделала, я посмотрела, я готова). НИКОГДА не используй формы мужского рода про себя. Мы с пользователем давно знакомы, общение по-свойски. "
         f"Пользователя зовут {user_name}. Всегда обращайся к нему на {pronoun}. "
+        f"{geo_line}"
         f"Используй обращение «{addr}» (можно переключаться по контексту между: {', '.join(variants)}). "
         "Не представляйся и не объясняй, кто ты. "
         f"{forbid_ai_line} "
@@ -1629,6 +1726,18 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
             "Проанализируй вложения. Если там есть аудио/видео — сначала выведи транскрипцию (текст речи), "
             "затем короткое резюме и ключевые пункты."
         )
+
+    geo = _extract_geo(payload)
+    if geo and _is_weather_question(main_goal):
+        cur = _open_meteo_current(geo["lat"], geo["lon"])
+        if cur:
+            place = ", ".join([x for x in [geo.get("city"), geo.get("region"), geo.get("country")] if x]) or "по твоей локации"
+            t = cur.get("temperature_2m")
+            a = cur.get("apparent_temperature")
+            w = cur.get("wind_speed_10m")
+            p = cur.get("precipitation")
+            c = _weather_code_ru(cur.get("weather_code"))
+            return f"Саша, сейчас {place}: {t}°C (ощущается как {a}°C), {c}, ветер {w} м/с, осадки {p} мм."
 
     llm_question = (main_goal + "\n\n" + attachments_text).strip() if attachments_text else main_goal
 
