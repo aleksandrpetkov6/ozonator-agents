@@ -39,8 +39,8 @@ AA_ADMIN_TOKEN = (os.getenv("OZONATOR_AA_ADMIN_TOKEN") or "").strip()
 DEFAULT_LLM_PROVIDER = (os.getenv("OZONATOR_LLM_PROVIDER") or "groq").strip()
 DEFAULT_LLM_MODEL = (os.getenv("OZONATOR_LLM_MODEL") or "llama-3.3-70b-versatile").strip()
 
-CREATE_RETRIES = 2
-HTTP_TIMEOUT = 25
+CREATE_RETRIES = 3
+HTTP_TIMEOUT = 45
 
 FAST_POLL_MS = 250
 NORMAL_POLL_MS = 1000
@@ -101,8 +101,11 @@ class AAClient:
             except Exception:
                 payload = None
             return ApiResponse(False, status, payload, f"HTTPError {status}")
+        except urllib_error.URLError as e:
+            # сеть/SSL/DNS/timeout — покажем причину
+            return ApiResponse(False, 0, None, f"URLError: {e}")
         except Exception as e:
-            return ApiResponse(False, 0, None, f"{e.__class__.__name__}")
+            return ApiResponse(False, 0, None, f"{e.__class__.__name__}: {e}")
 
     def _request_json(self, method: str, url: str, body: dict | None) -> ApiResponse:
         data = None
@@ -124,8 +127,11 @@ class AAClient:
             except Exception:
                 payload = None
             return ApiResponse(False, status, payload, f"HTTPError {status}")
+        except urllib_error.URLError as e:
+            # сеть/SSL/DNS/timeout — покажем причину
+            return ApiResponse(False, 0, None, f"URLError: {e}")
         except Exception as e:
-            return ApiResponse(False, 0, None, f"{e.__class__.__name__}")
+            return ApiResponse(False, 0, None, f"{e.__class__.__name__}: {e}")
 
     def create_task(self, payload: dict) -> int:
         body = {
@@ -136,15 +142,39 @@ class AAClient:
         }
 
         last_err = None
-        for _ in range(CREATE_RETRIES + 1):
+        backoff = 0.8
+        for attempt in range(CREATE_RETRIES + 1):
             for pref in self._prefixes():
                 self.api_prefix = pref
                 url = self._mk("/tasks/create")
                 resp = self._request_json("POST", url, body)
+
                 if resp.ok and resp.data and resp.data.get("task") and resp.data["task"].get("id"):
                     return int(resp.data["task"]["id"])
-                last_err = resp.error or "create_task_failed"
-        raise RuntimeError(last_err or "create_task_failed")
+
+                detail = ""
+                if isinstance(resp.data, dict):
+                    detail = str(resp.data.get("detail") or resp.data.get("message") or "").strip()
+
+                if resp.status:
+                    last_err = f"{resp.error or 'create_task_failed'} ({resp.status})"
+                else:
+                    last_err = resp.error or "create_task_failed"
+                if detail:
+                    last_err = f"{last_err}: {detail}"
+
+                # На сетевых ошибках/таймаутах — backoff
+                if resp.status == 0:
+                    import time as _t
+                    _t.sleep(backoff)
+                    backoff = min(backoff * 1.7, 6.0)
+
+            if attempt < CREATE_RETRIES:
+                import time as _t
+                _t.sleep(backoff)
+                backoff = min(backoff * 1.7, 6.0)
+
+        raise RuntimeError(f"{last_err or 'create_task_failed'} · сервер: {self.base_url}")
 
     def run_task(self, task_id: int) -> None:
         # если не смогли запустить обработку — лучше сразу сообщить, чем зависнуть
@@ -191,6 +221,7 @@ class AAClient:
         ).encode("utf-8")
         tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
         body = head + content + tail
+
         last_err = None
         for pref in self._prefixes():
             self.api_prefix = pref
@@ -202,15 +233,18 @@ class AAClient:
             if resp.ok:
                 return
 
-            msg = None
+            detail = ""
             if isinstance(resp.data, dict):
-                msg = resp.data.get("message") or resp.data.get("detail")
-            if resp.status:
-                last_err = f"HTTP {resp.status}: {msg or (resp.error or 'upload_failed')}"
-            else:
-                last_err = msg or resp.error or 'upload_failed'
+                detail = str(resp.data.get("detail") or resp.data.get("message") or "").strip()
 
-        raise RuntimeError(last_err or "upload_failed")
+            if resp.status:
+                last_err = f"{resp.error or 'upload_failed'} ({resp.status})"
+            else:
+                last_err = resp.error or "upload_failed"
+            if detail:
+                last_err = f"{last_err}: {detail}"
+
+        raise RuntimeError(f"{last_err or 'upload_failed'} · сервер: {self.base_url}")
 
 
 class App(tk.Tk):
