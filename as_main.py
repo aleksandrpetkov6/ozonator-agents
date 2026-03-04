@@ -242,22 +242,26 @@ def _collect_attachments_for_llm(task_id: int) -> tuple[str, list[dict[str, Any]
             if len(image_parts) >= _ATT_MAX_IMAGES:
                 blocks.append(f"— {file_name}: (изображение, пропущено — достигнут лимит {_ATT_MAX_IMAGES} шт.)")
                 continue
-            if size_bytes > _ATT_MAX_IMAGE_BYTES_EACH:
+
+            # Сначала ужимаем/уменьшаем, затем применяем лимиты уже к обработанным данным.
+            processed, mime = _prepare_image_for_vision(file_name, content_type, content)
+            processed_size = len(processed or b"")
+
+            if processed_size > _ATT_MAX_IMAGE_BYTES_EACH:
                 blocks.append(
-                    f"— {file_name}: (изображение, пропущено — слишком большой файл {size_bytes} bytes, лимит {_ATT_MAX_IMAGE_BYTES_EACH})"
+                    f"— {file_name}: (изображение, пропущено — даже после подготовки слишком большой файл {processed_size} bytes, лимит {_ATT_MAX_IMAGE_BYTES_EACH})"
                 )
                 continue
-            if total_image_bytes + size_bytes > _ATT_MAX_TOTAL_IMAGE_BYTES:
+            if total_image_bytes + processed_size > _ATT_MAX_TOTAL_IMAGE_BYTES:
                 blocks.append(
                     f"— {file_name}: (изображение, пропущено — достигнут лимит по суммарному размеру изображений {_ATT_MAX_TOTAL_IMAGE_BYTES} bytes)"
                 )
                 continue
 
-            processed, mime = _prepare_image_for_vision(file_name, content_type, content)
             b64 = base64.b64encode(processed).decode("ascii")
             data_url = f"data:{mime};base64,{b64}"
             image_parts.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
-            total_image_bytes += len(processed)
+            total_image_bytes += processed_size
             blocks.append(f"— {file_name}: (изображение, приложено к сообщению)")
             continue
 
