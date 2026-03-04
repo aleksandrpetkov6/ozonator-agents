@@ -39,14 +39,14 @@ AA_ADMIN_TOKEN = (os.getenv("OZONATOR_AA_ADMIN_TOKEN") or "").strip()
 DEFAULT_LLM_PROVIDER = (os.getenv("OZONATOR_LLM_PROVIDER") or "groq").strip()
 DEFAULT_LLM_MODEL = (os.getenv("OZONATOR_LLM_MODEL") or "llama-3.3-70b-versatile").strip()
 
-CREATE_RETRIES = 3
-HTTP_TIMEOUT = 45
+CREATE_RETRIES = 2
+HTTP_TIMEOUT = 25
 
+
+SEND_TIMEOUT_SEC = 75  # ожидание получения task_id (create_task)
 FAST_POLL_MS = 250
 NORMAL_POLL_MS = 1000
 FAST_POLL_WINDOW_SEC = 12
-
-POLL_TIMEOUT_SEC = 120
 
 HISTORY_MAX_ITEMS = 24
 
@@ -102,7 +102,6 @@ class AAClient:
                 payload = None
             return ApiResponse(False, status, payload, f"HTTPError {status}")
         except urllib_error.URLError as e:
-            # сеть/SSL/DNS/timeout — покажем причину
             return ApiResponse(False, 0, None, f"URLError: {e}")
         except Exception as e:
             return ApiResponse(False, 0, None, f"{e.__class__.__name__}: {e}")
@@ -128,7 +127,6 @@ class AAClient:
                 payload = None
             return ApiResponse(False, status, payload, f"HTTPError {status}")
         except urllib_error.URLError as e:
-            # сеть/SSL/DNS/timeout — покажем причину
             return ApiResponse(False, 0, None, f"URLError: {e}")
         except Exception as e:
             return ApiResponse(False, 0, None, f"{e.__class__.__name__}: {e}")
@@ -142,51 +140,47 @@ class AAClient:
         }
 
         last_err = None
-        backoff = 0.8
-        for attempt in range(CREATE_RETRIES + 1):
+        for _ in range(CREATE_RETRIES + 1):
             for pref in self._prefixes():
                 self.api_prefix = pref
                 url = self._mk("/tasks/create")
                 resp = self._request_json("POST", url, body)
-
                 if resp.ok and resp.data and resp.data.get("task") and resp.data["task"].get("id"):
                     return int(resp.data["task"]["id"])
-
-                detail = ""
-                if isinstance(resp.data, dict):
-                    detail = str(resp.data.get("detail") or resp.data.get("message") or "").strip()
-
-                if resp.status:
-                    last_err = f"{resp.error or 'create_task_failed'} ({resp.status})"
-                else:
-                    last_err = resp.error or "create_task_failed"
-                if detail:
-                    last_err = f"{last_err}: {detail}"
-
-                # На сетевых ошибках/таймаутах — backoff
-                if resp.status == 0:
-                    import time as _t
-                    _t.sleep(backoff)
-                    backoff = min(backoff * 1.7, 6.0)
-
-            if attempt < CREATE_RETRIES:
-                import time as _t
-                _t.sleep(backoff)
-                backoff = min(backoff * 1.7, 6.0)
-
-        raise RuntimeError(f"{last_err or 'create_task_failed'} · сервер: {self.base_url}")
+                last_err = resp.error or "create_task_failed"
+        raise RuntimeError(last_err or "create_task_failed")
 
     def run_task(self, task_id: int) -> None:
-        # если не смогли запустить обработку — лучше сразу сообщить, чем зависнуть
-        last_err = None
+        """"Пинок" оркестрации.
+
+        Важно: на Render возможен таймаут на cold start — это НЕ ошибка, polling продолжится.
+        Но если сервер явно отвечает 4xx (например, неверный путь/токен) — показываем ошибку,
+        чтобы не зависать бесконечно.
+        """
+        had_timeout = False
+        last_4xx: ApiResponse | None = None
+
         for pref in self._prefixes():
             self.api_prefix = pref
             url = self._mk(f"/aa/run-task/{task_id}")
             resp = self._request_json("POST", url, {})
             if resp.ok:
                 return
-            last_err = resp.error or (resp.data.get("message") if isinstance(resp.data, dict) else None)
-        raise RuntimeError(last_err or "run_task_failed")
+
+            if resp.status == 0:
+                had_timeout = True
+                continue
+
+            if 400 <= resp.status < 500:
+                last_4xx = resp
+
+        # Если были только таймауты/сетевые ошибки — считаем, что "пинок" мог сработать.
+        if had_timeout and last_4xx is None:
+            return
+
+        if last_4xx is not None:
+            raise RuntimeError(last_4xx.error or f"run_task_failed ({last_4xx.status})")
+
 
     def get_task(self, task_id: int) -> dict | None:
         for pref in self._prefixes():
@@ -236,15 +230,9 @@ class AAClient:
             detail = ""
             if isinstance(resp.data, dict):
                 detail = str(resp.data.get("detail") or resp.data.get("message") or "").strip()
+            last_err = (f"{resp.error or 'upload_failed'} (status={resp.status}) {detail}").strip()
 
-            if resp.status:
-                last_err = f"{resp.error or 'upload_failed'} ({resp.status})"
-            else:
-                last_err = resp.error or "upload_failed"
-            if detail:
-                last_err = f"{last_err}: {detail}"
-
-        raise RuntimeError(f"{last_err or 'upload_failed'} · сервер: {self.base_url}")
+        raise RuntimeError(last_err or "upload_failed")
 
 
 class App(tk.Tk):
@@ -261,9 +249,19 @@ class App(tk.Tk):
         self._polling = False
         self._poll_fast_until = 0.0
         self._poll_inflight = False
+
         self._typing_range = None
         self._conversation_history: list[dict[str, str]] = []
         self._attached_files: list[str] = []
+        self._last_task_status: str = ""
+        self._poll_started_at: float = 0.0
+
+        # send/create_task tracking (чтобы не зависать без task_id)
+        self._sending: bool = False
+        self._sending_started_at: float | None = None
+        self._send_stage: str = ""
+        self._last_send_error: str | None = None
+        self._send_nonce: str = uuid.uuid4().hex
 
         self._build_ui()
         self._bind_hotkeys()
@@ -397,10 +395,17 @@ class App(tk.Tk):
         self._update_status()
 
     def _update_status(self):
+        parts = ["● online"]
         if self._attached_files:
-            self.lbl_status.config(text=f"● online · файлов: {len(self._attached_files)}")
-        else:
-            self.lbl_status.config(text="● online")
+            parts.append(f"файлов: {len(self._attached_files)}")
+        if self.current_task_id is not None:
+            parts.append(f"задача #{self.current_task_id}")
+        if self._last_task_status:
+            parts.append(f"{self._last_task_status}")
+        if self._sending and self._send_stage:
+            parts.append(f"отправка: {self._send_stage}")
+        self.lbl_status.config(text=" · ".join(parts))
+
 
     def _build_task_payload(self, user_text: str) -> dict:
         # user_prefs (как ты попросил)
@@ -456,26 +461,79 @@ class App(tk.Tk):
 
         payload = self._build_task_payload(user_text)
 
-        def worker():
+        # reset per-send state
+        self._polling = False
+        self._poll_inflight = False
+        self._last_task_status = ""
+        self.current_task_id = None
+
+        # start send tracking
+        self._sending = True
+        self._sending_started_at = time.time()
+        self._send_stage = "create_task"
+        self._last_send_error = None
+        self._send_nonce = uuid.uuid4().hex
+        local_nonce = self._send_nonce
+        self._update_status()
+
+        def worker(nonce: str):
             try:
                 task_id = self.client.create_task(payload)
-                self.current_task_id = task_id
 
-                # Загружаем вложения ДО оркестрации
+                def ui_set_task_id():
+                    if nonce != self._send_nonce:
+                        return
+                    self.current_task_id = task_id
+                    self._send_stage = "upload_files"
+                    self._update_status()
+
+                self.after(0, ui_set_task_id)
+
+                # upload attachments before orchestration
                 for p in list(self._attached_files):
                     self.client.upload_file(task_id, p)
-                self._clear_files()
+
+                self.after(0, self._clear_files)
+
+                def ui_set_run_stage():
+                    if nonce != self._send_nonce:
+                        return
+                    self._send_stage = "run_task"
+                    self._update_status()
+
+                self.after(0, ui_set_run_stage)
 
                 self.client.run_task(task_id)
-                self._polling = True
-                self._poll_started_at = time.time()
-                self._poll_fast_until = time.time() + FAST_POLL_WINDOW_SEC
-            except Exception as e:
-                self._polling = False
-                self.current_task_id = None
-                self.after(0, lambda: self._on_error(f"Не удалось отправить задачу: {e}"))
 
-        threading.Thread(target=worker, daemon=True).start()
+                def ui_start_polling():
+                    if nonce != self._send_nonce:
+                        return
+                    self._sending = False
+                    self._send_stage = ""
+                    self._poll_started_at = time.time()
+                    self._polling = True
+                    self._poll_fast_until = time.time() + FAST_POLL_WINDOW_SEC
+                    self._update_status()
+
+                self.after(0, ui_start_polling)
+
+            except Exception as e:
+                err = f"{e}"
+
+                def ui_fail():
+                    if nonce != self._send_nonce:
+                        return
+                    self._sending = False
+                    self._send_stage = ""
+                    self._last_send_error = err
+                    self._polling = False
+                    self.current_task_id = None
+                    self._update_status()
+                    self._on_error(f"Не удалось отправить задачу: {err}")
+
+                self.after(0, ui_fail)
+
+        threading.Thread(target=worker, args=(local_nonce,), daemon=True).start()
 
     def _on_error(self, msg: str):
         self._clear_typing_if_any()
@@ -487,11 +545,22 @@ class App(tk.Tk):
     def _tick(self):
         interval = self._current_poll_interval_ms()
 
-        if self._polling and self._poll_started_at and (time.time() - self._poll_started_at) > POLL_TIMEOUT_SEC:
-            self._polling = False
-            self._clear_typing_if_any()
-            self._append(AA_DISPLAY_NAME, "Нет ответа за 2 минуты. Нажми ‘Логи’ — там причина.")
-            self._push_history("assistant", "Нет ответа за 2 минуты. Нажми ‘Логи’ — там причина.")
+        # Если task_id не приходит (create_task завис/сеть/таймаут) — не зависаем в "…".
+        if self._sending and self.current_task_id is None and self._sending_started_at:
+            if (time.time() - float(self._sending_started_at)) > SEND_TIMEOUT_SEC:
+                # инвалидируем поздние ответы фонового потока
+                self._send_nonce = uuid.uuid4().hex
+                self._sending = False
+                self._send_stage = ""
+                self._last_send_error = f"timeout_wait_task_id_{SEND_TIMEOUT_SEC}s"
+                self._clear_typing_if_any()
+                msg = (
+                    f"Не удалось получить task_id за {SEND_TIMEOUT_SEC} сек. "
+                    f"Проверь доступность сервера ({self.client.base_url}) и сеть. Нажми «Логи» — покажу диагностику отправки."
+                )
+                self._append(AA_DISPLAY_NAME, msg)
+                self._push_history("assistant", msg)
+                self._update_status()
 
         if self._polling and self.current_task_id is not None and not self._poll_inflight:
             self._poll_inflight = True
@@ -502,6 +571,7 @@ class App(tk.Tk):
                     self.after(0, lambda: self._handle_task_update(task_id, task))
                 finally:
                     self._poll_inflight = False
+
             threading.Thread(target=poll_worker, args=(self.current_task_id,), daemon=True).start()
 
         self.after(interval, self._tick)
@@ -511,7 +581,10 @@ class App(tk.Tk):
             return
 
         status = str(task.get("status") or "").upper()
-        self.lbl_status.config(text=f"● online · задача #{task_id} · {status or 'UNKNOWN'}")
+
+        if status and status != self._last_task_status:
+            self._last_task_status = status
+            self._update_status()
         result = task.get("result") if isinstance(task.get("result"), dict) else {}
 
         # финальный ответ всегда из task.result.final_answer
@@ -526,6 +599,24 @@ class App(tk.Tk):
             self._push_history("assistant", final_answer)
             return
 
+        # Если статус финальный, но финальный ответ пустой — выводим понятное сообщение и останавливаемся.
+        if status in {"DONE", "REVIEW_NEEDS_ATTENTION"}:
+            self._polling = False
+            self._clear_typing_if_any()
+            msg = "Задача завершилась, но финальный ответ пуст. Открой «Логи» и пришли скрин последних строк."
+            self._append(AA_DISPLAY_NAME, msg)
+            self._push_history("assistant", msg)
+            return
+
+        # Защита от бесконечного ожидания: если больше 90 секунд нет результата — подскажем открыть логи.
+        if self._poll_started_at and (time.time() - self._poll_started_at) > 90:
+            self._polling = False
+            self._clear_typing_if_any()
+            msg = "Я не получила финальный ответ за 90 секунд. Нажми «Логи» и пришли скрин последней части — разберу, где застряло."
+            self._append(AA_DISPLAY_NAME, msg)
+            self._push_history("assistant", msg)
+            return
+
         if status in {"FAILED"}:
             self._polling = False
             self._clear_typing_if_any()
@@ -534,8 +625,32 @@ class App(tk.Tk):
             self._push_history("assistant", err)
 
     def _open_logs(self):
+        # Если task_id ещё нет — показываем диагностику отправки (иначе пользователь не может понять, что сломалось).
         if self.current_task_id is None:
-            messagebox.showinfo("Логи", "Сначала отправь задачу, чтобы появился task_id.")
+            win = tk.Toplevel(self)
+            win.title("Логи — диагностика отправки")
+            win.geometry("900x420")
+
+            txt = tk.Text(win, wrap="word", font=("Consolas", 10))
+            txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            sc = tk.Scrollbar(win, command=txt.yview)
+            sc.pack(side=tk.RIGHT, fill=tk.Y)
+            txt.configure(yscrollcommand=sc.set)
+
+            elapsed = 0.0
+            if self._sending_started_at:
+                elapsed = max(0.0, time.time() - float(self._sending_started_at))
+
+            txt.insert(tk.END, f"server: {self.client.base_url}\n")
+            txt.insert(tk.END, f"sending: {self._sending}\n")
+            txt.insert(tk.END, f"stage: {self._send_stage or '-'}\n")
+            txt.insert(tk.END, f"elapsed_sec: {elapsed:.1f}\n")
+            if self._last_send_error:
+                txt.insert(tk.END, f"last_error: {self._last_send_error}\n")
+
+            txt.insert(tk.END, "\nПодсказка: если stage=create_task и elapsed_sec растёт — это сеть/DNS/таймаут или сервер недоступен.\n")
+            txt.configure(state="disabled")
             return
 
         logs = self.client.get_logs(self.current_task_id)
