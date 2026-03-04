@@ -26,6 +26,7 @@ from db.tasks import (
     set_task_result,
     update_task_status,
     write_orchestration_log,
+    list_recent_user_tasks,
 )
 from db.files import add_task_file, get_task_file_content, list_task_files
 from schemas.tasks import TaskCreateRequest
@@ -286,6 +287,44 @@ def tasks_create(body: TaskCreateRequest):
             "task": task if ok else None,
         },
     )
+
+
+@app.get("/history/recent")
+def history_recent(user_key: str | None = None, user_name: str | None = None, limit: int = 30):
+    """История для клиента: последние user_task.
+
+    Нужна, чтобы при переустановке/перезапуске клиент мог восстановить чат.
+    """
+    settings = get_settings()
+    ok, items, message = list_recent_user_tasks(
+        settings.database_url,
+        user_key=user_key,
+        user_name=user_name,
+        limit=limit,
+    )
+    if not ok:
+        return _json_response(
+            503,
+            {
+                "service": "AA",
+                "operation": "history_recent",
+                "status": "error",
+                "message": message,
+                "items": None,
+            },
+        )
+
+    return _json_response(
+        200,
+        {
+            "service": "AA",
+            "operation": "history_recent",
+            "status": "ok",
+            "message": "OK",
+            "items": items or [],
+        },
+    )
+
 
 
 @app.post("/tasks/{task_id}/files/upload")

@@ -21,6 +21,7 @@ ENV:
 import json
 import io
 import os
+import hashlib
 import threading
 import time
 import tkinter as tk
@@ -31,6 +32,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+from urllib import parse as urllib_parse
 
 
 DEFAULT_AA_BASE_URL = (os.getenv("OZONATOR_AA_BASE_URL") or "https://ozonator-aa-dev.onrender.com").rstrip("/")
@@ -64,6 +66,85 @@ try:
 except Exception:
     Image = None  # type: ignore
     PIL_AVAILABLE = False
+
+
+STATE_VERSION = 1
+STATE_MAX_ITEMS = max(50, int(os.getenv("OZONATOR_STATE_MAX_ITEMS") or 200))
+STATE_FILE_NAME = "chat_state_v1.json"
+CONFIG_FILE_NAME = "client_config_v1.json"
+
+
+def _app_data_dir() -> str:
+    """Папка для пользовательских данных клиента.
+
+    В Windows обычно переживает переустановку программы (если не чистить профиль).
+    """
+    try:
+        if os.name == "nt":
+            base = os.getenv("APPDATA") or os.path.expanduser("~")
+            path = os.path.join(base, "OzonatorAgents")
+        else:
+            base = os.getenv("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+            path = os.path.join(base, "ozonator_agents")
+        os.makedirs(path, exist_ok=True)
+        return path
+    except Exception:
+        # fallback
+        path = os.path.join(os.path.expanduser("~"), "ozonator_agents")
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            pass
+        return path
+
+
+def _read_json_file(path: str) -> dict | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_json_atomic(path: str, data: dict) -> None:
+    """Атомарная запись, чтобы не убить историю при внезапном закрытии."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _load_or_create_user_key(config_path: str, bearer: str, admin_token: str) -> str:
+    """Стабильный ключ пользователя для восстановления истории.
+
+    Приоритет:
+    1) OZONATOR_USER_KEY (если задан)
+    2) sha256 от OZONATOR_AA_BEARER / OZONATOR_AA_ADMIN_TOKEN (ключи не светим)
+    3) сохранённый в config (uuid)
+    """
+    env_key = (os.getenv("OZONATOR_USER_KEY") or "").strip()
+    if env_key:
+        return env_key
+
+    basis = (bearer or "").strip() or (admin_token or "").strip()
+    if basis:
+        return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+    cfg = _read_json_file(config_path) or {}
+    key = str(cfg.get("user_key") or "").strip()
+    if key:
+        return key
+
+    key = uuid.uuid4().hex
+    _write_json_atomic(config_path, {"version": 1, "user_key": key})
+    return key
 
 
 def _is_image_name(file_name: str, content_type: str) -> bool:
@@ -291,6 +372,32 @@ class AAClient:
                 return resp.data["logs"]
         return []
 
+    def get_recent_history(self, user_key: str, user_name: str | None = None, limit: int = 30) -> list[dict]:
+        """Пытается восстановить историю с сервера (если локальный файл отсутствует).
+
+        Возвращает список элементов (в обратном хронологическом порядке на сервере),
+        поэтому клиент дальше разворачивает в нормальный порядок.
+        """
+        limit = max(1, min(int(limit or 30), 200))
+        q = {
+            "limit": str(limit),
+        }
+        if user_key:
+            q["user_key"] = user_key
+        if user_name:
+            q["user_name"] = str(user_name)
+
+        query = urllib_parse.urlencode(q)
+
+        for pref in self._prefixes():
+            self.api_prefix = pref
+            url = self._mk(f"/history/recent?{query}")
+            resp = self._request_json("GET", url, None)
+            if resp.ok and resp.data and isinstance(resp.data.get("items"), list):
+                return resp.data.get("items") or []
+        return []
+
+
     def upload_file(self, task_id: int, file_path: str) -> None:
 
         upload_name, ctype, content, note = _prepare_file_for_upload(file_path)
@@ -352,6 +459,10 @@ class App(tk.Tk):
 
         self._typing_range = None
         self._conversation_history: list[dict[str, str]] = []
+        self._transcript: list[dict[str, str]] = []
+        self._state_path = os.path.join(_app_data_dir(), STATE_FILE_NAME)
+        self._config_path = os.path.join(_app_data_dir(), CONFIG_FILE_NAME)
+        self.user_key = _load_or_create_user_key(self._config_path, AA_BEARER, AA_ADMIN_TOKEN)
         self._attached_files: list[str] = []
         self._last_task_status: str = ""
         self._poll_started_at: float = 0.0
@@ -365,6 +476,8 @@ class App(tk.Tk):
 
         self._build_ui()
         self._bind_hotkeys()
+
+        self._restore_on_startup()
 
         self.after(FAST_POLL_MS, self._tick)
 
@@ -436,8 +549,7 @@ class App(tk.Tk):
         # small arrow
         self.btn_send.create_polygon(20, 15, 32, 23, 20, 31, 22, 23, fill="white", outline="white")
 
-    def _append(self, who: str, text: str):
-        stamp = datetime.now().strftime("%H:%M")
+    def _append_with_stamp(self, stamp: str, who: str, text: str):
         self.chat.configure(state="normal")
         if self.chat.index("end-1c") != "1.0":
             self.chat.insert(tk.END, "\n")
@@ -447,6 +559,143 @@ class App(tk.Tk):
         self.chat.insert(tk.END, f"{text.strip()}\n")
         self.chat.see(tk.END)
         self.chat.configure(state="disabled")
+
+    def _append(self, who: str, text: str):
+        self._append_with_stamp(datetime.now().strftime("%H:%M"), who, text)
+
+    def _add_message(
+        self,
+        role: str,
+        who: str,
+        text: str,
+        include_in_context: bool = True,
+        stamp: str | None = None,
+    ):
+        stamp = stamp or datetime.now().strftime("%H:%M")
+        self._append_with_stamp(stamp, who, text)
+
+        # В LLM-контекст кладём только user/assistant.
+        if include_in_context and role in {"user", "assistant"}:
+            self._push_history(role, text)
+
+        # Полный лог для восстановления UI
+        self._transcript.append({
+            "stamp": stamp,
+            "role": role,
+            "who": who,
+            "content": text,
+        })
+        if len(self._transcript) > STATE_MAX_ITEMS:
+            self._transcript = self._transcript[-STATE_MAX_ITEMS:]
+        self._save_state()
+
+    def _save_state(self):
+        data = {
+            "version": STATE_VERSION,
+            "user_key": self.user_key,
+            "updated_at": datetime.utcnow().isoformat(),
+            "transcript": self._transcript[-STATE_MAX_ITEMS:],
+        }
+        _write_json_atomic(self._state_path, data)
+
+    def _load_state(self) -> dict | None:
+        st = _read_json_file(self._state_path)
+        if not isinstance(st, dict):
+            return None
+        if int(st.get("version") or 0) != STATE_VERSION:
+            return None
+        tr = st.get("transcript")
+        if not isinstance(tr, list):
+            return None
+        return st
+
+    def _restore_on_startup(self):
+        # 1) локальная история
+        st = self._load_state()
+        if st:
+            tr = st.get("transcript") or []
+            if isinstance(tr, list) and tr:
+                self._transcript = []
+                self._conversation_history = []
+                for item in tr:
+                    if not isinstance(item, dict):
+                        continue
+                    stamp = str(item.get("stamp") or "").strip() or "--:--"
+                    who = str(item.get("who") or "").strip() or AA_DISPLAY_NAME
+                    role = str(item.get("role") or "").strip() or "meta"
+                    content = str(item.get("content") or "").strip()
+                    if not content:
+                        continue
+                    self._append_with_stamp(stamp, who, content)
+                    self._transcript.append({"stamp": stamp, "role": role, "who": who, "content": content})
+                    if role in {"user", "assistant"}:
+                        self._conversation_history.append({"role": role, "content": content})
+
+        # 2) если локально пусто — пытаемся подтянуть с сервера
+        if not self._transcript:
+            self._restore_from_server_async()
+
+    def _stamp_from_iso(self, iso_ts: str | None) -> str:
+        if not iso_ts:
+            return "--:--"
+        try:
+            # ожидаем формат вида 2026-03-04T12:34:56+00:00
+            dt = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+            return dt.astimezone().strftime("%H:%M")
+        except Exception:
+            return "--:--"
+
+    def _restore_from_server_async(self):
+        def worker():
+            try:
+                items = self.client.get_recent_history(self.user_key, user_name="Александр", limit=24)
+            except Exception:
+                items = []
+
+            if not items:
+                return
+
+            # сервер отдаёт DESC — разворачиваем в нормальный порядок
+            items = list(reversed(items))
+
+            def ui_apply():
+                if self._transcript:
+                    return
+                self._apply_server_history(items)
+
+            self.after(0, ui_apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_server_history(self, items: list[dict]):
+        if not items:
+            return
+
+        self._transcript = []
+        self._conversation_history = []
+
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            stamp = self._stamp_from_iso(it.get("created_at"))
+            user_text = str(it.get("user_request") or "").strip()
+            aa_text = str(it.get("final_answer") or "").strip()
+
+            if user_text:
+                self._append_with_stamp(stamp, "Ты", user_text)
+                self._transcript.append({"stamp": stamp, "role": "user", "who": "Ты", "content": user_text})
+                self._conversation_history.append({"role": "user", "content": user_text})
+
+            if aa_text:
+                self._append_with_stamp(stamp, AA_DISPLAY_NAME, aa_text)
+                self._transcript.append({"stamp": stamp, "role": "assistant", "who": AA_DISPLAY_NAME, "content": aa_text})
+                self._conversation_history.append({"role": "assistant", "content": aa_text})
+
+        if len(self._conversation_history) > HISTORY_MAX_ITEMS:
+            self._conversation_history = self._conversation_history[-HISTORY_MAX_ITEMS:]
+        if len(self._transcript) > STATE_MAX_ITEMS:
+            self._transcript = self._transcript[-STATE_MAX_ITEMS:]
+        self._save_state()
 
     def _show_typing(self):
         # мгновенный отклик
@@ -535,6 +784,7 @@ class App(tk.Tk):
             "llm_provider": DEFAULT_LLM_PROVIDER,
             "llm_model": DEFAULT_LLM_MODEL,
             "client_meta": {"source": "desktop", "client": "OzonatorAgentsClient"},
+            "user_key": self.user_key,
             "user_prefs": user_prefs,
             "conversation_history": history,
             "attachments": attachments_meta,
@@ -551,11 +801,10 @@ class App(tk.Tk):
             return
 
         self._clear_input()
-        self._append("Ты", user_text)
+        self._add_message("user", "Ты", user_text)
         if self._attached_files:
             names = [os.path.basename(p) or "file" for p in self._attached_files]
-            self._append("Ты", "Прикреплено файлов: " + ", ".join(names))
-        self._push_history("user", user_text)
+            self._add_message("meta", "Ты", "Прикреплено файлов: " + ", ".join(names), include_in_context=False)
 
         self._show_typing()
 
@@ -659,8 +908,7 @@ class App(tk.Tk):
                     f"Не удалось получить task_id за {SEND_TIMEOUT_SEC} сек. "
                     f"Проверь доступность сервера ({self.client.base_url}) и сеть. Нажми «Логи» — покажу диагностику отправки."
                 )
-                self._append(AA_DISPLAY_NAME, msg)
-                self._push_history("assistant", msg)
+                self._add_message("assistant", AA_DISPLAY_NAME, msg)
                 self._update_status()
 
         if self._polling and self.current_task_id is not None and not self._poll_inflight:
@@ -696,8 +944,7 @@ class App(tk.Tk):
         if final_answer:
             self._polling = False
             self._clear_typing_if_any()
-            self._append(AA_DISPLAY_NAME, final_answer)
-            self._push_history("assistant", final_answer)
+            self._add_message("assistant", AA_DISPLAY_NAME, final_answer)
             return
 
         # Если статус финальный, но финальный ответ пустой — выводим понятное сообщение и останавливаемся.
@@ -705,8 +952,7 @@ class App(tk.Tk):
             self._polling = False
             self._clear_typing_if_any()
             msg = "Задача завершилась, но финальный ответ пуст. Открой «Логи» и пришли скрин последних строк."
-            self._append(AA_DISPLAY_NAME, msg)
-            self._push_history("assistant", msg)
+            self._add_message("assistant", AA_DISPLAY_NAME, msg)
             return
 
         # Защита от бесконечного ожидания: если больше 90 секунд нет результата — подскажем открыть логи.
@@ -714,16 +960,14 @@ class App(tk.Tk):
             self._polling = False
             self._clear_typing_if_any()
             msg = "Я не получила финальный ответ за 90 секунд. Нажми «Логи» и пришли скрин последней части — разберу, где застряло."
-            self._append(AA_DISPLAY_NAME, msg)
-            self._push_history("assistant", msg)
+            self._add_message("assistant", AA_DISPLAY_NAME, msg)
             return
 
         if status in {"FAILED"}:
             self._polling = False
             self._clear_typing_if_any()
             err = str(task.get("error_message") or "Задача завершилась с ошибкой").strip()
-            self._append(AA_DISPLAY_NAME, err)
-            self._push_history("assistant", err)
+            self._add_message("assistant", AA_DISPLAY_NAME, err)
 
     def _open_logs(self):
         # Если task_id ещё нет — показываем диагностику отправки (иначе пользователь не может понять, что сломалось).
