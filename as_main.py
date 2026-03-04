@@ -69,6 +69,12 @@ _VIDEO_MAX_TRANSCRIPT_CHARS = int(os.getenv("OZONATOR_VIDEO_MAX_TRANSCRIPT_CHARS
 _VIDEO_MAX_TIMELINE_LINES = int(os.getenv("OZONATOR_VIDEO_MAX_TIMELINE_LINES", "1200") or 1200)
 
 
+# Audio attachments
+_AUDIO_EXTS = {"m4a", "mp3", "wav", "ogg", "oga", "flac", "aac", "opus", "webm"}
+_AUDIO_MAX_BYTES = int(os.getenv("OZONATOR_AUDIO_MAX_BYTES", "24000000") or 24000000)
+_AUDIO_MAX_TRANSCRIPT_CHARS = int(os.getenv("OZONATOR_AUDIO_MAX_TRANSCRIPT_CHARS", "12000") or 12000)
+
+
 def _ext(name: str) -> str:
     name = (name or "").lower()
     if "." not in name:
@@ -332,6 +338,64 @@ def _format_asr_verbose(resp: dict[str, Any] | None) -> str:
     return txt
 
 
+def _guess_audio_mime(file_name: str, content_type: str) -> str:
+    ct = (content_type or "").lower().strip()
+    if ct.startswith("audio/"):
+        return ct
+    ext = _ext(file_name)
+    if ext == "m4a":
+        return "audio/mp4"
+    if ext == "mp3":
+        return "audio/mpeg"
+    if ext == "wav":
+        return "audio/wav"
+    if ext in {"ogg", "oga", "opus"}:
+        return "audio/ogg"
+    if ext == "flac":
+        return "audio/flac"
+    if ext == "aac":
+        return "audio/aac"
+    if ext == "webm":
+        return "audio/webm"
+    return "application/octet-stream"
+
+
+def _analyze_audio_to_block(file_name: str, content_type: str, content: bytes, *, payload: dict[str, Any] | None = None) -> str:
+    payload = payload or {}
+    if not content:
+        return f"— {file_name} (аудио): (пустой файл)"
+
+    size_bytes = len(content)
+    if size_bytes > _AUDIO_MAX_BYTES:
+        return f"— {file_name} (аудио): (слишком большой файл {size_bytes} bytes, лимит {_AUDIO_MAX_BYTES})"
+
+    # Длительность (best-effort)
+    dur = 0.0
+    try:
+        ext = _ext(file_name) or "m4a"
+        with tempfile.TemporaryDirectory() as td:
+            audio_path = os.path.join(td, f"audio.{ext}")
+            with open(audio_path, "wb") as f:
+                f.write(content)
+            dur = _probe_video_duration_seconds(audio_path)
+    except Exception:
+        dur = 0.0
+
+    mime = _guess_audio_mime(file_name, content_type)
+    asr = _asr_transcribe(content, mime, file_name, payload=payload)
+    transcript = _trim_text(_format_asr_verbose(asr), _AUDIO_MAX_TRANSCRIPT_CHARS)
+
+    parts = [f"— {file_name} (аудио)"]
+    if dur:
+        parts.append(f"Длительность: ~{int(dur)} сек.")
+    if transcript:
+        parts.append("Транскрипция:\n" + transcript)
+    else:
+        parts.append("Транскрипция: (не удалось получить)")
+
+    return "\n".join(parts).strip()
+
+
 def _extract_audio_bytes(video_path: str) -> tuple[bytes, str, str]:
     exe = _ffmpeg_exe()
     with tempfile.TemporaryDirectory() as td:
@@ -580,6 +644,15 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = 
             image_parts.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
             total_image_bytes += processed_size
             blocks.append(f"— {file_name}: (изображение, приложено к сообщению)")
+            continue
+
+        # --- Audio (ASR transcription) ---
+        ct_low = (content_type or "").lower().strip()
+        if ct_low.startswith("audio/") or (ext in _AUDIO_EXTS and not ct_low.startswith("video/")):
+            try:
+                blocks.append(_analyze_audio_to_block(file_name, content_type, content, payload=payload))
+            except Exception:
+                blocks.append(f"— {file_name}: (аудио, не удалось расшифровать)")
             continue
 
         # --- Video (frames 1fps + audio transcription) ---
@@ -1489,6 +1562,18 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     main_goal = user_request or payload_brief or goal or title or f"задача #{task_id}"
 
     attachments_text, image_parts = _collect_attachments_for_llm(task_id, payload)
+
+    # Частый кейс: пользователь шлёт только голосовое и ставит "." как текст.
+    # В этом случае задаём явную цель, чтобы агент вернул транскрипцию и резюме.
+    placeholder = (user_request or "").strip()
+    if placeholder in {".", "..", "...", "…", "-", "—"} and attachments_text and (
+        "Транскрипция:" in attachments_text or "(аудио)" in attachments_text or "(видео)" in attachments_text
+    ):
+        main_goal = (
+            "Проанализируй вложения. Если там есть аудио/видео — сначала выведи транскрипцию (текст речи), "
+            "затем короткое резюме и ключевые пункты."
+        )
+
     llm_question = (main_goal + "\n\n" + attachments_text).strip() if attachments_text else main_goal
 
     endpoints = _normalize_str_list(payload.get("endpoints") or payload.get("endpoint") or az_fix_plan.get("endpoints") or az_fix_plan.get("endpoint"))
