@@ -910,7 +910,9 @@ def _strip_and_apply_self_profile_updates(text: str) -> str:
         return text
 
     cleaned = text
-    for m in list(_SELF_PROFILE_UPDATE_RE.finditer(text)):
+
+    # 1) Наш формат update-блока: [[EK_SELF_PROFILE_UPDATE]]{...}[[/EK_SELF_PROFILE_UPDATE]]
+    for m in list(_SELF_PROFILE_UPDATE_RE.finditer(cleaned)):
         payload = (m.group(1) or "").strip()
         try:
             upd = json.loads(payload)
@@ -919,6 +921,17 @@ def _strip_and_apply_self_profile_updates(text: str) -> str:
         except Exception:
             pass
         cleaned = cleaned.replace(m.group(0), "")
+
+    # 2) На случай, если модель вернула update как JSON-«tool call» в конце:
+    #    [[ "EK_SELF_PROFILE_UPDATE" ], { "set":..., "delete":... }]
+    if "EK_SELF_PROFILE_UPDATE" in cleaned:
+        idx = cleaned.rfind("EK_SELF_PROFILE_UPDATE")
+        br = cleaned.rfind("[", 0, idx)
+        if br != -1:
+            tail = cleaned[br:].strip()
+            obj, _rest = _raw_json_prefix(tail)
+            if _json_contains_token(obj, "EK_SELF_PROFILE_UPDATE"):
+                cleaned = cleaned[:br].rstrip()
 
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
@@ -986,6 +999,56 @@ def _enforce_feminine_ru(text: str) -> str:
 
 def _safe_strip(s: str) -> str:
     return (s or "").strip()
+
+
+def _raw_json_prefix(text: str) -> tuple[Any | None, str]:
+    """
+    Пытаемся распарсить ПЕРВЫЙ JSON-объект/массив из строки.
+    Работает даже если перед JSON есть префикс ("JSON:", "Вот:", и т.п.) или дальше есть второй JSON/мусор.
+    Возвращает (obj, rest).
+    """
+    if not isinstance(text, str):
+        return None, ""
+    s = text.lstrip()
+
+    # убираем возможные код-фенсы
+    if s.startswith("```"):
+        s2 = re.sub(r"^```(?:json)?\s*", "", s, flags=re.I)
+        s2 = re.sub(r"\s*```\s*$", "", s2)
+        s = s2.strip()
+
+    # если JSON не с самого начала — ищем первую { или [ недалеко от начала
+    if s and not (s.startswith("{") or s.startswith("[")):
+        i1 = s.find("{")
+        i2 = s.find("[")
+        candidates = [i for i in [i1, i2] if i != -1]
+        if candidates:
+            i = min(candidates)
+            if i <= 120:  # разумный префикс
+                s = s[i:].lstrip()
+
+    if not s or (not s.startswith("{") and not s.startswith("[")):
+        return None, text
+
+    try:
+        dec = json.JSONDecoder()
+        obj, idx = dec.raw_decode(s)
+        rest = s[idx:].lstrip()
+        return obj, rest
+    except Exception:
+        return None, text
+
+def _json_contains_token(obj: Any, token: str) -> bool:
+    if obj is None:
+        return False
+    if isinstance(obj, str):
+        return token in obj
+    if isinstance(obj, dict):
+        return any(_json_contains_token(k, token) or _json_contains_token(v, token) for k, v in obj.items())
+    if isinstance(obj, list):
+        return any(_json_contains_token(x, token) for x in obj)
+    return False
+
 
 # -------------------------
 # LLM (Groq / OpenAI-compatible Chat Completions)
@@ -1246,20 +1309,31 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
         data = json.loads(raw.decode("utf-8")) if raw else {}
         ans_text = _safe_strip(_extract_chat_completion_text(data))
 
-        # Если мы просили JSON (vision) — распарсим и вернём человеческий answer
+                # Если мы просили JSON (vision) — распарсим и вернём человекочитаемый answer
         if image_parts:
-            obj = None
-            try:
-                if ans_text.startswith("{"):
-                    obj = json.loads(ans_text)
-            except Exception:
-                obj = None
+            obj, _rest = _raw_json_prefix(ans_text)
+
+            # Иногда модель возвращает массив, например: [ { ... } ]
+            if isinstance(obj, list) and obj:
+                d = None
+                for x in obj:
+                    if isinstance(x, dict):
+                        d = x
+                        break
+                obj = d
+
+            def _as_list_text(v: Any) -> str:
+                if v is None:
+                    return ""
+                if isinstance(v, list):
+                    return ", ".join([str(x).strip() for x in v if str(x).strip()])
+                return str(v).strip()
 
             if isinstance(obj, dict):
                 people_present = obj.get("people_present")
-                people = _safe_strip(str(obj.get("people") or ""))
-                objects = _safe_strip(str(obj.get("objects") or ""))
-                txt = _safe_strip(str(obj.get("text") or ""))
+                people = _as_list_text(obj.get("people"))
+                objects = _as_list_text(obj.get("objects"))
+                txt = _as_list_text(obj.get("text"))
                 answer = _safe_strip(str(obj.get("answer") or ""))
 
                 ql = (question_ru or "").lower()
@@ -1298,13 +1372,14 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
                             raw2 = r2.read()
                         data2 = json.loads(raw2.decode("utf-8")) if raw2 else {}
                         ans2 = _safe_strip(_extract_chat_completion_text(data2))
-                        obj2 = json.loads(ans2) if ans2.startswith("{") else None
+                        obj2, _ = _raw_json_prefix(ans2)
                         if isinstance(obj2, dict) and str(obj2.get("people_present")).lower() in {"true", "1", "yes"}:
                             people_present = obj2.get("people_present")
-                            people = _safe_strip(str(obj2.get("people") or people))
+                            people = _as_list_text(obj2.get("people") or people)
                     except Exception:
                         pass
 
+                # Если модель не дала answer — соберём короткий, читабельный ответ
                 if not answer:
                     parts = []
                     if str(people_present).lower() in {"true", "1", "yes"} and people:
@@ -1319,8 +1394,8 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
                         parts.append(f"Текст на изображении: {txt}.")
                     answer = " ".join(parts).strip()
 
+                # Главное — вернуть человеку читабельный ответ, а не JSON
                 ans_text = answer or ans_text
-
         ans_text = _strip_and_apply_self_profile_updates(ans_text)
         ans_text = _enforce_feminine_ru(ans_text)
         return ans_text
