@@ -19,6 +19,7 @@ ENV:
 """
 
 import json
+import io
 import os
 import threading
 import time
@@ -48,6 +49,96 @@ FAST_POLL_MS = 250
 NORMAL_POLL_MS = 1000
 FAST_POLL_WINDOW_SEC = 12
 
+
+
+# Радикально иной подход к вложениям: по умолчанию отправляем не оригинал фото,
+# а "превью" (ресайз + JPEG), чтобы не ловить write timeout на медленных каналах.
+# Оригинал при этом остаётся локально у пользователя.
+CLIENT_IMAGE_MAX_BYTES = int(os.getenv("OZONATOR_CLIENT_IMAGE_MAX_BYTES") or 900_000)  # ~0.9MB
+CLIENT_IMAGE_MAX_DIM = int(os.getenv("OZONATOR_CLIENT_IMAGE_MAX_DIM") or 1600)
+CLIENT_IMAGE_PREVIEW_ONLY = (os.getenv("OZONATOR_CLIENT_IMAGE_PREVIEW_ONLY") or "1").strip().lower() not in ("0", "false", "no")
+
+try:
+    from PIL import Image  # type: ignore
+    PIL_AVAILABLE = True
+except Exception:
+    Image = None  # type: ignore
+    PIL_AVAILABLE = False
+
+
+def _is_image_name(file_name: str, content_type: str) -> bool:
+    ct = (content_type or "").lower().strip()
+    if ct.startswith("image/"):
+        return True
+    ext = (file_name or "").lower().rsplit(".", 1)
+    ext = ext[-1] if len(ext) == 2 else ""
+    return ext in {"jpg", "jpeg", "png", "webp", "gif"}
+
+
+def _make_image_preview(raw: bytes, max_dim: int, max_bytes: int):
+    """Делает JPEG-превью <= max_bytes. Требует Pillow. Возвращает (bytes, content_type) или (None, None)."""
+    if not PIL_AVAILABLE or Image is None:
+        return (None, None)
+    try:
+        img = Image.open(io.BytesIO(raw))
+        if getattr(img, "mode", "") == "RGBA":
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif getattr(img, "mode", "") != "RGB":
+            img = img.convert("RGB")
+
+        w, h = img.size
+        if max(w, h) > max_dim:
+            scale = max_dim / float(max(w, h))
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+
+        def encode(q: int) -> bytes:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=q, optimize=True)
+            return buf.getvalue()
+
+        q = 82
+        data = encode(q)
+        while len(data) > max_bytes and q >= 45:
+            q -= 7
+            data = encode(q)
+
+        tries = 0
+        while len(data) > max_bytes and tries < 3:
+            w, h = img.size
+            img = img.resize((max(1, int(w * 0.85)), max(1, int(h * 0.85))))
+            data = encode(max(45, q))
+            tries += 1
+
+        if len(data) <= max_bytes:
+            return (data, "image/jpeg")
+        return (None, None)
+    except Exception:
+        return (None, None)
+
+
+def _prepare_file_for_upload(file_path: str):
+    """Возвращает (upload_name, content_type, content_bytes, note)."""
+    file_name = os.path.basename(file_path) or "file"
+    ctype = __import__('mimetypes').guess_type(file_name)[0] or "application/octet-stream"
+
+    with open(file_path, "rb") as f:
+        raw = f.read() or b""
+
+    if _is_image_name(file_name, ctype):
+        need_preview = CLIENT_IMAGE_PREVIEW_ONLY or (len(raw) > CLIENT_IMAGE_MAX_BYTES)
+        if need_preview:
+            data, new_ct = _make_image_preview(raw, CLIENT_IMAGE_MAX_DIM, CLIENT_IMAGE_MAX_BYTES)
+            if data is not None and new_ct is not None:
+                base = file_name.rsplit(".", 1)[0]
+                upload_name = f"{base}_preview.jpg"
+                note = f"отправлено превью ({len(data)} bytes)"
+                return upload_name, new_ct, data, note
+            note = "превью не получилось (нет Pillow или ошибка), отправлен оригинал"
+            return file_name, ctype, raw, note
+
+    return file_name, ctype, raw, "отправлен оригинал"
 HISTORY_MAX_ITEMS = 24
 
 AA_DISPLAY_NAME = "Екатерина"
@@ -201,25 +292,21 @@ class AAClient:
         return []
 
     def upload_file(self, task_id: int, file_path: str) -> None:
-        file_name = os.path.basename(file_path) or "file"
-        ctype = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
 
-        with open(file_path, "rb") as f:
-            content = f.read()
+        upload_name, ctype, content, note = _prepare_file_for_upload(file_path)
 
         boundary = "----ozonatorboundary" + uuid.uuid4().hex
         head = (
             f"--{boundary}\r\n"
-            f"Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n"
+            f"Content-Disposition: form-data; name=\"file\"; filename=\"{upload_name}\"\r\n"
             f"Content-Type: {ctype}\r\n\r\n"
         ).encode("utf-8")
         tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
         body = head + content + tail
 
-        # Динамический таймаут: по умолчанию UPLOAD_TIMEOUT,
-        # но для больших файлов/медленного канала увеличиваем.
-        # 200_000 B/s ~ 0.2MB/s (консервативно), +60s запас.
-        dyn = int(len(body) / 200_000) + 60
+        # Динамический таймаут: чем больше тело — тем больше даём времени.
+        # Для превью обычно это <1MB и таймаут становится коротким.
+        dyn = int(len(body) / 180_000) + 45  # ~0.18MB/s + запас
         upload_timeout = max(UPLOAD_TIMEOUT, dyn)
         upload_timeout = min(upload_timeout, 900)
 
@@ -242,10 +329,10 @@ class AAClient:
                 last_err = (f"{resp.error or 'upload_failed'} (status={resp.status}) {detail}").strip()
 
             # сетевые/таймауты — ретраим с небольшим backoff
-            time.sleep(0.8 * (attempt + 1))
+            time.sleep(0.9 * (attempt + 1))
 
-        raise RuntimeError(last_err or "upload_failed")
-
+        # если дошли сюда — всё плохо
+        raise RuntimeError((last_err or "upload_failed") + f"; note={note}")
 
 
 class App(tk.Tk):
