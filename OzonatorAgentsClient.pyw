@@ -145,13 +145,36 @@ class AAClient:
         raise RuntimeError(last_err or "create_task_failed")
 
     def run_task(self, task_id: int) -> None:
-        # cold start может таймаутить — это ок, поллинг продолжится
+        """"Пинок" оркестрации.
+
+        Важно: на Render возможен таймаут на cold start — это НЕ ошибка, polling продолжится.
+        Но если сервер явно отвечает 4xx (например, неверный путь/токен) — показываем ошибку,
+        чтобы не зависать бесконечно.
+        """
+        had_timeout = False
+        last_4xx: ApiResponse | None = None
+
         for pref in self._prefixes():
             self.api_prefix = pref
             url = self._mk(f"/aa/run-task/{task_id}")
             resp = self._request_json("POST", url, {})
             if resp.ok:
                 return
+
+            if resp.status == 0:
+                had_timeout = True
+                continue
+
+            if 400 <= resp.status < 500:
+                last_4xx = resp
+
+        # Если были только таймауты/сетевые ошибки — считаем, что "пинок" мог сработать.
+        if had_timeout and last_4xx is None:
+            return
+
+        if last_4xx is not None:
+            raise RuntimeError(last_4xx.error or f"run_task_failed ({last_4xx.status})")
+
 
     def get_task(self, task_id: int) -> dict | None:
         for pref in self._prefixes():
@@ -218,6 +241,8 @@ class App(tk.Tk):
         self._typing_range = None
         self._conversation_history: list[dict[str, str]] = []
         self._attached_files: list[str] = []
+        self._last_task_status: str = ""
+        self._poll_started_at: float = 0.0
 
         self._build_ui()
         self._bind_hotkeys()
@@ -351,10 +376,13 @@ class App(tk.Tk):
         self._update_status()
 
     def _update_status(self):
+        parts = ["● online"]
         if self._attached_files:
-            self.lbl_status.config(text=f"● online · файлов: {len(self._attached_files)}")
-        else:
-            self.lbl_status.config(text="● online")
+            parts.append(f"файлов: {len(self._attached_files)}")
+        if self._last_task_status:
+            parts.append(f"статус: {self._last_task_status}")
+        self.lbl_status.config(text=" · ".join(parts))
+
 
     def _build_task_payload(self, user_text: str) -> dict:
         # user_prefs (как ты попросил)
@@ -421,6 +449,7 @@ class App(tk.Tk):
                 self._clear_files()
 
                 self.client.run_task(task_id)
+                self._poll_started_at = time.time()
                 self._polling = True
                 self._poll_fast_until = time.time() + FAST_POLL_WINDOW_SEC
             except Exception as e:
@@ -459,6 +488,10 @@ class App(tk.Tk):
             return
 
         status = str(task.get("status") or "").upper()
+
+        if status and status != self._last_task_status:
+            self._last_task_status = status
+            self._update_status()
         result = task.get("result") if isinstance(task.get("result"), dict) else {}
 
         # финальный ответ всегда из task.result.final_answer
@@ -471,6 +504,24 @@ class App(tk.Tk):
             self._clear_typing_if_any()
             self._append(AA_DISPLAY_NAME, final_answer)
             self._push_history("assistant", final_answer)
+            return
+
+        # Если статус финальный, но финальный ответ пустой — выводим понятное сообщение и останавливаемся.
+        if status in {"DONE", "REVIEW_NEEDS_ATTENTION"}:
+            self._polling = False
+            self._clear_typing_if_any()
+            msg = "Задача завершилась, но финальный ответ пуст. Открой «Логи» и пришли скрин последних строк."
+            self._append(AA_DISPLAY_NAME, msg)
+            self._push_history("assistant", msg)
+            return
+
+        # Защита от бесконечного ожидания: если больше 90 секунд нет результата — подскажем открыть логи.
+        if self._poll_started_at and (time.time() - self._poll_started_at) > 90:
+            self._polling = False
+            self._clear_typing_if_any()
+            msg = "Я не получила финальный ответ за 90 секунд. Нажми «Логи» и пришли скрин последней части — разберу, где застряло."
+            self._append(AA_DISPLAY_NAME, msg)
+            self._push_history("assistant", msg)
             return
 
         if status in {"FAILED"}:

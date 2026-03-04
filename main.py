@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import time
 from typing import Annotated, Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -510,20 +511,60 @@ def _agent_route(agent_code: str, task_id: int) -> str:
 
 
 
+def _is_retriable_agent_call(http_status: int, error_message: str | None) -> bool:
+    """Transient Render/Network issues that are worth retrying."""
+    if http_status in {0, 408, 425, 429, 500, 502, 503, 504}:
+        return True
+    if error_message and any(x in error_message for x in ["URLError", "timeout", "timed out", "Temporary failure", "Connection reset", "Connection refused"]):
+        return True
+    return False
+
+
 def _call_agent(settings, task_id: int, agent_code: str) -> tuple[bool, dict[str, Any]]:
+    """Call AZ/AS/AK with small retries to survive Render cold-start/5xx."""
     base_url = _agent_base_url(settings, agent_code)
     url = f"{base_url}{_agent_route(agent_code, task_id)}"
-    ok, status_code, body, error_message = _post_json(url, {})
-    return (
-        ok,
-        {
-            "agent": agent_code.upper(),
-            "url": url,
-            "http_status": status_code,
-            "response": body if isinstance(body, dict) else None,
-            "error": error_message,
-        },
-    )
+
+    max_attempts = max(1, int(os.getenv("AA_AGENT_CALL_RETRIES") or "3"))
+    base_sleep = float(os.getenv("AA_AGENT_CALL_RETRY_SLEEP_SEC") or "1.25")
+
+    last_ok: bool = False
+    last_status: int = 0
+    last_body = None
+    last_err: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        ok, status_code, body, error_message = _post_json(url, {})
+        last_ok, last_status, last_body, last_err = ok, status_code, body, error_message
+
+        if ok:
+            return True, {
+                "agent": agent_code.upper(),
+                "url": url,
+                "http_status": status_code,
+                "attempt": attempt,
+                "attempts_total": max_attempts,
+                "response": body if isinstance(body, dict) else None,
+                "error": None,
+            }
+
+        # retry only for transient errors
+        if attempt < max_attempts and _is_retriable_agent_call(status_code, error_message):
+            time.sleep(base_sleep * attempt)
+            continue
+
+        break
+
+    return False, {
+        "agent": agent_code.upper(),
+        "url": url,
+        "http_status": last_status,
+        "attempt": max_attempts,
+        "attempts_total": max_attempts,
+        "response": last_body if isinstance(last_body, dict) else None,
+        "error": last_err or "agent_call_failed",
+    }
+
 
 
 
@@ -875,6 +916,39 @@ def aa_run_task(task_id: int):
                 "execution_result": orchestration_result,
             },
         )
+
+    
+    # Если авто-оркестрация не смогла завершить цепочку, не оставляем пользователя в бесконечном ожидании.
+    # В этом случае фиксируем понятную причину и переводим задачу в failed (без утечки секретов).
+    try:
+        final_result = final_task.get("result") if isinstance(final_task.get("result"), dict) else {}
+        final_result = final_result if isinstance(final_result, dict) else {}
+        has_final_answer = bool(str(final_result.get("final_answer") or "").strip())
+
+        orch_status = str(orchestration_result.get("orchestration_status") or "").lower()
+        if orch_status in {"failed", "unknown_final_status"} and not has_final_answer:
+            failed_at = orchestration_result.get("failed_at") or "UNKNOWN"
+            msg = orchestration_result.get("message") or "Авто-оркестрация не смогла завершить задачу"
+            safe_error = f"AA: не удалось завершить цепочку (шаг: {failed_at}). {msg}. Открой кнопку «Логи» в клиенте и пришли скрин последней части, если нужно продолжать отладку."
+
+            merged = {**final_result, "final_answer": safe_error, "aa_orchestration": orchestration_result}
+            set_task_result(settings.database_url, task_id=task_id, result=merged, error_message=safe_error)
+            update_task_status(settings.database_url, task_id, "failed")
+            ok, final_task, _ = get_task_record(settings.database_url, task_id)
+
+        # Если авто-оркестрация выключена на сервере — тоже не зависаем молча.
+        if (not settings.aa_auto_orchestration_enabled) and not has_final_answer:
+            safe_error = (
+                "AA: авто-оркестрация цепочки AZ → AS → AK сейчас отключена на сервере (AA_AUTO_ORCHESTRATION_ENABLED=false). "
+                "Из-за этого задача не будет выполнена автоматически. Включи переменную на сервисе AA в Render и перезапусти сервис."
+            )
+            merged = {**final_result, "final_answer": safe_error, "aa_orchestration": {"orchestration_status": "disabled"}}
+            set_task_result(settings.database_url, task_id=task_id, result=merged, error_message=safe_error)
+            update_task_status(settings.database_url, task_id, "failed")
+            ok, final_task, _ = get_task_record(settings.database_url, task_id)
+    except Exception:
+        # На всякий случай не ломаем ответ AA, даже если не смогли записать failure.
+        pass
 
     return _json_response(
         200,
