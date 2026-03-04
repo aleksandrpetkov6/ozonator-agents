@@ -8,6 +8,7 @@ import re
 import base64
 import io
 import csv
+import tempfile
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
@@ -15,6 +16,11 @@ import psycopg
 import redis
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+
+try:
+    import imageio.v2 as imageio  # type: ignore
+except Exception:
+    imageio = None  # type: ignore
 
 from app.config import get_settings
 from db.health import check_postgres, check_redis
@@ -204,6 +210,101 @@ def _prepare_image_for_vision(file_name: str, content_type: str, raw: bytes) -> 
         return raw, mime
 
 
+
+_VIDEO_EXTS = {"mp4", "mov", "m4v", "avi", "mkv", "webm"}
+
+def _prepare_video_frames_for_vision(file_name: str, content_type: str, raw: bytes, *, max_frames: int = 4) -> list[tuple[bytes, str]]:
+    """Извлекаем несколько кадров из видео и подготавливаем их как изображения для vision.
+
+    Подход: сохраняем во временный файл и читаем через imageio/ffmpeg.
+    Если imageio недоступен или чтение не удалось — возвращаем пусто.
+    """
+    if not raw or max_frames <= 0:
+        return []
+    if imageio is None:
+        return []
+
+    try:
+        # Временный файл нужен, потому что ffmpeg-ридер обычно ждёт путь.
+        ext = _ext(file_name) or "mp4"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+
+        frames: list[tuple[bytes, str]] = []
+        try:
+            reader = imageio.get_reader(tmp_path, format="ffmpeg")
+            meta = {}
+            try:
+                meta = reader.get_meta_data() or {}
+            except Exception:
+                meta = {}
+
+            nframes = None
+            # imageio может отдавать nframes, но иногда это inf/None
+            for key in ("nframes", "n_frames", "nImages"):
+                v = meta.get(key)
+                if isinstance(v, (int, float)) and v and v != float("inf"):
+                    nframes = int(v)
+                    break
+            if not nframes:
+                try:
+                    nframes = int(reader.count_frames())
+                except Exception:
+                    nframes = None
+
+            # Индексы кадров равномерно по ролику (или первые, если nframes неизвестно)
+            indices: list[int] = []
+            if nframes and nframes > 0:
+                if max_frames == 1:
+                    indices = [max(0, nframes // 2)]
+                else:
+                    indices = [int(round(i * (nframes - 1) / (max_frames - 1))) for i in range(max_frames)]
+                # уникализируем и сортируем
+                indices = sorted(set(max(0, min(nframes - 1, x)) for x in indices))
+            else:
+                indices = list(range(max_frames))
+
+            from PIL import Image  # Pillow уже в requirements
+            for i, idx in enumerate(indices):
+                if len(frames) >= max_frames:
+                    break
+                try:
+                    arr = reader.get_data(idx)
+                except Exception:
+                    # если random access не работает — пробуем последовательное чтение
+                    try:
+                        arr = next(reader)
+                    except Exception:
+                        break
+
+                try:
+                    img = Image.fromarray(arr)
+                except Exception:
+                    continue
+
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=85, optimize=True)
+                jpg = buf.getvalue()
+
+                prepared, mime = _prepare_image_for_vision(f"{file_name}#frame{idx}.jpg", "image/jpeg", jpg)
+                if prepared:
+                    frames.append((prepared, mime))
+        finally:
+            try:
+                reader.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+        return frames
+    except Exception:
+        return []
+
+
 def _collect_attachments_for_llm(task_id: int) -> tuple[str, list[dict[str, Any]]]:
     """
     Возвращает:
@@ -263,6 +364,39 @@ def _collect_attachments_for_llm(task_id: int) -> tuple[str, list[dict[str, Any]
             image_parts.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
             total_image_bytes += processed_size
             blocks.append(f"— {file_name}: (изображение, приложено к сообщению)")
+            continue
+
+
+        # --- Video (extract frames for vision) ---
+        if ext in _VIDEO_EXTS or (content_type or "").lower().startswith("video/"):
+            remaining = max(0, _ATT_MAX_IMAGES - len(image_parts))
+            if remaining <= 0:
+                blocks.append(f"— {file_name}: (видео, пропущено — достигнут лимит {_ATT_MAX_IMAGES} изображений)")
+                continue
+
+            frames = _prepare_video_frames_for_vision(file_name, content_type, content, max_frames=min(4, remaining))
+            if not frames:
+                blocks.append(f"— {file_name}: (видео, не удалось извлечь кадры для анализа)")
+                continue
+
+            added = 0
+            for frame_bytes, mime in frames:
+                if not frame_bytes:
+                    continue
+                if len(image_parts) >= _ATT_MAX_IMAGES:
+                    break
+                if total_image_bytes + len(frame_bytes) > _ATT_MAX_TOTAL_IMAGE_BYTES:
+                    break
+                b64 = base64.b64encode(frame_bytes).decode("ascii")
+                data_url = f"data:{mime};base64,{b64}"
+                image_parts.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
+                total_image_bytes += len(frame_bytes)
+                added += 1
+
+            if added:
+                blocks.append(f"— {file_name}: (видео, извлечено кадров для анализа: {added})")
+            else:
+                blocks.append(f"— {file_name}: (видео, кадры извлечены, но не добавлены из-за лимитов)")
             continue
 
         # --- Text-like ---
