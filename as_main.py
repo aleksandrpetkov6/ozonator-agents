@@ -5,6 +5,7 @@ import json
 import operator as op
 import os
 import re
+import base64
 import io
 import csv
 from datetime import datetime, timezone
@@ -46,6 +47,9 @@ _ATT_MAX_FILES = 8
 _ATT_MAX_TOTAL_BYTES = 2 * 1024 * 1024
 _ATT_MAX_CHARS_PER_FILE = 20000
 
+_ATT_MAX_IMAGES = 4
+_ATT_MAX_IMAGE_BYTES_EACH = 2 * 1024 * 1024
+_ATT_MAX_TOTAL_IMAGE_BYTES = 4 * 1024 * 1024
 
 def _ext(name: str) -> str:
     name = (name or "").lower()
@@ -119,56 +123,150 @@ def _preview_xlsx(raw: bytes) -> str:
         return "(xlsx: не удалось прочитать)"
 
 
-def _build_attachments_block(task_id: int) -> str:
+def _guess_image_mime(file_name: str, content_type: str | None = None) -> str:
+    ct = (content_type or '').strip().lower()
+    if ct.startswith('image/'):
+        return ct
+    ext = _ext(file_name)
+    if ext in {'jpg', 'jpeg'}:
+        return 'image/jpeg'
+    if ext == 'png':
+        return 'image/png'
+    if ext == 'webp':
+        return 'image/webp'
+    if ext == 'gif':
+        return 'image/gif'
+    return 'image/jpeg'
+
+
+def _aa_public_download_url(task_id: int, file_id: int, *, sha256: str | None = None) -> str:
+    """Публичный URL, который vision-провайдер сможет подтянуть сам."""
+    base = (os.getenv('AA_PUBLIC_BASE_URL') or os.getenv('OZONATOR_AA_PUBLIC_URL') or 'https://ozonator-aa-dev.onrender.com').rstrip('/')
+    prefix = (os.getenv('AA_PUBLIC_API_PREFIX') or '').strip()
+    if prefix and not prefix.startswith('/'):
+        prefix = '/' + prefix
+    path = f"{prefix}/tasks/{task_id}/files/{file_id}/download"
+    url = base + path
+    if sha256:
+        url = url + f"?v={sha256}"
+    return url
+
+
+def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None) -> tuple[str, list[dict[str, Any]]]:
+    """
+    Возвращает:
+    1) Текстовый блок-превью вложений (таблицы/текст и пометки о пропусках).
+    2) Список image_url частей (OpenAI-compatible) для vision-моделей.
+
+    ВАЖНО: для изображений отдаём публичный URL, а не base64 data-url,
+    чтобы Groq/провайдеры vision гарантированно смогли скачать картинку.
+    """
+    payload = payload or {}
     settings = get_settings()
-    db_url = getattr(settings, "database_url", None)
+    db_url = getattr(settings, 'database_url', None)
+
+    # Если БД не настроена — хотя бы покажем метаданные из payload.attachments
     if not db_url:
-        return ""
+        att = payload.get('attachments')
+        if isinstance(att, list) and att:
+            lines = ['Вложения к задаче (метаданные из клиента):']
+            for item in att[:_ATT_MAX_FILES]:
+                if isinstance(item, dict):
+                    name = str(item.get('name') or 'file')
+                    sz = item.get('size_bytes')
+                    suffix = f" ({sz} bytes)" if isinstance(sz, int) else ''
+                    lines.append(f"— {name}{suffix}: (содержимое недоступно на сервере)")
+                else:
+                    lines.append(f"— {str(item)}: (содержимое недоступно на сервере)")
+            return "\n".join(lines).strip(), []
+        return '', []
 
-    ok, files, message = list_task_files(db_url, task_id)
+    ok, files, _message = list_task_files(db_url, task_id)
     if not ok or not files:
-        return ""
+        att = payload.get('attachments')
+        if isinstance(att, list) and att:
+            lines = ['Вложения к задаче (метаданные из клиента):']
+            for item in att[:_ATT_MAX_FILES]:
+                if isinstance(item, dict):
+                    name = str(item.get('name') or 'file')
+                    sz = item.get('size_bytes')
+                    suffix = f" ({sz} bytes)" if isinstance(sz, int) else ''
+                    lines.append(f"— {name}{suffix}: (на сервере не найдено в task_files)")
+                else:
+                    lines.append(f"— {str(item)}: (на сервере не найдено в task_files)")
+            return "\n".join(lines).strip(), []
+        return '', []
 
-    total = 0
+    total_text_bytes = 0
+    total_image_bytes = 0
+    image_parts: list[dict[str, Any]] = []
     blocks: list[str] = []
+
     for meta in files[:_ATT_MAX_FILES]:
-        file_id = int(meta.get("id") or 0)
-        file_name = str(meta.get("file_name") or f"file_{file_id}")
-        size_bytes = int(meta.get("size_bytes") or 0)
-        if total + size_bytes > _ATT_MAX_TOTAL_BYTES:
-            blocks.append("(достигнут лимит по суммарному размеру вложений, остальное пропущено)")
+        file_id = int(meta.get('id') or 0)
+        file_name = str(meta.get('file_name') or f'file_{file_id}')
+        size_bytes = int(meta.get('size_bytes') or 0)
+        content_type = str(meta.get('content_type') or '')
+        sha256 = str(meta.get('sha256') or '')
+
+        ext = _ext(file_name)
+        is_image = ext in {'jpg', 'jpeg', 'png', 'webp', 'gif'} or content_type.lower().startswith('image/')
+
+        if is_image:
+            if len(image_parts) >= _ATT_MAX_IMAGES:
+                blocks.append(f"— {file_name}: (изображение, пропущено — достигнут лимит {_ATT_MAX_IMAGES} шт.)")
+                continue
+            if size_bytes > _ATT_MAX_IMAGE_BYTES_EACH:
+                blocks.append(f"— {file_name}: (изображение, пропущено — слишком большой файл {size_bytes} bytes, лимит {_ATT_MAX_IMAGE_BYTES_EACH})")
+                continue
+            if total_image_bytes + size_bytes > _ATT_MAX_TOTAL_IMAGE_BYTES:
+                blocks.append(f"— {file_name}: (изображение, пропущено — достигнут лимит по суммарному размеру изображений {_ATT_MAX_TOTAL_IMAGE_BYTES} bytes)")
+                continue
+
+            url = _aa_public_download_url(task_id, file_id, sha256=sha256 or None)
+            image_parts.append({'type': 'image_url', 'image_url': {'url': url}})
+            total_image_bytes += size_bytes
+            blocks.append(f"— {file_name}: (изображение, приложено к сообщению)")
+            continue
+
+        if total_text_bytes + size_bytes > _ATT_MAX_TOTAL_BYTES:
+            blocks.append('(достигнут лимит по суммарному размеру текстовых вложений, остальное пропущено)')
             break
 
-        ok_c, meta_c, content, msg_c = get_task_file_content(db_url, task_id, file_id)
+        ok_c, _meta_c, content, _msg_c = get_task_file_content(db_url, task_id, file_id)
         if not ok_c or content is None:
             blocks.append(f"— {file_name}: (не удалось загрузить содержимое)")
             continue
 
-        total += len(content)
-        ext = _ext(file_name)
+        total_text_bytes += len(content)
 
-        if ext in {"txt", "md", "log", "json", "yaml", "yml"}:
+        if ext in {'txt', 'md', 'log', 'json', 'yaml', 'yml'}:
             txt = _trim_text(_decode_text(content), _ATT_MAX_CHARS_PER_FILE)
             blocks.append(f"— {file_name}\n{txt}")
             continue
-        if ext == "csv":
+        if ext == 'csv':
             txt = _decode_text(content)
             blocks.append(f"— {file_name}\n{_preview_csv(txt, ',', 60)}")
             continue
-        if ext == "tsv":
+        if ext == 'tsv':
             txt = _decode_text(content)
             blocks.append(f"— {file_name}\n{_preview_csv(txt, '\t', 60)}")
             continue
-        if ext in {"xlsx", "xlsm"}:
+        if ext in {'xlsx', 'xlsm'}:
             blocks.append(f"— {file_name}\n{_preview_xlsx(content)}")
             continue
 
         blocks.append(f"— {file_name}: (бинарный формат, автоматический разбор не поддерживается)")
 
-    if not blocks:
-        return ""
+    if not blocks and not image_parts:
+        return '', []
 
-    return "\n\n".join(["Вложения к задаче (используй их при ответе):", *blocks]).strip()
+    text_block = ("\n\n".join(['Вложения к задаче (используй их при ответе):', *blocks]).strip()) if blocks else ''
+    return text_block, image_parts
+
+
+
+
 
 
 def _normalize_str_list(value: Any) -> list[str]:
@@ -556,7 +654,7 @@ def _extract_chat_completion_text(resp: dict[str, Any]) -> str:
     return ""
 
 
-def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
+def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, image_parts: list[dict[str, Any]] | None = None) -> str:
     key = _pick_llm_key()
     if not key:
         return ""
@@ -564,6 +662,17 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
     payload = payload or {}
     url = _normalize_llm_url(os.getenv("OPENAI_API_URL", ""), key=key)
     model = _pick_llm_model(payload)
+
+    image_parts = image_parts or []
+    if image_parts:
+        # Если есть изображения — выбираем vision-модель (Groq/OpenAI совместимые).
+        vision_model = (os.getenv('OZONATOR_LLM_VISION_MODEL') or os.getenv('GROQ_VISION_MODEL') or '').strip()
+        if vision_model:
+            model = vision_model
+        else:
+            low_m = (model or '').lower()
+            if key.startswith('gsk_') and ('vision' not in low_m and 'image' not in low_m):
+                model = 'llama-3.2-11b-vision-preview'
 
     prefs = payload.get("user_prefs") if isinstance(payload.get("user_prefs"), dict) else {}
     user_name = str(prefs.get("user_name") or "Александр").strip() or "Александр"
@@ -588,7 +697,7 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
     )
 
     system_msg = (
-        f"Ты — Екатерина. Мы с пользователем давно знакомы, общение по-свойски. "
+        f"Ты — Екатерина. Говори от первого лица и о себе всегда в женском роде (я сделала, я посмотрела, я готова). Мы с пользователем давно знакомы, общение по-свойски. "
         f"Пользователя зовут {user_name}. Всегда обращайся к нему на {pronoun}. "
         f"Используй обращение «{addr}» (можно переключаться по контексту между: {', '.join(variants)}). "
         "Не представляйся и не объясняй, кто ты. "
@@ -597,6 +706,7 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
         "Восклицательные знаки используй только при крайней необходимости; в письмах «!» воспринимается как крик. "
         "Всегда опирайся ТОЛЬКО на факты из последнего сообщения пользователя и переданной истории диалога. "
         "НЕ гадай и НЕ перечисляй возможные трактовки. "
+        "Если во входном сообщении есть изображения — они переданы тебе, анализируй их и не утверждай, что ты их не видишь. "
         "Если по контексту нельзя понять, что требуется (или не хватает критичных данных), задай ОДИН уточняющий вопрос и остановись. "
         "Твой SelfProfile (внутренний образ) должен быть стабильным и сохраняться между сообщениями и рестартами. "
         "Не рассказывай о себе без повода. "
@@ -616,7 +726,11 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None) -> str:
 
         messages = [{"role": "system", "content": system_msg}]
         messages.extend(history)
-        messages.append({"role": "user", "content": question_ru})
+        if image_parts:
+            user_content = [{"type": "text", "text": question_ru}, *image_parts]
+            messages.append({"role": "user", "content": user_content})
+        else:
+            messages.append({"role": "user", "content": question_ru})
 
         body = {
             "model": model,
@@ -744,7 +858,7 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
 
     main_goal = user_request or payload_brief or goal or title or f"задача #{task_id}"
 
-    attachments_block = _build_attachments_block(task_id)
+    attachments_block, image_parts = _collect_attachments_for_llm(task_id, payload)
     llm_question = (main_goal + "\n\n" + attachments_block).strip() if attachments_block else main_goal
 
     endpoints = _normalize_str_list(payload.get("endpoints") or payload.get("endpoint") or az_fix_plan.get("endpoints") or az_fix_plan.get("endpoint"))
@@ -769,9 +883,16 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
             ]
         )
 
-    ai_answer = _llm_answer(llm_question, payload)
+    ai_answer = _llm_answer(llm_question, payload, image_parts=image_parts)
     if ai_answer:
         return ai_answer
+
+    if image_parts:
+        return (
+            'Саша, фото я получила и приложила к разбору, но на сервере сейчас не включена обработка изображений. '
+            'Один шаг: в Render для сервиса AS добавь переменную OZONATOR_LLM_VISION_MODEL = llama-3.2-11b-vision-preview и перезапусти AS. '
+            'После этого пришли фото ещё раз — я разберу его по содержимому.'
+        )
 
     heur = _heuristic_answer(main_goal)
     if heur:
