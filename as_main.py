@@ -51,6 +51,7 @@ _ATT_MAX_IMAGES = 4
 _ATT_MAX_IMAGE_BYTES_EACH = 2 * 1024 * 1024
 _ATT_MAX_TOTAL_IMAGE_BYTES = 4 * 1024 * 1024
 
+
 def _ext(name: str) -> str:
     name = (name or "").lower()
     if "." not in name:
@@ -124,78 +125,35 @@ def _preview_xlsx(raw: bytes) -> str:
 
 
 def _guess_image_mime(file_name: str, content_type: str | None = None) -> str:
-    ct = (content_type or '').strip().lower()
-    if ct.startswith('image/'):
+    ct = (content_type or "").strip().lower()
+    if ct.startswith("image/"):
         return ct
     ext = _ext(file_name)
-    if ext in {'jpg', 'jpeg'}:
-        return 'image/jpeg'
-    if ext == 'png':
-        return 'image/png'
-    if ext == 'webp':
-        return 'image/webp'
-    if ext == 'gif':
-        return 'image/gif'
-    return 'image/jpeg'
+    if ext in {"jpg", "jpeg"}:
+        return "image/jpeg"
+    if ext == "png":
+        return "image/png"
+    if ext == "webp":
+        return "image/webp"
+    if ext == "gif":
+        return "image/gif"
+    return "image/jpeg"
 
 
-def _aa_public_download_url(task_id: int, file_id: int, *, sha256: str | None = None) -> str:
-    """Публичный URL, который vision-провайдер сможет подтянуть сам."""
-    base = (os.getenv('AA_PUBLIC_BASE_URL') or os.getenv('OZONATOR_AA_PUBLIC_URL') or 'https://ozonator-aa-dev.onrender.com').rstrip('/')
-    prefix = (os.getenv('AA_PUBLIC_API_PREFIX') or '').strip()
-    if prefix and not prefix.startswith('/'):
-        prefix = '/' + prefix
-    path = f"{prefix}/tasks/{task_id}/files/{file_id}/download"
-    url = base + path
-    if sha256:
-        url = url + f"?v={sha256}"
-    return url
-
-
-def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None) -> tuple[str, list[dict[str, Any]]]:
+def _collect_attachments_for_llm(task_id: int) -> tuple[str, list[dict[str, Any]]]:
     """
     Возвращает:
     1) Текстовый блок-превью вложений (таблицы/текст и пометки о пропусках).
     2) Список image_url частей (OpenAI-compatible) для vision-моделей.
-
-    ВАЖНО: для изображений отдаём публичный URL, а не base64 data-url,
-    чтобы Groq/провайдеры vision гарантированно смогли скачать картинку.
     """
-    payload = payload or {}
     settings = get_settings()
-    db_url = getattr(settings, 'database_url', None)
-
-    # Если БД не настроена — хотя бы покажем метаданные из payload.attachments
+    db_url = getattr(settings, "database_url", None)
     if not db_url:
-        att = payload.get('attachments')
-        if isinstance(att, list) and att:
-            lines = ['Вложения к задаче (метаданные из клиента):']
-            for item in att[:_ATT_MAX_FILES]:
-                if isinstance(item, dict):
-                    name = str(item.get('name') or 'file')
-                    sz = item.get('size_bytes')
-                    suffix = f" ({sz} bytes)" if isinstance(sz, int) else ''
-                    lines.append(f"— {name}{suffix}: (содержимое недоступно на сервере)")
-                else:
-                    lines.append(f"— {str(item)}: (содержимое недоступно на сервере)")
-            return "\n".join(lines).strip(), []
-        return '', []
+        return "", []
 
     ok, files, _message = list_task_files(db_url, task_id)
     if not ok or not files:
-        att = payload.get('attachments')
-        if isinstance(att, list) and att:
-            lines = ['Вложения к задаче (метаданные из клиента):']
-            for item in att[:_ATT_MAX_FILES]:
-                if isinstance(item, dict):
-                    name = str(item.get('name') or 'file')
-                    sz = item.get('size_bytes')
-                    suffix = f" ({sz} bytes)" if isinstance(sz, int) else ''
-                    lines.append(f"— {name}{suffix}: (на сервере не найдено в task_files)")
-                else:
-                    lines.append(f"— {str(item)}: (на сервере не найдено в task_files)")
-            return "\n".join(lines).strip(), []
-        return '', []
+        return "", []
 
     total_text_bytes = 0
     total_image_bytes = 0
@@ -203,70 +161,71 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None) -
     blocks: list[str] = []
 
     for meta in files[:_ATT_MAX_FILES]:
-        file_id = int(meta.get('id') or 0)
-        file_name = str(meta.get('file_name') or f'file_{file_id}')
-        size_bytes = int(meta.get('size_bytes') or 0)
-        content_type = str(meta.get('content_type') or '')
-        sha256 = str(meta.get('sha256') or '')
-
-        ext = _ext(file_name)
-        is_image = ext in {'jpg', 'jpeg', 'png', 'webp', 'gif'} or content_type.lower().startswith('image/')
-
-        if is_image:
-            if len(image_parts) >= _ATT_MAX_IMAGES:
-                blocks.append(f"— {file_name}: (изображение, пропущено — достигнут лимит {_ATT_MAX_IMAGES} шт.)")
-                continue
-            if size_bytes > _ATT_MAX_IMAGE_BYTES_EACH:
-                blocks.append(f"— {file_name}: (изображение, пропущено — слишком большой файл {size_bytes} bytes, лимит {_ATT_MAX_IMAGE_BYTES_EACH})")
-                continue
-            if total_image_bytes + size_bytes > _ATT_MAX_TOTAL_IMAGE_BYTES:
-                blocks.append(f"— {file_name}: (изображение, пропущено — достигнут лимит по суммарному размеру изображений {_ATT_MAX_TOTAL_IMAGE_BYTES} bytes)")
-                continue
-
-            url = _aa_public_download_url(task_id, file_id, sha256=sha256 or None)
-            image_parts.append({'type': 'image_url', 'image_url': {'url': url}})
-            total_image_bytes += size_bytes
-            blocks.append(f"— {file_name}: (изображение, приложено к сообщению)")
-            continue
-
-        if total_text_bytes + size_bytes > _ATT_MAX_TOTAL_BYTES:
-            blocks.append('(достигнут лимит по суммарному размеру текстовых вложений, остальное пропущено)')
-            break
+        file_id = int(meta.get("id") or 0)
+        file_name = str(meta.get("file_name") or f"file_{file_id}")
+        size_bytes = int(meta.get("size_bytes") or 0)
+        content_type = str(meta.get("content_type") or "")
 
         ok_c, _meta_c, content, _msg_c = get_task_file_content(db_url, task_id, file_id)
         if not ok_c or content is None:
             blocks.append(f"— {file_name}: (не удалось загрузить содержимое)")
             continue
 
-        total_text_bytes += len(content)
+        ext = _ext(file_name)
 
-        if ext in {'txt', 'md', 'log', 'json', 'yaml', 'yml'}:
+        # --- Images (vision) ---
+        if ext in {"jpg", "jpeg", "png", "webp", "gif"} or (content_type or "").lower().startswith("image/"):
+            if len(image_parts) >= _ATT_MAX_IMAGES:
+                blocks.append(f"— {file_name}: (изображение, пропущено — достигнут лимит {_ATT_MAX_IMAGES} шт.)")
+                continue
+            if size_bytes > _ATT_MAX_IMAGE_BYTES_EACH:
+                blocks.append(
+                    f"— {file_name}: (изображение, пропущено — слишком большой файл {size_bytes} bytes, лимит {_ATT_MAX_IMAGE_BYTES_EACH})"
+                )
+                continue
+            if total_image_bytes + size_bytes > _ATT_MAX_TOTAL_IMAGE_BYTES:
+                blocks.append(
+                    f"— {file_name}: (изображение, пропущено — достигнут лимит по суммарному размеру изображений {_ATT_MAX_TOTAL_IMAGE_BYTES} bytes)"
+                )
+                continue
+
+            mime = _guess_image_mime(file_name, content_type)
+            b64 = base64.b64encode(content).decode("ascii")
+            data_url = f"data:{mime};base64,{b64}"
+            image_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+            total_image_bytes += size_bytes
+            blocks.append(f"— {file_name}: (изображение, приложено к сообщению)")
+            continue
+
+        # --- Text-like ---
+        if total_text_bytes + size_bytes > _ATT_MAX_TOTAL_BYTES:
+            blocks.append("(достигнут лимит по суммарному размеру текстовых вложений, остальное пропущено)")
+            break
+
+        total_text_bytes += len(content)
+        if ext in {"txt", "md", "log", "json", "yaml", "yml"}:
             txt = _trim_text(_decode_text(content), _ATT_MAX_CHARS_PER_FILE)
             blocks.append(f"— {file_name}\n{txt}")
             continue
-        if ext == 'csv':
+        if ext == "csv":
             txt = _decode_text(content)
             blocks.append(f"— {file_name}\n{_preview_csv(txt, ',', 60)}")
             continue
-        if ext == 'tsv':
+        if ext == "tsv":
             txt = _decode_text(content)
             blocks.append(f"— {file_name}\n{_preview_csv(txt, '\t', 60)}")
             continue
-        if ext in {'xlsx', 'xlsm'}:
+        if ext in {"xlsx", "xlsm"}:
             blocks.append(f"— {file_name}\n{_preview_xlsx(content)}")
             continue
 
         blocks.append(f"— {file_name}: (бинарный формат, автоматический разбор не поддерживается)")
 
     if not blocks and not image_parts:
-        return '', []
+        return "", []
 
-    text_block = ("\n\n".join(['Вложения к задаче (используй их при ответе):', *blocks]).strip()) if blocks else ''
+    text_block = "\n\n".join(["Вложения к задаче (используй их при ответе):", *blocks]).strip() if blocks else ""
     return text_block, image_parts
-
-
-
-
 
 
 def _normalize_str_list(value: Any) -> list[str]:
@@ -578,6 +537,7 @@ def _strip_and_apply_self_profile_updates(text: str) -> str:
 _DEFAULT_GROQ_BASE = "https://api.groq.com/openai/v1"
 _DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
 _DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+_DEFAULT_OPENAI_VISION_MODEL = "gpt-4o-mini"
 
 
 def _clean_api_key(raw: str) -> str:
@@ -589,6 +549,18 @@ def _clean_api_key(raw: str) -> str:
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
         s = s[1:-1].strip()
     s = "".join(ch for ch in s if 33 <= ord(ch) <= 126)
+    return s
+
+def _mask_secrets_in_text(s: str) -> str:
+    """
+    Убирает возможные секреты из диагностических сообщений.
+    Важно: НЕ логируем и НЕ возвращаем ключи.
+    """
+    if not s:
+        return ""
+    s = re.sub(r"gsk_[A-Za-z0-9_\-]{10,}", "gsk_***", s)
+    s = re.sub(r"sk-[A-Za-z0-9]{10,}", "sk-***", s)
+    s = re.sub(r"(?i)bearer\s+[A-Za-z0-9_\-]{10,}", "Bearer ***", s)
     return s
 
 
@@ -665,14 +637,25 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
 
     image_parts = image_parts or []
     if image_parts:
-        # Если есть изображения — выбираем vision-модель (Groq/OpenAI совместимые).
-        vision_model = (os.getenv('OZONATOR_LLM_VISION_MODEL') or os.getenv('GROQ_VISION_MODEL') or '').strip()
+        # Если прилетели изображения — пытаемся выбрать vision-модель.
+        vision_model = (
+            os.getenv("OZONATOR_LLM_VISION_MODEL")
+            or os.getenv("GROQ_VISION_MODEL")
+            or os.getenv("OPENAI_VISION_MODEL")
+            or ""
+        ).strip()
         if vision_model:
             model = vision_model
         else:
-            low_m = (model or '').lower()
-            if key.startswith('gsk_') and ('vision' not in low_m and 'image' not in low_m):
-                model = 'llama-3.2-11b-vision-preview'
+            low_m = (model or "").lower()
+            if key.startswith("gsk_"):
+                # Groq: автоматически выбираем vision-модель
+                if ("vision" not in low_m and "image" not in low_m):
+                    model = "llama-3.2-11b-vision-preview"
+            else:
+                # OpenAI/compatible: если выбрана текстовая модель — переключаемся на vision по умолчанию
+                if ("gpt-4o" not in low_m) and ("vision" not in low_m) and ("image" not in low_m):
+                    model = _DEFAULT_OPENAI_VISION_MODEL
 
     prefs = payload.get("user_prefs") if isinstance(payload.get("user_prefs"), dict) else {}
     user_name = str(prefs.get("user_name") or "Александр").strip() or "Александр"
@@ -761,11 +744,46 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
                 raw = r.read()
         except urllib_error.HTTPError as e:
             status = int(getattr(e, "code", 0) or 0)
+            err_raw = b""
+            try:
+                err_raw = e.read()  # type: ignore[attr-defined]
+            except Exception:
+                err_raw = b""
+
             if status == 403:
-                return "Ошибка: запрос к Groq заблокирован (403 Forbidden)."
+                return "Ошибка: запрос к провайдеру заблокирован (403 Forbidden)."
             if status == 401:
-                return "Ошибка: ключ Groq отклонён (401 Unauthorized)."
-            return ""
+                return "Ошибка: ключ отклонён (401 Unauthorized)."
+
+            # Пытаемся вытащить человекочитаемое сообщение (без секретов)
+            try:
+                if err_raw:
+                    err_data = json.loads(err_raw.decode("utf-8", errors="ignore"))
+                    if isinstance(err_data, dict):
+                        err_obj = err_data.get("error") if isinstance(err_data.get("error"), dict) else {}
+                        msg = err_obj.get("message") if isinstance(err_obj.get("message"), str) else ""
+                        if msg.strip():
+                            msg = _mask_secrets_in_text(msg.strip())
+                            if len(msg) > 240:
+                                msg = msg[:240] + "…"
+                            return f"Ошибка: {msg}"
+            except Exception:
+                pass
+
+            # Фолбэк: короткий снэпшот тела ошибки
+            try:
+                if err_raw:
+                    snippet = err_raw.decode("utf-8", errors="ignore").strip()
+                    snippet = re.sub(r"\s+", " ", snippet)
+                    snippet = _mask_secrets_in_text(snippet)
+                    if snippet:
+                        if len(snippet) > 240:
+                            snippet = snippet[:240] + "…"
+                        return f"Ошибка HTTP {status}: {snippet}"
+            except Exception:
+                pass
+
+            return f"Ошибка HTTP {status} при обращении к провайдеру модели."
 
         data = json.loads(raw.decode("utf-8")) if raw else {}
         return _strip_and_apply_self_profile_updates(_extract_chat_completion_text(data))
@@ -858,8 +876,8 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
 
     main_goal = user_request or payload_brief or goal or title or f"задача #{task_id}"
 
-    attachments_block, image_parts = _collect_attachments_for_llm(task_id, payload)
-    llm_question = (main_goal + "\n\n" + attachments_block).strip() if attachments_block else main_goal
+    attachments_text, image_parts = _collect_attachments_for_llm(task_id)
+    llm_question = (main_goal + "\n\n" + attachments_text).strip() if attachments_text else main_goal
 
     endpoints = _normalize_str_list(payload.get("endpoints") or payload.get("endpoint") or az_fix_plan.get("endpoints") or az_fix_plan.get("endpoint"))
     request_keys = _normalize_str_list(payload.get("request_keys") or payload.get("input_keys") or az_fix_plan.get("request_keys") or az_fix_plan.get("input_keys"))
@@ -886,24 +904,46 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     ai_answer = _llm_answer(llm_question, payload, image_parts=image_parts)
     if ai_answer:
         return ai_answer
-
     if image_parts:
+        key = _pick_llm_key()
+        if not key:
+            return (
+                "Саша, я получила фото, но на сервере сейчас не настроен ключ для обращения к провайдеру модели. "
+                "Поэтому я отвечаю в офлайн-режиме и картинки разобрать не могу. "
+                "Один шаг: в Render → сервис AS → Environment добавь GROQ_API_KEY (предпочтительно) "
+                "или OPENAI_API_KEY и перезапусти AS. После этого снова отправь фото — я разберу его."
+            )
+
+        probe = _llm_answer("Ответь одним словом: ОК.", payload)
+        if not probe or probe.strip().lower().startswith("ошибка"):
+            # Если текстовый вызов тоже не проходит — это не про vision, а про доступ/ключ/URL
+            base_hint = (
+                "GROQ_API_KEY (предпочтительно)" if key.startswith("gsk_") else "OPENAI_API_KEY"
+            )
+            return (
+                "Саша, я получила фото, но сейчас сервер не может нормально обратиться к провайдеру модели (ключ/URL/доступ). "
+                f"Один шаг: в Render → сервис AS → Environment проверь {base_hint} (и при необходимости OPENAI_API_URL), "
+                "затем перезапусти AS. После этого снова отправь фото."
+            )
+
+        provider = "Groq" if key.startswith("gsk_") else "OpenAI/compatible"
+        rec_model = "llama-3.2-11b-vision-preview" if key.startswith("gsk_") else _DEFAULT_OPENAI_VISION_MODEL
         return (
-            'Саша, фото я получила и приложила к разбору, но на сервере сейчас не включена обработка изображений. '
-            'Один шаг: в Render для сервиса AS добавь переменную OZONATOR_LLM_VISION_MODEL = llama-3.2-11b-vision-preview и перезапусти AS. '
-            'После этого пришли фото ещё раз — я разберу его по содержимому.'
+            f"Саша, я получила фото, но провайдер {provider} не принял изображение в текущей настройке модели. "
+            f"Один шаг: в Render → сервис AS → Environment задай OZONATOR_LLM_VISION_MODEL = {rec_model} и перезапусти AS. "
+            "После этого снова отправь фото — я разберу его по содержимому."
         )
 
-    heur = _heuristic_answer(main_goal)
+    heur = _heuristic_answer(main_goal)(main_goal)
     if heur:
         return heur
 
-    parts = [f"Готово. Подготовлено решение по задаче: {main_goal}."]
+    parts = [f"Готово. Я подготовила решение по задаче: {main_goal}."]
     if screen and screen != "Не указано":
         parts.append(f"Область: {screen}.")
     if target_columns:
         parts.append(f"Целевые элементы: {', '.join(target_columns)}.")
-    parts.append("Артефакты собраны и переданы на проверку AK.")
+    parts.append("Я собрала артефакты и передала их на проверку AK.")
     return " ".join(parts)
 
 
