@@ -527,6 +527,9 @@ class App(tk.Tk):
         self.btn_logs = tk.Button(header, text="Логи", command=self._open_logs)
         self.btn_logs.pack(side=tk.RIGHT)
 
+        self.btn_settings = tk.Button(header, text="Настройки", command=self._open_settings)
+        self.btn_settings.pack(side=tk.RIGHT, padx=(0, 8))
+
         # Chat area
         body = tk.Frame(self, padx=10, pady=6)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -550,8 +553,6 @@ class App(tk.Tk):
         self.btn_files.pack(side=tk.LEFT)
 
         self.var_share_geo = tk.BooleanVar(value=bool(getattr(self, "_share_geo", True)))
-        self.chk_geo = tk.Checkbutton(bottom, text="📍", variable=self.var_share_geo, command=self._on_toggle_geo)
-        self.chk_geo.pack(side=tk.LEFT, padx=(6, 6))
 
         input_wrap = tk.Frame(bottom)
         input_wrap.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
@@ -586,6 +587,28 @@ class App(tk.Tk):
         self.btn_send.create_oval(2, 2, 44, 44, fill="#2b2b2b", outline="")
         # small arrow
         self.btn_send.create_polygon(20, 15, 32, 23, 20, 31, 22, 23, fill="white", outline="white")
+
+
+    def _clean_aa_text(self, text: str) -> str:
+
+        """Убираем служебные маркеры из ответа Екатерины, чтобы не показывать пользователю."""
+
+        if not isinstance(text, str):
+
+            return ""
+
+        t = text
+
+        # Полный блок
+
+        t = re.sub(r"\[\[EK_SELF_PROFILE_UPDATE\]\].*?(\[\[/EK_SELF_PROFILE_UPDATE\]\])", "", t, flags=re.S)
+
+        # Если блок обрезан и закрывающий тег не пришёл
+
+        t = re.sub(r"\[\[EK_SELF_PROFILE_UPDATE\]\].*$", "", t, flags=re.S)
+
+        return t.strip()
+
 
     def _append_with_stamp(self, stamp: str, who: str, text: str):
         self.chat.configure(state="normal")
@@ -1062,6 +1085,106 @@ class App(tk.Tk):
             return None
 
         return None
+
+
+    def _open_settings(self):
+        # Одно окно настроек
+        try:
+            if getattr(self, "_settings_win", None) is not None and self._settings_win.winfo_exists():
+                self._settings_win.lift()
+                self._settings_win.focus_force()
+                return
+        except Exception:
+            pass
+
+        win = tk.Toplevel(self)
+        win.title("Настройки")
+        win.resizable(False, False)
+        win.transient(self)
+        win.grab_set()
+        self._settings_win = win
+
+        frm = tk.Frame(win, padx=12, pady=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(frm, text="Геопозиция", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+
+        cb = tk.Checkbutton(
+            frm,
+            text="Передавать геопозицию (примерно по IP)",
+            variable=self.var_share_geo,
+            command=self._on_toggle_geo,
+        )
+        cb.pack(anchor="w", pady=(6, 4))
+
+        self._geo_status_var = tk.StringVar(value=self._format_geo_status())
+        tk.Label(frm, textvariable=self._geo_status_var, wraplength=380, justify="left").pack(anchor="w", pady=(0, 10))
+
+        btns = tk.Frame(frm)
+        btns.pack(fill=tk.X)
+
+        tk.Button(btns, text="Обновить гео", command=self._refresh_geo_now).pack(side=tk.LEFT)
+        tk.Button(btns, text="Очистить кэш", command=self._clear_geo_cache).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(btns, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+    def _format_geo_status(self) -> str:
+        try:
+            geo = self._get_geo()
+            if not geo:
+                if getattr(self, "_share_geo", False):
+                    return "Гео: включено, но ещё не определено. Нажми «Обновить гео»."
+                return "Гео: выключено."
+
+            parts = []
+            for k in ("city", "region", "country"):
+                v = geo.get(k)
+                if v:
+                    parts.append(str(v))
+            place = ", ".join(parts) if parts else "неизвестно"
+            lat = geo.get("lat")
+            lon = geo.get("lon")
+            if lat is not None and lon is not None:
+                return f"Гео: {place} (lat={lat:.5f}, lon={lon:.5f})"
+            return f"Гео: {place}"
+        except Exception:
+            return "Гео: не удалось определить."
+
+    def _refresh_geo_now(self):
+        try:
+            if not getattr(self, "_share_geo", False):
+                messagebox.showinfo("Геопозиция", "Сначала включи передачу геопозиции.")
+                return
+            geo = self._fetch_geo_by_ip()
+            if geo:
+                path = self._geo_state_path()
+                _write_json_atomic(
+                    path,
+                    {
+                        "version": 1,
+                        "fetched_at": datetime.now(timezone.utc).isoformat(),
+                        "geo": geo,
+                    },
+                )
+            if getattr(self, "_geo_status_var", None) is not None:
+                self._geo_status_var.set(self._format_geo_status())
+        except Exception:
+            pass
+
+    def _clear_geo_cache(self):
+        try:
+            path = self._geo_state_path()
+            try:
+                import os
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+            if getattr(self, "_geo_status_var", None) is not None:
+                self._geo_status_var.set(self._format_geo_status())
+        except Exception:
+            pass
 
     def _install_context_menus(self):
         # Контекстное меню для поля ввода

@@ -1135,6 +1135,25 @@ def _strip_and_apply_self_profile_updates(text: str) -> str:
             pass
         cleaned = cleaned.replace(m.group(0), "")
 
+
+
+    # 1b) Если модель вывела маркер, но не закрыла тег (или ответ обрезался) —
+    # убираем всё от маркера до конца и, если возможно, применяем JSON.
+    open_tok = "[[EK_SELF_PROFILE_UPDATE]]"
+    if open_tok in cleaned:
+        start = cleaned.rfind(open_tok)
+        tail = cleaned[start + len(open_tok):].strip()
+        json_part = tail
+        close_tok = "[[/EK_SELF_PROFILE_UPDATE]]"
+        if close_tok in tail:
+            json_part = tail.split(close_tok, 1)[0].strip()
+        try:
+            upd = json.loads(json_part)
+            if isinstance(upd, dict):
+                _apply_self_profile_update(upd)
+        except Exception:
+            pass
+        cleaned = cleaned[:start].rstrip()
     # 2) На случай, если модель вернула update как JSON-«tool call» в конце:
     #    [[ "EK_SELF_PROFILE_UPDATE" ], { "set":..., "delete":... }]
     if "EK_SELF_PROFILE_UPDATE" in cleaned:
@@ -1423,8 +1442,8 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
         "Если по контексту нельзя понять, что требуется (или не хватает критичных данных), задай ОДИН уточняющий вопрос и остановись. "
         "Твой SelfProfile (внутренний образ) должен быть стабильным и сохраняться между сообщениями и рестартами. "
         "Не рассказывай о себе без повода. "
-        "Если в ответе всё же прозвучал ЛЮБОЙ факт о тебе — зафиксируй его скрытым update-блоком в самом конце ответа без пояснений: "
-        "[[EK_SELF_PROFILE_UPDATE]]{\"set\":{},\"delete\":[]}[[/EK_SELF_PROFILE_UPDATE]] "
+        "Если нужно обновить твой SelfProfile (например, ты сообщила новый факт о себе) — добавь в самом конце скрытый блок без пояснений: "
+        "[[EK_SELF_PROFILE_UPDATE]]{\"set\":{...},\"delete\":[...]}[[/EK_SELF_PROFILE_UPDATE]]. Никогда не добавляй этот блок, если set и delete пустые. "
         f"SelfProfile(JSON): {json.dumps(prof, ensure_ascii=False)}"
     )
 
@@ -1765,6 +1784,7 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
 
     ai_answer = _llm_answer(llm_question, payload, image_parts=image_parts)
     if ai_answer:
+        ai_answer = _strip_and_apply_self_profile_updates(ai_answer)
         return _enforce_feminine_ru(ai_answer)
 
     if image_parts:
