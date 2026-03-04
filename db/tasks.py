@@ -284,3 +284,89 @@ def get_task_logs(
 
     except Exception as e:
         return False, None, f"Ошибка чтения логов: {e.__class__.__name__}"
+
+
+def list_recent_user_tasks(
+    database_url: str | None,
+    user_key: str | None = None,
+    user_name: str | None = None,
+    limit: int = 30,
+) -> tuple[bool, list[dict[str, Any]] | None, str]:
+    """Возвращает последние user_task для восстановления истории в клиенте.
+
+    Берём только корневые задачи (parent_task_id IS NULL), чтобы не показывать внутренние подзадачи агентов.
+    """
+    if not database_url:
+        return False, None, "DATABASE_URL не задан"
+
+    user_key = (user_key or "").strip()
+    user_name = (user_name or "").strip()
+    limit = max(1, min(int(limit or 30), 200))
+
+    conditions = []
+    params: list[Any] = []
+
+    if user_key:
+        conditions.append("payload->>'user_key' = %s")
+        params.append(user_key)
+
+    # fallback для старых задач (когда user_key ещё не передавался)
+    if user_name:
+        conditions.append("(payload->'user_prefs'->>'user_name' = %s AND COALESCE(payload->>'user_key','') = '')")
+        params.append(user_name)
+
+    if not conditions:
+        return True, [], "OK"
+
+    where_expr = " OR ".join(conditions)
+
+    try:
+        with psycopg.connect(database_url, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, status, payload, result, created_at
+                    FROM tasks
+                    WHERE task_type = 'user_task'
+                      AND parent_task_id IS NULL
+                      AND ({where_expr})
+                    ORDER BY id DESC
+                    LIMIT %s;
+                    """,
+                    (*params, limit),
+                )
+                rows = cur.fetchall()
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            task_id = int(row[0])
+            status = str(row[1] or "")
+            payload = row[2] if row[2] is not None else {}
+            result = row[3] if row[3] is not None else {}
+            created_at = row[4].isoformat() if row[4] else None
+
+            if not isinstance(payload, dict):
+                payload = {}
+            if not isinstance(result, dict):
+                result = {}
+
+            user_request = str(payload.get("user_request") or "").strip()
+            final_answer = str(result.get("final_answer") or "").strip()
+
+            # показываем только пары, где есть хотя бы вопрос
+            if not user_request and not final_answer:
+                continue
+
+            items.append(
+                {
+                    "task_id": task_id,
+                    "status": status,
+                    "created_at": created_at,
+                    "user_request": user_request,
+                    "final_answer": final_answer,
+                }
+            )
+
+        return True, items, "OK"
+    except Exception as e:
+        return False, None, f"Ошибка списка задач: {e.__class__.__name__}"
