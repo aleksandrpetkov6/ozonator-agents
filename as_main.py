@@ -31,7 +31,7 @@ from db.tasks import (
     update_task_status,
     write_orchestration_log,
 )
-from db.files import get_task_file_content, list_task_files
+from db.files import add_task_file, get_task_file_content, list_task_files
 
 app = FastAPI(title="Ozonator Agents AS")
 
@@ -198,6 +198,405 @@ def _guess_image_mime(file_name: str, content_type: str | None = None) -> str:
 # Groq: base64 encoded image request max is 4MB (base64 payload)
 # (см. Groq Vision docs)
 _MAX_GROQ_BASE64_IMAGE_CHARS = 4 * 1024 * 1024
+
+
+
+# -------------------------
+# Web search & downloads
+# -------------------------
+# Включается по явным словам («найди в интернете», «проверь источники», «дай ссылку») или OZONATOR_WEB_DEFAULT_ON=1.
+_WEB_DEFAULT_ON = bool(int(os.getenv("OZONATOR_WEB_DEFAULT_ON", "0") or 0))
+_WEB_SEARCH_MAX_RESULTS = int(os.getenv("OZONATOR_WEB_SEARCH_MAX_RESULTS", "6") or 6)
+_WEB_TIMEOUT_SECONDS = float(os.getenv("OZONATOR_WEB_TIMEOUT_SECONDS", "12") or 12)
+_WEB_FETCH_MAX_BYTES = int(os.getenv("OZONATOR_WEB_FETCH_MAX_BYTES", "2000000") or 2000000)  # 2MB
+_WEB_RESULT_TEXT_MAX_CHARS = int(os.getenv("OZONATOR_WEB_RESULT_TEXT_MAX_CHARS", "120000") or 120000)
+_WEB_USER_AGENT = (os.getenv("OZONATOR_WEB_USER_AGENT") or "OzonatorAgents-AS/web").strip()
+
+# Защита от очевидных пиратских/торрент‑доментов. Список намеренно короткий — не «гоняемся» за всеми.
+_WEB_BLOCK_DOMAIN_SUBSTR = {
+    "torrent", "rutor", "rutacker", "thepiratebay", "piratebay", "1337x", "yts", "rarbg", "kinozal", "lostfilm",
+    "nnmclub", "zaycev", "seasonvar", "rezka", "lorda", "filmix", "hdrezka",
+}
+
+
+def _looks_like_web_request(text_ru: str) -> bool:
+    t = (text_ru or "").lower()
+    if _WEB_DEFAULT_ON:
+        return True
+    triggers = [
+        "в интернете",
+        "в инете",
+        "интернет",
+        "найди",
+        "поиск",
+        "загугли",
+        "погугли",
+        "ссылк",
+        "источник",
+        "пруф",
+        "подтверди",
+        "проверь",
+        "что пишут",
+    ]
+    return any(x in t for x in triggers)
+
+
+def _extract_urls(text_ru: str) -> list[str]:
+    t = text_ru or ""
+    # базовый URL regex
+    urls = re.findall(r"https?://[^\s<>\]\)\}\"']+", t)
+    # обрежем хвостовые знаки
+    cleaned: list[str] = []
+    for u in urls:
+        u2 = u.rstrip(".,;:!?)\"]}")
+        if u2 and u2 not in cleaned:
+            cleaned.append(u2)
+    return cleaned
+
+
+def _is_piracy_intent(text_ru: str) -> bool:
+    t = (text_ru or "").lower()
+    # запросы на скачивание фильмов/сериалов/игр и т.п.
+    piracy_words = [
+        "скачать фильм",
+        "скачать сериал",
+        "скачать серии",
+        "скачай фильм",
+        "скачай сериал",
+        "торрент",
+        "magnet",
+        "пират",
+        "bittorrent",
+        "crack",
+        "взлом",
+        "keygen",
+        "warez",
+    ]
+    return any(w in t for w in piracy_words)
+
+
+def _piracy_guardrail_answer(text_ru: str) -> str:
+    if not _is_piracy_intent(text_ru):
+        return ""
+    # важно: не предлагать торренты. Даём легальные варианты.
+    return (
+        "Саша, я не могу помогать со скачиванием пиратских копий фильмов/сериалов. "
+        "Если тебе нужно смотреть офлайн (например, в поездке), самый надёжный вариант — "
+        "скачать эпизоды внутри официального сервиса, где у тебя есть доступ (обычно это кнопка «Download/Скачать» в приложении). "
+        "Если скажешь страну и какие сервисы у тебя есть (подписки), я подскажу самый короткий путь."
+    )
+
+
+def _ddg_search(query: str, max_results: int) -> list[dict[str, str]]:
+    """Поиск через DuckDuckGo (lite/html) без ключей. Возвращает список {title,url,snippet}."""
+    import urllib.request as urllib_request
+    import urllib.parse as urllib_parse
+
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    def fetch(url: str) -> str:
+        req = urllib_request.Request(url, headers={"User-Agent": _WEB_USER_AGENT})
+        with urllib_request.urlopen(req, timeout=_WEB_TIMEOUT_SECONDS) as r:
+            data = r.read(_WEB_FETCH_MAX_BYTES)
+        return _decode_text(data)
+
+    results: list[dict[str, str]] = []
+
+    # 1) lite
+    try:
+        url = "https://lite.duckduckgo.com/lite/?" + urllib_parse.urlencode({"q": q})
+        html = fetch(url)
+        # На lite результаты обычно в <a rel="nofollow" class="result-link" href="...">Title</a>
+        for m in re.finditer(r'<a[^>]+class="result-link"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.I | re.S):
+            link = m.group(1)
+            title = re.sub(r"<.*?>", "", m.group(2) or "").strip()
+            if not link or not title:
+                continue
+            if link.startswith("//"):
+                link = "https:" + link
+            # сниппет в lite искать сложно — оставим пустым
+            results.append({"title": title, "url": link, "snippet": ""})
+            if len(results) >= max_results:
+                break
+    except Exception:
+        pass
+
+    if results:
+        return results
+
+    # 2) html
+    try:
+        url = "https://duckduckgo.com/html/?" + urllib_parse.urlencode({"q": q})
+        html = fetch(url)
+        # <a rel="nofollow" class="result__a" href="...">Title</a>
+        for m in re.finditer(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.I | re.S):
+            link = m.group(1)
+            title = re.sub(r"<.*?>", "", m.group(2) or "").strip()
+            if not link or not title:
+                continue
+            results.append({"title": title, "url": link, "snippet": ""})
+            if len(results) >= max_results:
+                break
+    except Exception:
+        pass
+
+    return results
+
+
+def _is_blocked_domain(url: str) -> bool:
+    u = (url or "").lower()
+    return any(bad in u for bad in _WEB_BLOCK_DOMAIN_SUBSTR)
+
+
+def _web_search(query: str, max_results: int | None = None) -> list[dict[str, str]]:
+    max_results = int(max_results or _WEB_SEARCH_MAX_RESULTS)
+    items = _ddg_search(query, max_results=max_results)
+    # фильтр доменов
+    filtered: list[dict[str, str]] = []
+    for it in items:
+        url = (it.get("url") or "").strip()
+        if not url or _is_blocked_domain(url):
+            continue
+        filtered.append({
+            "title": (it.get("title") or "").strip(),
+            "url": url,
+            "snippet": (it.get("snippet") or "").strip(),
+        })
+        if len(filtered) >= max_results:
+            break
+    return filtered
+
+
+def _fetch_url_bytes(url: str, *, max_bytes: int | None = None) -> tuple[bytes, str]:
+    import urllib.request as urllib_request
+    import urllib.error as urllib_error
+
+    max_bytes = int(max_bytes or _WEB_FETCH_MAX_BYTES)
+    req = urllib_request.Request(url, headers={"User-Agent": _WEB_USER_AGENT})
+    try:
+        with urllib_request.urlopen(req, timeout=_WEB_TIMEOUT_SECONDS) as r:
+            ct = (r.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip()
+            data = r.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                data = data[:max_bytes]
+            return data, ct
+    except urllib_error.HTTPError as e:
+        # попробуем вычитать тело ошибки (иногда там редирект/объяснение)
+        try:
+            data = e.read(max_bytes)
+        except Exception:
+            data = b""
+        ct = (getattr(e, "headers", None) or {}).get("Content-Type") if hasattr(e, "headers") else None
+        ct = (ct or "application/octet-stream").split(";")[0].strip()
+        return data, ct
+
+
+def _strip_html_tags(html: str) -> str:
+    if not html:
+        return ""
+    # выкинем script/style
+    html = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
+    html = re.sub(r"<style[\s\S]*?</style>", " ", html, flags=re.I)
+    txt = re.sub(r"<[^>]+>", " ", html)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
+
+
+def _requested_export_format(text_ru: str) -> str:
+    t = (text_ru or "").lower()
+    # приоритетно — явные форматы
+    for fmt in ["xlsx", "csv", "tsv", "json", "txt", "md", "html", "xml", "pdf"]:
+        if fmt in t:
+            return fmt
+    if "таблиц" in t or "csv" in t:
+        return "csv"
+    if "файл" in t or "скачив" in t or "для скач" in t:
+        return "md"
+    return ""
+
+
+def _save_web_results_as_file(task_id: int, database_url: str | None, query: str, results: list[dict[str, str]], fmt: str) -> tuple[str, str]:
+    """Сохраняет результаты поиска в task_files. Возвращает (file_name, note_text)."""
+    if not database_url:
+        return "", ""
+
+    fmt = (fmt or "md").lower().strip()
+    if fmt == "pdf":
+        fmt = "md"  # pdf пока не генерируем
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    base = f"internet_{stamp}_{uuid.uuid4().hex[:6]}"
+
+    content: bytes
+    content_type: str
+    file_name: str
+
+    if fmt in {"md", "txt", "html", "xml"}:
+        lines = []
+        lines.append(f"Запрос: {query}")
+        lines.append(f"UTC: {datetime.now(timezone.utc).isoformat()}")
+        lines.append("")
+        for i, r in enumerate(results, start=1):
+            title = r.get("title") or "(без названия)"
+            url = r.get("url") or ""
+            snip = (r.get("snippet") or "").strip()
+            lines.append(f"{i}. {title}")
+            lines.append(f"   {url}")
+            if snip:
+                lines.append(f"   {snip}")
+            lines.append("")
+        body = "\n".join(lines).strip() + "\n"
+        body = _trim_text(body, _WEB_RESULT_TEXT_MAX_CHARS)
+        content = body.encode("utf-8")
+        if fmt == "txt":
+            content_type = "text/plain"
+            file_name = base + ".txt"
+        elif fmt == "html":
+            content_type = "text/html"
+            file_name = base + ".html"
+        elif fmt == "xml":
+            content_type = "application/xml"
+            file_name = base + ".xml"
+        else:
+            content_type = "text/markdown"
+            file_name = base + ".md"
+
+    elif fmt in {"csv", "tsv"}:
+        delim = "," if fmt == "csv" else "\t"
+        buf = io.StringIO()
+        w = csv.writer(buf, delimiter=delim)
+        w.writerow(["title", "url", "snippet"])
+        for r in results:
+            w.writerow([r.get("title") or "", r.get("url") or "", r.get("snippet") or ""])
+        content = buf.getvalue().encode("utf-8")
+        content_type = "text/csv" if fmt == "csv" else "text/tab-separated-values"
+        file_name = base + "." + fmt
+
+    elif fmt == "json":
+        payload = {"query": query, "utc": datetime.now(timezone.utc).isoformat(), "results": results}
+        content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        content_type = "application/json"
+        file_name = base + ".json"
+
+    elif fmt == "xlsx":
+        try:
+            from openpyxl import Workbook
+        except Exception:
+            # fallback
+            return _save_web_results_as_file(task_id, database_url, query, results, fmt="csv")
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "results"
+        ws.append(["title", "url", "snippet"])
+        for r in results:
+            ws.append([r.get("title") or "", r.get("url") or "", r.get("snippet") or ""])
+        bio = io.BytesIO()
+        wb.save(bio)
+        content = bio.getvalue()
+        content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        file_name = base + ".xlsx"
+
+    else:
+        # неизвестный формат — md
+        return _save_web_results_as_file(task_id, database_url, query, results, fmt="md")
+
+    ok, meta, msg = add_task_file(database_url, task_id=task_id, file_name=file_name, content_type=content_type, content=content)
+    if not ok:
+        return "", ""
+
+    note = f"Я подготовила файл «{file_name}» для скачивания (кнопка «Скачать»)."
+    return file_name, note
+
+
+def _maybe_prepare_web_context(task_id: int, task: dict[str, Any], payload: dict[str, Any], user_text: str) -> tuple[str, str]:
+    """Возвращает (web_context_text, notice_for_user)."""
+    if not _looks_like_web_request(user_text):
+        return "", ""
+
+    # безопасность: если это явный запрос пиратского контента — не ищем ссылки.
+    guard = _piracy_guardrail_answer(user_text)
+    if guard:
+        return "", guard
+
+    query = (user_text or "").strip()
+    results = _web_search(query, max_results=_WEB_SEARCH_MAX_RESULTS)
+    if not results:
+        return "", ""
+
+    # Сформируем компактный блок для LLM
+    lines = ["WEB_SEARCH_RESULTS:"]
+    for i, r in enumerate(results, start=1):
+        title = r.get("title") or "(без названия)"
+        url = r.get("url") or ""
+        snip = (r.get("snippet") or "").strip()
+        if snip:
+            lines.append(f"{i}. {title} — {url} — {snip}")
+        else:
+            lines.append(f"{i}. {title} — {url}")
+
+    web_context = "\n".join(lines).strip()
+
+    fmt = _requested_export_format(user_text) or "md"
+    settings = get_settings()
+    _fname, notice = _save_web_results_as_file(task_id, settings.database_url, query=query, results=results, fmt=fmt)
+    # notice может быть пустым при проблеме с БД — в этом случае просто не обещаем скачать.
+    return web_context, notice
+
+
+def _maybe_download_url_to_task(task_id: int, payload: dict[str, Any], user_text: str) -> str:
+    """Если пользователь просит скачать файл по URL — скачиваем и кладём в task_files."""
+    t = (user_text or "").lower()
+    if not any(k in t for k in ["скачай", "скачать", "загрузи", "download", "сохрани", "пришли файл", "дай файл"]):
+        return ""
+
+    urls = _extract_urls(user_text)
+    if not urls:
+        return ""
+
+    if _is_piracy_intent(user_text):
+        return _piracy_guardrail_answer(user_text)
+
+    settings = get_settings()
+    if not settings.database_url:
+        return "Саша, у меня сейчас не настроена база данных для сохранения файлов."
+
+    # берём первый URL
+    url = urls[0]
+    raw, ct = _fetch_url_bytes(url, max_bytes=_WEB_FETCH_MAX_BYTES)
+    # блокируем видео/аудио
+    if (ct or "").startswith("video/") or (ct or "").startswith("audio/") or _ext(url) in _VIDEO_EXTS or _ext(url) in _AUDIO_EXTS:
+        return (
+            "Саша, я не могу скачивать и пересылать медиафайлы. "
+            "Если это документ (PDF/таблица/текст) — пришли ссылку на документ или уточни формат."
+        )
+
+    if not raw:
+        return "Саша, я попробовала скачать файл, но сервер вернул пустой ответ."
+
+    # имя файла из URL
+    from urllib.parse import urlparse
+
+    path = urlparse(url).path
+    name = (path.rsplit("/", 1)[-1] if path else "download") or "download"
+    if len(name) > 120:
+        name = name[:120]
+    if "." not in name:
+        # добавим расширение по content-type
+        if ct == "application/pdf":
+            name += ".pdf"
+        elif ct.startswith("text/"):
+            name += ".txt"
+        elif ct == "application/json":
+            name += ".json"
+
+    ok, meta, msg = add_task_file(settings.database_url, task_id=task_id, file_name=name, content_type=ct, content=raw)
+    if not ok:
+        return "Саша, я скачала файл, но не смогла сохранить его для выдачи."
+
+    return f"Саша, я скачала файл по ссылке и подготовила его для тебя: «{name}». Нажми «Скачать» в клиенте."
 
 
 def _prepare_image_for_vision(file_name: str, content_type: str, raw: bytes) -> tuple[bytes, str]:
@@ -1469,7 +1868,7 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
         f"{forbid_ai_line} "
         "Отвечай на русском, кратко, точно и по делу. "
         "Восклицательные знаки используй только при крайней необходимости; в письмах «!» воспринимается как крик. "
-        "Всегда опирайся ТОЛЬКО на факты из последнего сообщения пользователя и переданной истории диалога. Если пользователь спрашивает о том, что было раньше, отвечай только по переданной истории. Если в истории этого нет — прямо скажи, что в текущей истории этого нет, и попроси прислать нужный фрагмент. "
+        "Всегда опирайся ТОЛЬКО на факты из последнего сообщения пользователя и переданной истории диалога. Если во входном сообщении есть блок WEB_SEARCH_RESULTS или сохранённые выдержки из веб‑страниц — это тоже факты, используй их и давай ссылки. Не предлагай торренты, пиратские сайты и любые способы нелегального получения контента.  Если пользователь спрашивает о том, что было раньше, отвечай только по переданной истории. Если в истории этого нет — прямо скажи, что в текущей истории этого нет, и попроси прислать нужный фрагмент. "
         "НЕ гадай и НЕ перечисляй возможные трактовки. "
         "Если во входном сообщении есть изображения — они переданы тебе, анализируй их. НИКОГДА не утверждай, что ты их не видишь. НИКОГДА не делай предположений о личности людей на фото (например, что это пользователь), если он сам это не сказал. "
         "Если по контексту нельзя понять, что требуется (или не хватает критичных данных), задай ОДИН уточняющий вопрос и остановись. "
@@ -2398,9 +2797,30 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     if file_answer:
         return file_answer
 
+    piracy_answer = _piracy_guardrail_answer(main_goal)
+    if piracy_answer:
+        return piracy_answer
+
+    download_answer = _maybe_download_url_to_task(task_id, payload, main_goal)
+    if download_answer:
+        return download_answer
+
+    web_context, web_notice = _maybe_prepare_web_context(task_id, task, payload, main_goal)
+    if web_notice and not web_context:
+        return web_notice
+
+    if web_context:
+        if attachments_text:
+            llm_question = (main_goal + "\n\n" + web_context + "\n\n" + attachments_text).strip()
+        else:
+            llm_question = (main_goal + "\n\n" + web_context).strip()
+
     ai_answer = _llm_answer(llm_question, payload, image_parts=image_parts)
     if ai_answer:
         ai_answer = _strip_and_apply_self_profile_updates(ai_answer)
+        if 'web_notice' in locals() and web_notice:
+            if web_notice not in ai_answer:
+                ai_answer = ai_answer.rstrip() + "\n\n" + web_notice
         return _enforce_feminine_ru(ai_answer)
 
     if image_parts:
