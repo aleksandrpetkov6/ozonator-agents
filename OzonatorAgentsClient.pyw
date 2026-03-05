@@ -415,6 +415,73 @@ class AAClient:
                 return resp.data["logs"]
         return []
 
+    def list_task_files(self, task_id: int) -> list[dict]:
+        for pref in self._prefixes():
+            self.api_prefix = pref
+            url = self._mk(f"/tasks/{task_id}/files")
+            resp = self._request_json("GET", url, None)
+            if resp.ok and resp.data and isinstance(resp.data.get("files"), list):
+                return resp.data.get("files") or []
+        return []
+
+    def download_task_file(self, task_id: int, file_id: int) -> bytes:
+        headers = self._headers().copy()
+        headers.pop("Content-Type", None)
+        headers["Accept"] = "*/*"
+
+        last_err = None
+        for pref in self._prefixes():
+            self.api_prefix = pref
+            url = self._mk(f"/tasks/{task_id}/files/{file_id}/download")
+            req = urllib_request.Request(url, headers=headers, method="GET")
+            try:
+                with urllib_request.urlopen(req, timeout=max(HTTP_TIMEOUT, 180)) as r:
+                    return r.read() or b""
+            except urllib_error.HTTPError as e:
+                last_err = f"HTTPError {int(getattr(e, 'code', 0) or 0)}"
+            except urllib_error.URLError as e:
+                last_err = f"URLError: {e}"
+            except Exception as e:
+                last_err = f"{e.__class__.__name__}: {e}"
+
+        raise RuntimeError(last_err or "download_failed")
+
+    def upload_file_bytes(self, task_id: int, file_name: str, content_type: str, content: bytes, note: str = "отправлен оригинал") -> None:
+        boundary = "----ozonatorboundary" + uuid.uuid4().hex
+        head = (
+            f"--{boundary}\r\n"
+            f"Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n"
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+        tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        body = head + (content or b"") + tail
+
+        dyn = int(len(body) / 180_000) + 45
+        upload_timeout = max(UPLOAD_TIMEOUT, dyn)
+        upload_timeout = min(upload_timeout, 900)
+
+        last_err = None
+        for attempt in range(UPLOAD_RETRIES + 1):
+            for pref in self._prefixes():
+                self.api_prefix = pref
+                url = self._mk(f"/tasks/{task_id}/files/upload")
+                headers = self._headers().copy()
+                headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+                headers["Accept"] = "application/json"
+
+                resp = self._request_raw("POST", url, body, headers, timeout=upload_timeout)
+                if resp.ok:
+                    return
+
+                detail = ""
+                if isinstance(resp.data, dict):
+                    detail = str(resp.data.get("detail") or resp.data.get("message") or "").strip()
+                last_err = (f"{resp.error or 'upload_failed'} (status={resp.status}) {detail}").strip()
+
+            time.sleep(0.9 * (attempt + 1))
+
+        raise RuntimeError((last_err or "upload_failed") + f"; note={note}")
+
     def get_recent_history(self, user_key: str, user_name: str | None = None, limit: int = 30) -> list[dict]:
         """Пытается восстановить историю с сервера (если локальный файл отсутствует).
 
@@ -444,45 +511,7 @@ class AAClient:
     def upload_file(self, task_id: int, file_path: str) -> None:
 
         upload_name, ctype, content, note = _prepare_file_for_upload(file_path)
-
-        boundary = "----ozonatorboundary" + uuid.uuid4().hex
-        head = (
-            f"--{boundary}\r\n"
-            f"Content-Disposition: form-data; name=\"file\"; filename=\"{upload_name}\"\r\n"
-            f"Content-Type: {ctype}\r\n\r\n"
-        ).encode("utf-8")
-        tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
-        body = head + content + tail
-
-        # Динамический таймаут: чем больше тело — тем больше даём времени.
-        # Для превью обычно это <1MB и таймаут становится коротким.
-        dyn = int(len(body) / 180_000) + 45  # ~0.18MB/s + запас
-        upload_timeout = max(UPLOAD_TIMEOUT, dyn)
-        upload_timeout = min(upload_timeout, 900)
-
-        last_err = None
-        for attempt in range(UPLOAD_RETRIES + 1):
-            for pref in self._prefixes():
-                self.api_prefix = pref
-                url = self._mk(f"/tasks/{task_id}/files/upload")
-                headers = self._headers().copy()
-                headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
-                headers["Accept"] = "application/json"
-
-                resp = self._request_raw("POST", url, body, headers, timeout=upload_timeout)
-                if resp.ok:
-                    return
-
-                detail = ""
-                if isinstance(resp.data, dict):
-                    detail = str(resp.data.get("detail") or resp.data.get("message") or "").strip()
-                last_err = (f"{resp.error or 'upload_failed'} (status={resp.status}) {detail}").strip()
-
-            # сетевые/таймауты — ретраим с небольшим backoff
-            time.sleep(0.9 * (attempt + 1))
-
-        # если дошли сюда — всё плохо
-        raise RuntimeError((last_err or "upload_failed") + f"; note={note}")
+        self.upload_file_bytes(task_id, upload_name, ctype, content, note=note)
 
 
 class App(tk.Tk):
@@ -550,6 +579,9 @@ class App(tk.Tk):
 
         self.btn_logs = tk.Button(header, text="Логи", command=self._open_logs)
         self.btn_logs.pack(side=tk.RIGHT)
+
+        self.btn_downloads = tk.Button(header, text="Скачать", command=self._open_task_files)
+        self.btn_downloads.pack(side=tk.RIGHT, padx=(0, 8))
 
         self.btn_settings = tk.Button(header, text="Настройки", command=self._open_settings)
         self.btn_settings.pack(side=tk.RIGHT, padx=(0, 8))
@@ -1452,6 +1484,76 @@ class App(tk.Tk):
             self._clear_typing_if_any()
             err = str(task.get("error_message") or "Задача завершилась с ошибкой").strip()
             self._add_message("assistant", AA_DISPLAY_NAME, err)
+
+    def _open_task_files(self):
+        if self.current_task_id is None:
+            messagebox.showinfo("Скачать", "Сначала дождись задачи с файлами.")
+            return
+
+        try:
+            files = self.client.list_task_files(self.current_task_id)
+        except Exception as e:
+            messagebox.showerror("Скачать", f"Не удалось получить список файлов: {e}")
+            return
+
+        if not files:
+            messagebox.showinfo("Скачать", "Для этой задачи файлов пока нет.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"Файлы задачи #{self.current_task_id}")
+        win.geometry("760x420")
+
+        frm = tk.Frame(win, padx=10, pady=10)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        lb = tk.Listbox(frm, font=("Segoe UI", 10))
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        sc = tk.Scrollbar(frm, command=lb.yview)
+        sc.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.configure(yscrollcommand=sc.set)
+
+        file_map: list[dict] = []
+        for item in files:
+            file_id = int(item.get("id") or 0)
+            file_name = str(item.get("file_name") or f"file_{file_id}")
+            size_bytes = int(item.get("size_bytes") or 0)
+            label = f"{file_name}  ({size_bytes} bytes)"
+            lb.insert(tk.END, label)
+            file_map.append(item)
+
+        def do_download():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showinfo("Скачать", "Выбери файл в списке.")
+                return
+
+            meta = file_map[int(sel[0])]
+            file_id = int(meta.get("id") or 0)
+            file_name = str(meta.get("file_name") or f"file_{file_id}")
+
+            save_path = filedialog.asksaveasfilename(initialfile=file_name, title="Куда сохранить файл")
+            if not save_path:
+                return
+
+            try:
+                content = self.client.download_task_file(self.current_task_id, file_id)
+                with open(save_path, "wb") as f:
+                    f.write(content or b"")
+            except Exception as e:
+                messagebox.showerror("Скачать", f"Не удалось скачать файл: {e}")
+                return
+
+            messagebox.showinfo("Скачать", f"Файл сохранён:\n{save_path}")
+
+        btns = tk.Frame(win, padx=10, pady=(0, 10))
+        btns.pack(fill=tk.X)
+        tk.Button(btns, text="Скачать выбранный", command=do_download).pack(side=tk.LEFT)
+        tk.Button(btns, text="Обновить", command=lambda: (win.destroy(), self._open_task_files())).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(btns, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+
+        lb.bind("<Double-Button-1>", lambda _e: do_download())
 
     def _open_logs(self):
         # Если task_id ещё нет — показываем диагностику отправки (иначе пользователь не может понять, что сломалось).

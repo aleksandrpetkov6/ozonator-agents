@@ -8,6 +8,7 @@ import re
 import base64
 import io
 import csv
+import html
 import subprocess
 import tempfile
 import uuid
@@ -24,11 +25,12 @@ from db.health import check_postgres, check_redis
 from db.tasks import (
     get_task_logs,
     get_task_record,
+    list_recent_user_tasks,
     set_task_result,
     update_task_status,
     write_orchestration_log,
 )
-from db.files import get_task_file_content, list_task_files
+from db.files import add_task_file, get_task_file_content, list_task_files
 
 app = FastAPI(title="Ozonator Agents AS")
 
@@ -60,6 +62,10 @@ _ATT_MAX_IMAGES = 5
 _ATT_MAX_IMAGE_BYTES_EACH = 2_900_000
 _ATT_MAX_TOTAL_IMAGE_BYTES = 2_900_000
 
+_FILE_EXPORT_MAX_BYTES = int(os.getenv("OZONATOR_FILE_EXPORT_MAX_BYTES", str(8 * 1024 * 1024)) or (8 * 1024 * 1024))
+_FILE_RECENT_TASK_LOOKBACK = max(1, int(os.getenv("OZONATOR_FILE_RECENT_TASK_LOOKBACK", "8") or 8))
+_FILE_SUMMARY_MAX_COLUMNS = max(3, int(os.getenv("OZONATOR_FILE_SUMMARY_MAX_COLUMNS", "12") or 12))
+_FILE_SUMMARY_MAX_PREVIEW_ROWS = max(1, int(os.getenv("OZONATOR_FILE_SUMMARY_MAX_PREVIEW_ROWS", "3") or 3))
 
 _VIDEO_EXTS = {"mp4", "mov", "mkv", "avi", "webm", "m4v"}
 _VIDEO_FPS = float(os.getenv("OZONATOR_VIDEO_FPS", "1") or 1)  # 1 кадр/сек
@@ -633,8 +639,8 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = 
     if not db_url:
         return "", []
 
-    ok, files, _message = list_task_files(db_url, task_id)
-    if not ok or not files:
+    source_task_id, files, _message = _find_task_files_context(task_id, payload)
+    if not source_task_id or not files:
         return "", []
 
     total_text_bytes = 0
@@ -648,7 +654,7 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = 
         size_bytes = int(meta.get("size_bytes") or 0)
         content_type = str(meta.get("content_type") or "")
 
-        ok_c, _meta_c, content, _msg_c = get_task_file_content(db_url, task_id, file_id)
+        ok_c, _meta_c, content, _msg_c = get_task_file_content(db_url, source_task_id, file_id)
         if not ok_c or content is None:
             blocks.append(f"— {file_name}: (не удалось загрузить содержимое)")
             continue
@@ -727,7 +733,10 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = 
     if not blocks and not image_parts:
         return "", []
 
-    text_block = "\n\n".join(["Вложения к задаче (используй их при ответе):", *blocks]).strip() if blocks else ""
+    header = "Вложения к задаче (используй их при ответе):"
+    if source_task_id and source_task_id != int(task_id):
+        header = f"Вложения из предыдущей задачи #{source_task_id} (используй их при ответе):"
+    text_block = "\n\n".join([header, *blocks]).strip() if blocks else ""
     if text_block:
         text_block = _trim_text(text_block, _ATT_TEXT_BLOCK_MAX_CHARS)
     return text_block, image_parts
@@ -1861,6 +1870,695 @@ def _heuristic_answer(question: str) -> str:
 
 
 # -------------------------
+# File intelligence / exports
+# -------------------------
+_FILE_EXPORT_FORMATS = {"xlsx", "csv", "tsv", "json", "txt", "md", "html", "xml"}
+_FILE_TEXT_EXTS = {"txt", "md", "log", "json", "yaml", "yml"}
+
+
+def _user_identity_from_payload(payload: dict[str, Any] | None) -> tuple[str, str]:
+    payload = payload if isinstance(payload, dict) else {}
+    user_key = str(payload.get("user_key") or "").strip()
+    prefs = payload.get("user_prefs") if isinstance(payload.get("user_prefs"), dict) else {}
+    user_name = str(prefs.get("user_name") or "").strip()
+    return user_key, user_name
+
+
+def _task_file_candidates(task_id: int, payload: dict[str, Any] | None = None) -> list[int]:
+    settings = get_settings()
+    db_url = getattr(settings, "database_url", None)
+    candidates: list[int] = [int(task_id)]
+    if not db_url:
+        return candidates
+
+    user_key, user_name = _user_identity_from_payload(payload)
+    if not user_key and not user_name:
+        return candidates
+
+    ok, items, _message = list_recent_user_tasks(
+        db_url,
+        user_key=user_key or None,
+        user_name=user_name or None,
+        limit=_FILE_RECENT_TASK_LOOKBACK,
+    )
+    if not ok or not items:
+        return candidates
+
+    for item in items:
+        try:
+            other_task_id = int(item.get("task_id") or 0)
+        except Exception:
+            other_task_id = 0
+        if other_task_id > 0 and other_task_id not in candidates:
+            candidates.append(other_task_id)
+
+    return candidates
+
+
+def _find_task_files_context(task_id: int, payload: dict[str, Any] | None = None) -> tuple[int | None, list[dict[str, Any]], str | None]:
+    settings = get_settings()
+    db_url = getattr(settings, "database_url", None)
+    if not db_url:
+        return None, [], None
+
+    for candidate_task_id in _task_file_candidates(task_id, payload):
+        ok, files, message = list_task_files(db_url, candidate_task_id)
+        if ok and files:
+            return candidate_task_id, list(files), None
+        if not ok and message not in {"schema_not_initialized", "OK"}:
+            return None, [], message
+
+    return None, [], "Файлы не найдены"
+
+
+def _normalize_match_key(value: Any) -> str:
+    s = str(value or "").lower().replace("ё", "е")
+    s = re.sub(r"[^a-zа-я0-9]+", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _match_tokens(value: Any) -> list[str]:
+    s = _normalize_match_key(value)
+    return [x for x in s.split(" ") if x]
+
+
+def _detect_csv_delimiter(text: str, default: str = ",") -> str:
+    sample = "\n".join((text or "").splitlines()[:5])
+    if not sample:
+        return default
+    scores = {delim: sample.count(delim) for delim in [",", ";", "\t", "|"]}
+    best = max(scores, key=scores.get)
+    return best if scores.get(best, 0) > 0 else default
+
+
+def _parse_csv_table(text: str, default_delimiter: str = ",") -> dict[str, Any] | None:
+    txt = text or ""
+    if not txt.strip():
+        return None
+
+    delimiter = _detect_csv_delimiter(txt, default=default_delimiter)
+    try:
+        reader = csv.reader(io.StringIO(txt), delimiter=delimiter)
+        all_rows = [list(row) for row in reader]
+    except Exception:
+        return None
+
+    if not all_rows:
+        return None
+
+    raw_headers = [str(x or "").strip() for x in all_rows[0]]
+    headers = [h if h else f"column_{idx + 1}" for idx, h in enumerate(raw_headers)]
+    rows: list[list[str]] = []
+    for row in all_rows[1:]:
+        row_vals = [str(x or "").strip() for x in row]
+        if len(row_vals) < len(headers):
+            row_vals.extend([""] * (len(headers) - len(row_vals)))
+        elif len(row_vals) > len(headers):
+            extra = len(row_vals) - len(headers)
+            headers.extend([f"extra_{len(headers) + i + 1}" for i in range(extra)])
+            for existing in rows:
+                existing.extend([""] * extra)
+        rows.append(row_vals[: len(headers)])
+
+    return {
+        "kind": "table",
+        "delimiter": delimiter,
+        "headers": headers,
+        "rows": rows,
+    }
+
+
+def _parse_xlsx_table(raw: bytes) -> dict[str, Any] | None:
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        return None
+
+    try:
+        wb = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+        ws = wb.worksheets[0] if wb.worksheets else None
+        if ws is None:
+            return None
+
+        matrix: list[list[str]] = []
+        for row in ws.iter_rows(values_only=True):
+            vals = ["" if v is None else str(v).strip() for v in row]
+            matrix.append(vals)
+
+        if not matrix:
+            return None
+
+        raw_headers = [str(x or "").strip() for x in matrix[0]]
+        headers = [h if h else f"column_{idx + 1}" for idx, h in enumerate(raw_headers)]
+        rows: list[list[str]] = []
+        for row in matrix[1:]:
+            row_vals = [str(x or "").strip() for x in row]
+            if len(row_vals) < len(headers):
+                row_vals.extend([""] * (len(headers) - len(row_vals)))
+            elif len(row_vals) > len(headers):
+                extra = len(row_vals) - len(headers)
+                headers.extend([f"extra_{len(headers) + i + 1}" for i in range(extra)])
+                for existing in rows:
+                    existing.extend([""] * extra)
+            rows.append(row_vals[: len(headers)])
+
+        return {
+            "kind": "table",
+            "sheet_name": ws.title,
+            "headers": headers,
+            "rows": rows,
+        }
+    except Exception:
+        return None
+
+
+def _load_files_for_processing(task_id: int, payload: dict[str, Any] | None = None) -> tuple[int | None, list[dict[str, Any]]]:
+    settings = get_settings()
+    db_url = getattr(settings, "database_url", None)
+    if not db_url:
+        return None, []
+
+    source_task_id, files_meta, _message = _find_task_files_context(task_id, payload)
+    if not source_task_id or not files_meta:
+        return None, []
+
+    loaded: list[dict[str, Any]] = []
+    for meta in files_meta[:_ATT_MAX_FILES]:
+        file_id = int(meta.get("id") or 0)
+        file_name = str(meta.get("file_name") or f"file_{file_id}")
+        content_type = str(meta.get("content_type") or "application/octet-stream")
+        ok, _meta_c, content, _msg = get_task_file_content(db_url, source_task_id, file_id)
+        if not ok or content is None:
+            continue
+
+        ext = _ext(file_name)
+        info: dict[str, Any] = {
+            "task_id": source_task_id,
+            "id": file_id,
+            "file_name": file_name,
+            "content_type": content_type,
+            "size_bytes": int(meta.get("size_bytes") or len(content)),
+            "ext": ext,
+            "raw": content,
+        }
+
+        table = None
+        if ext == "csv":
+            table = _parse_csv_table(_decode_text(content), default_delimiter=",")
+        elif ext == "tsv":
+            table = _parse_csv_table(_decode_text(content), default_delimiter="\t")
+        elif ext in {"xlsx", "xlsm"}:
+            table = _parse_xlsx_table(content)
+
+        if table:
+            info.update(table)
+            loaded.append(info)
+            continue
+
+        if ext in _FILE_TEXT_EXTS:
+            info["kind"] = "text"
+            info["text"] = _decode_text(content)
+            loaded.append(info)
+            continue
+
+        info["kind"] = "binary"
+        loaded.append(info)
+
+    return source_task_id, loaded
+
+
+def _pick_export_ext(question: str, source_info: dict[str, Any] | None = None) -> str | None:
+    q = _normalize_match_key(question)
+    m = re.search(r"\b(xlsx|csv|tsv|json|txt|md|markdown|html|htm|xml)\b", q)
+    if m:
+        ext = m.group(1)
+        if ext == "markdown":
+            ext = "md"
+        if ext == "htm":
+            ext = "html"
+        return ext
+
+    if any(x in q for x in ["скач", "выгруз", "экспорт", "сохрани", "скачать"]):
+        if source_info and source_info.get("kind") == "table":
+            return "xlsx"
+        return "txt"
+
+    return None
+
+
+def _looks_like_file_request(question: str, files: list[dict[str, Any]]) -> bool:
+    q = _normalize_match_key(question)
+    if not q or not files:
+        return False
+
+    if _pick_export_ext(question, None) is not None:
+        return True
+
+    hints = [
+        "файл", "таблиц", "csv", "xlsx", "json", "tsv", "xml", "html",
+        "столб", "колон", "строк", "запис", "выгруз", "экспорт", "скач",
+        "данн", "продаж", "заказ", "штук", "колич", "сумм", "выруч", "остатк", "склад",
+    ]
+    return any(h in q for h in hints)
+
+
+def _guess_table_topic(file_name: str, headers: list[str]) -> str:
+    corpus = " ".join([_normalize_match_key(file_name), *[_normalize_match_key(h) for h in headers]])
+    if any(x in corpus for x in ["продаж", "заказ", "отгруз", "fbs", "fbo"]):
+        return "данные о продажах и заказах"
+    if any(x in corpus for x in ["остат", "склад", "зона размещ", "ячейк"]):
+        return "данные об остатках и складе"
+    if any(x in corpus for x in ["клиент", "покупат", "customer"]):
+        return "данные по клиентам"
+    return "табличные данные"
+
+
+def _format_table_summary(info: dict[str, Any], current_task_id: int) -> str:
+    headers = list(info.get("headers") or [])
+    rows = list(info.get("rows") or [])
+    preview_headers = ", ".join([h for h in headers[:_FILE_SUMMARY_MAX_COLUMNS] if h]) or "(пусто)"
+    preview_lines = []
+    for idx, row in enumerate(rows[:_FILE_SUMMARY_MAX_PREVIEW_ROWS], start=1):
+        row_text = " | ".join([str(x or "").strip() for x in row[:_FILE_SUMMARY_MAX_COLUMNS]])
+        preview_lines.append(f"{idx}) {row_text or '(пусто)'}")
+
+    source_note = ""
+    source_task_id = int(info.get("task_id") or 0)
+    if source_task_id and source_task_id != int(current_task_id):
+        source_note = f" Использую вложение из предыдущей задачи #{source_task_id}."
+
+    parts = [
+        f"Саша, я открыла файл {info.get('file_name')}. Это {_guess_table_topic(str(info.get('file_name') or ''), headers)}.{source_note}",
+        f"Строк данных: {len(rows)}. Столбцов: {len(headers)}.",
+        f"Колонки: {preview_headers}.",
+    ]
+    if preview_lines:
+        parts.append("Первые строки:\n" + "\n".join(preview_lines))
+    return " ".join(parts).strip()
+
+
+def _parse_number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    s = s.replace("\xa0", " ").replace(" ", "")
+    s = s.replace("−", "-").replace("–", "-")
+    s = re.sub(r"[^0-9,\.\-]", "", s)
+    if not s or s in {"-", ".", ","}:
+        return None
+
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif s.count(",") == 1 and s.count(".") == 0:
+        s = s.replace(",", ".")
+    elif s.count(",") > 1 and s.count(".") == 0:
+        s = s.replace(",", "")
+    elif s.count(".") > 1 and s.count(",") == 0:
+        s = s.replace(".", "")
+
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _format_number_ru(value: float) -> str:
+    if abs(value - round(value)) < 1e-9:
+        return f"{int(round(value)):,}".replace(",", " ")
+    txt = f"{value:,.2f}".replace(",", " ")
+    return txt.replace(".", ",")
+
+
+def _numeric_column_stats(headers: list[str], rows: list[list[str]]) -> list[dict[str, Any]]:
+    stats: list[dict[str, Any]] = []
+    if not headers:
+        return stats
+
+    for idx, header in enumerate(headers):
+        values: list[float] = []
+        for row in rows:
+            if idx >= len(row):
+                continue
+            num = _parse_number(row[idx])
+            if num is not None:
+                values.append(num)
+        if values:
+            stats.append(
+                {
+                    "index": idx,
+                    "header": header,
+                    "count": len(values),
+                    "sum": sum(values),
+                    "avg": sum(values) / float(len(values)),
+                    "max": max(values),
+                    "min": min(values),
+                }
+            )
+    return stats
+
+
+def _pick_best_numeric_column(question: str, headers: list[str], rows: list[list[str]]) -> dict[str, Any] | None:
+    stats = _numeric_column_stats(headers, rows)
+    if not stats:
+        return None
+
+    q = _normalize_match_key(question)
+    quantity_intent = any(x in q for x in ["штук", "штука", "шт", "колич", "единиц", "qty", "units"])
+    money_intent = any(x in q for x in ["сумм", "выруч", "оборот", "руб", "доход", "цен", "стоим"])
+    average_intent = any(x in q for x in ["средн", "average"])
+    max_intent = any(x in q for x in ["максим", "наибол", "max"])
+    min_intent = any(x in q for x in ["миним", "наимен", "min"])
+    q_tokens = set(_match_tokens(question))
+
+    best = None
+    best_score = -10**9
+    for item in stats:
+        h_norm = _normalize_match_key(item["header"])
+        h_tokens = set(_match_tokens(item["header"]))
+        score = float(item["count"])
+        score += len(q_tokens & h_tokens) * 8
+
+        if quantity_intent:
+            if any(x in h_norm for x in ["колич", "штук", "qty", "unit", "единиц", "шт"]):
+                score += 40
+            if any(x in h_norm for x in ["сумм", "цена", "руб", "стоим", "выруч"]):
+                score -= 25
+
+        if money_intent:
+            if any(x in h_norm for x in ["сумм", "цена", "руб", "стоим", "выруч", "оборот"]):
+                score += 40
+            if any(x in h_norm for x in ["колич", "штук", "qty", "unit", "единиц", "шт"]):
+                score -= 20
+
+        if not quantity_intent and not money_intent and any(x in q for x in ["продаж", "заказ"]):
+            if any(x in h_norm for x in ["колич", "штук", "qty", "unit", "единиц", "шт", "заказ"]):
+                score += 20
+
+        if average_intent:
+            score += 2
+        if max_intent:
+            score += 1
+        if min_intent:
+            score += 1
+
+        if score > best_score:
+            best = item
+            best_score = score
+
+    return best
+
+
+def _answer_table_question(question: str, info: dict[str, Any], current_task_id: int) -> str:
+    headers = list(info.get("headers") or [])
+    rows = list(info.get("rows") or [])
+    q = _normalize_match_key(question)
+    file_name = str(info.get("file_name") or "файл")
+    source_task_id = int(info.get("task_id") or 0)
+    source_note = f" Использую ранее прикреплённый файл из задачи #{source_task_id}." if source_task_id and source_task_id != int(current_task_id) else ""
+
+    if any(x in q for x in ["что в файле", "о чем файл", "что за файл", "какие данные", "что внутри"]):
+        return _format_table_summary(info, current_task_id)
+
+    if "колон" in q or "столб" in q:
+        cols = ", ".join([h for h in headers if h]) or "(пусто)"
+        return f"Саша, в файле {file_name} {len(headers)} столбцов.{source_note} Колонки: {cols}."
+
+    if "строк" in q or "запис" in q:
+        return f"Саша, в файле {file_name} {len(rows)} строк данных.{source_note}"
+
+    if any(x in q for x in ["сколько", "сумма", "итого", "всего", "средн", "максим", "миним"]):
+        col = _pick_best_numeric_column(question, headers, rows)
+        if col is None:
+            return f"Саша, я открыла {file_name}, но не нашла числовую колонку, по которой можно посчитать итог.{source_note}"
+
+        metric = "sum"
+        metric_label = "итог"
+        if any(x in q for x in ["средн", "average"]):
+            metric = "avg"
+            metric_label = "среднее"
+        elif any(x in q for x in ["максим", "наибол", "max"]):
+            metric = "max"
+            metric_label = "максимум"
+        elif any(x in q for x in ["миним", "наимен", "min"]):
+            metric = "min"
+            metric_label = "минимум"
+
+        value = float(col.get(metric) or 0.0)
+        return (
+            f"Саша, {metric_label} по файлу {file_name}: {_format_number_ru(value)}. "
+            f"Посчитала по колонке «{col.get('header')}».{source_note}"
+        )
+
+    return _format_table_summary(info, current_task_id)
+
+
+def _answer_text_question(question: str, info: dict[str, Any], current_task_id: int) -> str:
+    txt = str(info.get("text") or "")
+    preview = _trim_text(txt, 1200).strip() or "(пусто)"
+    source_task_id = int(info.get("task_id") or 0)
+    source_note = f" Использую ранее прикреплённый файл из задачи #{source_task_id}." if source_task_id and source_task_id != int(current_task_id) else ""
+    return (
+        f"Саша, я открыла текстовый файл {info.get('file_name')}. "
+        f"Длина: {len(txt)} символов.{source_note}\n\n{preview}"
+    ).strip()
+
+
+def _content_type_for_export(ext: str) -> str:
+    mapping = {
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "csv": "text/csv; charset=utf-8",
+        "tsv": "text/tab-separated-values; charset=utf-8",
+        "json": "application/json; charset=utf-8",
+        "txt": "text/plain; charset=utf-8",
+        "md": "text/markdown; charset=utf-8",
+        "html": "text/html; charset=utf-8",
+        "xml": "application/xml; charset=utf-8",
+    }
+    return mapping.get(ext, "application/octet-stream")
+
+
+def _make_export_file_name(source_name: str, ext: str) -> str:
+    base = (source_name or "data").rsplit(".", 1)[0].strip() or "data"
+    safe = re.sub(r'[\\/:*?"<>|]+', "_", base).strip() or "data"
+    return f"{safe}.{ext}"
+
+
+def _table_to_json_records(info: dict[str, Any]) -> list[dict[str, Any]]:
+    headers = list(info.get("headers") or [])
+    rows = list(info.get("rows") or [])
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        record = {}
+        for idx, header in enumerate(headers):
+            record[str(header)] = row[idx] if idx < len(row) else ""
+        records.append(record)
+    return records
+
+
+def _render_table_export(info: dict[str, Any], ext: str) -> bytes:
+    headers = list(info.get("headers") or [])
+    rows = list(info.get("rows") or [])
+
+    if ext in {"csv", "tsv"}:
+        delim = "," if ext == "csv" else "\t"
+        buf = io.StringIO()
+        writer = csv.writer(buf, delimiter=delim, lineterminator="\n")
+        writer.writerow(headers)
+        writer.writerows(rows)
+        return buf.getvalue().encode("utf-8")
+
+    if ext == "json":
+        return json.dumps(_table_to_json_records(info), ensure_ascii=False, indent=2).encode("utf-8")
+
+    if ext == "txt":
+        lines = ["\t".join([str(x or "") for x in headers])]
+        lines.extend(["\t".join([str(x or "") for x in row]) for row in rows])
+        return "\n".join(lines).encode("utf-8")
+
+    if ext == "md":
+        if not headers:
+            return b""
+        head = "| " + " | ".join([str(x or "") for x in headers]) + " |"
+        sep = "| " + " | ".join(["---"] * len(headers)) + " |"
+        body = ["| " + " | ".join([str(x or "") for x in row[: len(headers)]]) + " |" for row in rows]
+        return "\n".join([head, sep, *body]).encode("utf-8")
+
+    if ext == "html":
+        parts = ["<table>", "  <thead>", "    <tr>"]
+        for h in headers:
+            parts.append(f"      <th>{html.escape(str(h or ''))}</th>")
+        parts.extend(["    </tr>", "  </thead>", "  <tbody>"])
+        for row in rows:
+            parts.append("    <tr>")
+            for val in row[: len(headers)]:
+                parts.append(f"      <td>{html.escape(str(val or ''))}</td>")
+            parts.append("    </tr>")
+        parts.extend(["  </tbody>", "</table>"])
+        return "\n".join(parts).encode("utf-8")
+
+    if ext == "xml":
+        lines = ["<rows>"]
+        records = _table_to_json_records(info)
+        for rec in records:
+            lines.append("  <row>")
+            for key, value in rec.items():
+                tag = re.sub(r"[^a-zA-Z0-9_]+", "_", str(key or "field")).strip("_") or "field"
+                lines.append(f"    <{tag}>{html.escape(str(value or ''))}</{tag}>")
+            lines.append("  </row>")
+        lines.append("</rows>")
+        return "\n".join(lines).encode("utf-8")
+
+    if ext == "xlsx":
+        try:
+            from openpyxl import Workbook
+        except Exception:
+            raise RuntimeError("openpyxl не установлен")
+        wb = Workbook()
+        ws = wb.active
+        ws.title = str(info.get("sheet_name") or "Данные")[:31] or "Данные"
+        ws.append(headers)
+        for row in rows:
+            ws.append(list(row[: len(headers)]))
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    raise RuntimeError(f"Неподдерживаемый формат: {ext}")
+
+
+def _render_text_export(info: dict[str, Any], ext: str) -> bytes:
+    text_value = str(info.get("text") or "")
+    if ext in {"txt", "md"}:
+        return text_value.encode("utf-8")
+    if ext == "html":
+        return f"<pre>{html.escape(text_value)}</pre>".encode("utf-8")
+    if ext == "xml":
+        return f"<document>{html.escape(text_value)}</document>".encode("utf-8")
+    if ext == "json":
+        return json.dumps({"text": text_value}, ensure_ascii=False, indent=2).encode("utf-8")
+    if ext in {"csv", "tsv"}:
+        delim = "," if ext == "csv" else "\t"
+        buf = io.StringIO()
+        writer = csv.writer(buf, delimiter=delim, lineterminator="\n")
+        writer.writerow(["text"])
+        for line in text_value.splitlines() or [text_value]:
+            writer.writerow([line])
+        return buf.getvalue().encode("utf-8")
+    if ext == "xlsx":
+        try:
+            from openpyxl import Workbook
+        except Exception:
+            raise RuntimeError("openpyxl не установлен")
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Текст"
+        ws.append(["text"])
+        for line in text_value.splitlines() or [text_value]:
+            ws.append([line])
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+    raise RuntimeError(f"Неподдерживаемый формат: {ext}")
+
+
+def _create_export_file(task_id: int, source_info: dict[str, Any], export_ext: str) -> tuple[bool, dict[str, Any] | None, str]:
+    settings = get_settings()
+    db_url = getattr(settings, "database_url", None)
+    if not db_url:
+        return False, None, "DATABASE_URL не задан"
+
+    if export_ext not in _FILE_EXPORT_FORMATS:
+        return False, None, f"Формат {export_ext} пока не поддерживается"
+
+    try:
+        if source_info.get("kind") == "table":
+            content = _render_table_export(source_info, export_ext)
+        elif source_info.get("kind") == "text":
+            content = _render_text_export(source_info, export_ext)
+        else:
+            return False, None, "Этот тип файла пока нельзя автоматически преобразовать"
+    except Exception as e:
+        return False, None, f"Не удалось подготовить файл: {e}"
+
+    if len(content or b"") > _FILE_EXPORT_MAX_BYTES:
+        return False, None, f"Результат слишком большой ({len(content)} bytes), лимит {_FILE_EXPORT_MAX_BYTES}"
+
+    export_name = _make_export_file_name(str(source_info.get("file_name") or "data"), export_ext)
+    ok, meta, message = add_task_file(
+        db_url,
+        task_id=task_id,
+        file_name=export_name,
+        content_type=_content_type_for_export(export_ext),
+        content=content,
+    )
+    if not ok:
+        return False, None, message
+
+    write_orchestration_log(
+        db_url,
+        task_id=task_id,
+        actor_agent="AS",
+        event_type="generated_file_created",
+        level="info",
+        message="AS подготовила файл для скачивания",
+        meta={
+            "file_id": meta.get("id") if isinstance(meta, dict) else None,
+            "file_name": export_name,
+            "source_file": source_info.get("file_name"),
+            "source_task_id": source_info.get("task_id"),
+            "format": export_ext,
+            "size_bytes": len(content or b""),
+        },
+    )
+    return True, meta if isinstance(meta, dict) else None, "OK"
+
+
+def _handle_file_request(task_id: int, task: dict[str, Any]) -> str:
+    payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    question = _normalize_text(payload.get("user_request"))
+    source_task_id, files = _load_files_for_processing(task_id, payload)
+    if not files:
+        return ""
+
+    if not _looks_like_file_request(question, files):
+        return ""
+
+    processable = [f for f in files if f.get("kind") in {"table", "text"}]
+    if not processable:
+        return "Саша, я вижу вложения, но среди них нет файла, который можно автоматически прочитать или преобразовать."
+
+    primary = processable[0]
+    export_ext = _pick_export_ext(question, primary)
+    if export_ext:
+        ok, meta, message = _create_export_file(task_id, primary, export_ext)
+        if ok and meta:
+            source_note = ""
+            if source_task_id and source_task_id != int(task_id):
+                source_note = f" Исходные данные взяты из ранее загруженного файла (задача #{source_task_id})."
+            return (
+                f"Саша, готово. Я подготовила файл {meta.get('file_name')} для скачивания.{source_note} "
+                f"Нажми «Скачать» в клиенте и выбери этот файл."
+            )
+        return f"Саша, не удалось подготовить файл для скачивания: {message}."
+
+    if primary.get("kind") == "table":
+        return _answer_table_question(question, primary, task_id)
+    if primary.get("kind") == "text":
+        return _answer_text_question(question, primary, task_id)
+    return ""
+
+
+# -------------------------
 # Core logic
 # -------------------------
 def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
@@ -1901,6 +2599,10 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
             p = cur.get("precipitation")
             c = _weather_code_ru(cur.get("weather_code"))
             return f"Саша, сейчас {place}: {t}°C (ощущается как {a}°C), {c}, ветер {w} м/с, осадки {p} мм."
+
+    file_answer = _handle_file_request(task_id, task)
+    if file_answer:
+        return _enforce_feminine_ru(_strip_and_apply_self_profile_updates(file_answer))
 
     llm_question = (main_goal + "\n\n" + attachments_text).strip() if attachments_text else main_goal
 
