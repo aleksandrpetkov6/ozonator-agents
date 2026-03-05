@@ -60,6 +60,49 @@ _ATT_MAX_IMAGE_BYTES_EACH = 2_900_000
 _ATT_MAX_TOTAL_IMAGE_BYTES = 2_900_000
 
 
+# -------------------------
+# LLM error state (for graceful fallbacks)
+# -------------------------
+_LAST_LLM_ERROR: dict[str, Any] = {}
+
+
+def _set_last_llm_error(kind: str, message: str, status: int | None = None) -> None:
+    global _LAST_LLM_ERROR
+    _LAST_LLM_ERROR = {
+        "kind": str(kind or "").strip() or "unknown",
+        "message": (message or "").strip(),
+        "status": int(status or 0) if status is not None else None,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _clear_last_llm_error() -> None:
+    global _LAST_LLM_ERROR
+    _LAST_LLM_ERROR = {}
+
+
+def _llm_msg_is_rate_limit(msg: str) -> bool:
+    low = (msg or "").lower()
+    return any(
+        k in low
+        for k in [
+            "rate limit",
+            "too many requests",
+            "tpm",
+            "tpd",
+            "tokens per minute",
+            "tokens per day",
+            "limit reached",
+        ]
+    )
+
+
+def _llm_msg_is_request_too_large(msg: str) -> bool:
+    low = (msg or "").lower()
+    return ("request too large" in low) or ("context" in low and "limit" in low) or ("maximum context" in low)
+
+
+
 _VIDEO_EXTS = {"mp4", "mov", "mkv", "avi", "webm", "m4v"}
 _VIDEO_FPS = float(os.getenv("OZONATOR_VIDEO_FPS", "1") or 1)  # 1 кадр/сек
 _VIDEO_BATCH_SIZE = int(os.getenv("OZONATOR_VIDEO_BATCH_SIZE", "8") or 8)  # кадров на 1 vision-вызов
@@ -545,6 +588,54 @@ def _maybe_prepare_web_context(task_id: int, task: dict[str, Any], payload: dict
     # notice может быть пустым при проблеме с БД — в этом случае просто не обещаем скачать.
     return web_context, notice
 
+
+
+
+def _parse_web_context_results(web_context: str) -> list[dict[str, str]]:
+    """Парсит компактный блок WEB_SEARCH_RESULTS в структуру.
+    Формат строк: '1. Title — URL — Snippet' (snippet может отсутствовать).
+    """
+    text = (web_context or "").strip()
+    if not text:
+        return []
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    # убираем заголовок
+    if lines and lines[0].upper().startswith("WEB_SEARCH_RESULTS"):
+        lines = lines[1:]
+
+    out: list[dict[str, str]] = []
+    rx = re.compile(r"^\d+\.\s*(?P<title>.*?)\s+—\s+(?P<url>https?://\S+)(?:\s+—\s+(?P<snip>.*))?$", re.U)
+    for ln in lines:
+        m = rx.match(ln)
+        if not m:
+            continue
+        out.append(
+            {
+                "title": (m.group("title") or "").strip(),
+                "url": (m.group("url") or "").strip(),
+                "snippet": (m.group("snip") or "").strip(),
+            }
+        )
+    return out
+
+
+def _format_web_results_answer_ru(addr: str, results: list[dict[str, str]], *, max_items: int = 6) -> str:
+    items = results[: max(1, int(max_items or 6))]
+    if not items:
+        return ""
+    lines = [f"{addr}, я нашла несколько релевантных источников (проверь доступность по твоей стране):"]
+    for i, r in enumerate(items, start=1):
+        title = (r.get("title") or "").strip() or "(без названия)"
+        url = (r.get("url") or "").strip()
+        snip = (r.get("snippet") or "").strip()
+        if snip:
+            # сниппет ограничим, чтобы не раздувать сообщение
+            if len(snip) > 220:
+                snip = snip[:220].rstrip() + "…"
+            lines.append(f"{i}. {title} — {url}\n   {snip}")
+        else:
+            lines.append(f"{i}. {title} — {url}")
+    return "\n".join(lines).strip()
 
 def _maybe_download_url_to_task(task_id: int, payload: dict[str, Any], user_text: str) -> str:
     """Если пользователь просит скачать файл по URL — скачиваем и кладём в task_files."""
@@ -1977,6 +2068,25 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
                                 except Exception:
                                     pass
 
+                            # rate limit / quota / request size: не показываем пользователю «внутренности провайдера»,
+
+                            # а даём шанс на fallback (например, отдать web-результаты без LLM).
+
+                            if status in {429, 400, 503} and _llm_msg_is_rate_limit(msg):
+
+                                _set_last_llm_error("rate_limit", msg, status=status)
+
+                                return ""
+
+                            if status == 400 and _llm_msg_is_request_too_large(msg):
+
+                                _set_last_llm_error("request_too_large", msg, status=status)
+
+                                return ""
+
+
+                            _set_last_llm_error("provider_error", msg, status=status)
+
                             return f"{addr}, я получила ошибку от провайдера: {msg}"
             except Exception:
                 pass
@@ -2815,6 +2925,44 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
         else:
             llm_question = (main_goal + "\n\n" + web_context).strip()
 
+
+    web_results = _parse_web_context_results(web_context) if web_context else []
+
+
+    # Адресация для fallback (когда LLM недоступен/лимитирован)
+
+    prefs = payload.get("user_prefs") if isinstance(payload.get("user_prefs"), dict) else {}
+
+    user_name = str(prefs.get("user_name") or "Александр").strip() or "Александр"
+
+    variants = prefs.get("addressing_variants")
+
+    if not isinstance(variants, list) or not variants:
+
+        variants = ["Александр", "Саша", "Сашечка", "Александр Николаевич"]
+
+    variants = [str(x).strip() for x in variants if str(x).strip()]
+
+    default_addr = str(prefs.get("addressing_default") or "Саша").strip() or "Саша"
+
+    addr = _pick_addressing(main_goal, default_addr, variants)
+
+
+    # Если хочешь экономить токены и получать сразу ссылки — включи флаг OZONATOR_WEB_SKIP_LLM=1
+
+    if web_results and (os.getenv("OZONATOR_WEB_SKIP_LLM") or "").strip().lower() in {"1", "true", "yes", "on"}:
+
+        ans = _format_web_results_answer_ru(addr, web_results, max_items=_WEB_SEARCH_MAX_RESULTS)
+
+        if web_notice:
+
+            ans = ans.rstrip() + "\n\n" + web_notice
+
+        return _enforce_feminine_ru(ans)
+
+
+    _clear_last_llm_error()
+
     ai_answer = _llm_answer(llm_question, payload, image_parts=image_parts)
     if ai_answer:
         ai_answer = _strip_and_apply_self_profile_updates(ai_answer)
@@ -2822,6 +2970,15 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
             if web_notice not in ai_answer:
                 ai_answer = ai_answer.rstrip() + "\n\n" + web_notice
         return _enforce_feminine_ru(ai_answer)
+
+    # Если LLM не ответил, но у нас есть web-результаты — отдаём их напрямую.
+    if web_results:
+        ans = _format_web_results_answer_ru(addr, web_results, max_items=_WEB_SEARCH_MAX_RESULTS)
+        if web_notice:
+            ans = ans.rstrip() + "\n\n" + web_notice
+        if isinstance(_LAST_LLM_ERROR, dict) and _LAST_LLM_ERROR.get("kind") == "rate_limit":
+            ans = ans.rstrip() + "\n\nСейчас я упёрлась в дневной лимит провайдера, поэтому дала ссылки без подробного анализа."
+        return _enforce_feminine_ru(ans)
 
     if image_parts:
         return (
