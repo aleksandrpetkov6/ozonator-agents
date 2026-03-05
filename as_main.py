@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import uuid
 import zipfile
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
@@ -95,6 +96,31 @@ def _decode_text(raw: bytes) -> str:
         except Exception:
             return raw.decode("utf-8", errors="replace")
 
+
+
+def _guess_bytes_encoding(sample: bytes) -> str:
+    """Грубая эвристика: utf-8 (включая BOM) или cp1251. Используется для CSV/TSV."""
+    sample = sample or b""
+    try:
+        sample.decode("utf-8")
+        return "utf-8-sig"
+    except Exception:
+        try:
+            sample.decode("cp1251")
+            return "cp1251"
+        except Exception:
+            return "utf-8-sig"
+
+
+def _sniff_csv_delimiter(sample_text: str, default: str = ",") -> str:
+    """Определяет разделитель по первому фрагменту текста."""
+    if not sample_text:
+        return default
+    head = "\n".join(sample_text.splitlines()[:20])
+    candidates = [",", ";", "\t", "|"]
+    scores = {c: head.count(c) for c in candidates}
+    best = max(scores, key=scores.get)
+    return best if scores.get(best, 0) > 0 else default
 
 def _trim_text(s: str, limit: int) -> str:
     s = s or ""
@@ -621,7 +647,10 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = 
         ext = _ext(file_name)
 
         if _is_zip_file(file_name, content_type):
-            blocks.append(_build_zip_preview_block(file_name, content))
+            try:
+                blocks.append(_build_zip_preview_block(file_name, content))
+            except Exception as e:
+                blocks.append(f"— {file_name}: (архив ZIP, ошибка обработки: {e.__class__.__name__})")
             continue
 
         if ext in {"jpg", "jpeg", "png", "webp", "gif"} or (content_type or "").lower().startswith("image/"):
@@ -1721,6 +1750,7 @@ def _heuristic_answer(question: str) -> str:
 _ZIP_PREVIEW_MAX_FILES = int(os.getenv("OZONATOR_ZIP_PREVIEW_MAX_FILES", "6") or 6)
 _ZIP_MAX_ENTRY_BYTES = int(os.getenv("OZONATOR_ZIP_MAX_ENTRY_BYTES", str(64 * 1024 * 1024)) or (64 * 1024 * 1024))
 _ZIP_MAX_TOTAL_UNPACKED_BYTES = int(os.getenv("OZONATOR_ZIP_MAX_TOTAL_UNPACKED_BYTES", str(96 * 1024 * 1024)) or (96 * 1024 * 1024))
+_ZIP_SAMPLE_MAX_BYTES = int(os.getenv("OZONATOR_ZIP_SAMPLE_MAX_BYTES", str(256 * 1024)) or (256 * 1024))
 _FILE_CONTEXT_LOOKBACK_TASKS = int(os.getenv("OZONATOR_FILE_CONTEXT_LOOKBACK_TASKS", "12") or 12)
 
 _SUPPORTED_TEXT_EXTS = {"txt", "md", "log", "json", "yaml", "yml"}
@@ -1841,6 +1871,112 @@ def _iter_table_rows_from_bytes(content: bytes, ext: str) -> tuple[list[str], li
     return [], []
 
 
+
+_TABLE_SCAN_MAX_ROWS = int(os.getenv("OZONATOR_TABLE_SCAN_MAX_ROWS", "2000000") or 2000000)
+_TABLE_SCAN_MAX_SECONDS = float(os.getenv("OZONATOR_TABLE_SCAN_MAX_SECONDS", "20") or 20)
+
+
+def _open_table_row_iter_from_bytes(content: bytes, ext: str) -> tuple[list[str], Any, dict[str, Any]]:
+    """Возвращает: header, iterator (по строкам без заголовка), meta."""
+    ext = (ext or "").lower().strip()
+    meta: dict[str, Any] = {"ext": ext}
+
+    if ext in {"csv", "tsv"}:
+        sample = (content or b"")[:65536]
+        enc = _guess_bytes_encoding(sample)
+        sample_text = sample.decode(enc, errors="replace") if sample else ""
+        delimiter = "\t" if ext == "tsv" else _sniff_csv_delimiter(sample_text, default=",")
+
+        bio = io.BytesIO(content or b"")
+        txt = io.TextIOWrapper(bio, encoding=enc, errors="replace", newline="")
+        reader = csv.reader(txt, delimiter=delimiter)
+
+        try:
+            raw_header = next(reader, None)
+        except Exception:
+            raw_header = None
+
+        header = [str(x or "").strip() for x in (raw_header or [])]
+
+        def _gen():
+            for row in reader:
+                yield row
+
+        meta.update({"encoding": enc, "delimiter": delimiter})
+        return header, _gen(), meta
+
+    if ext in {"xlsx", "xlsm"}:
+        try:
+            from openpyxl import load_workbook
+        except Exception:
+            return [], iter(()), {"ext": ext, "error": "openpyxl_not_installed"}
+
+        try:
+            wb = load_workbook(io.BytesIO(content or b""), data_only=True, read_only=True)
+            ws = wb.worksheets[0] if wb.worksheets else None
+            if ws is None:
+                return [], iter(()), {"ext": ext, "error": "no_sheets"}
+
+            iterator = ws.iter_rows(values_only=True)
+            first = next(iterator, None)
+            header = [str(x or "").strip() for x in (first or [])]
+
+            def _gen_xlsx():
+                for row in iterator:
+                    yield list(row)
+
+            return header, _gen_xlsx(), {"ext": ext}
+        except Exception as e:
+            return [], iter(()), {"ext": ext, "error": f"{e.__class__.__name__}"}
+
+    return [], iter(()), meta
+
+
+def _scan_table_metrics(
+    row_iter: Any,
+    quantity_idx: int | None,
+    amount_idx: int | None,
+    need_row_count: bool,
+    need_quantity_sum: bool,
+    need_amount_sum: bool,
+    need_amount_avg: bool,
+) -> dict[str, Any]:
+    start_ts = time.time()
+    row_count = 0
+
+    quantity_sum = 0.0
+    amount_sum = 0.0
+    amount_count = 0
+
+    truncated = False
+
+    for row in row_iter:
+        row_count += 1
+
+        if need_quantity_sum and quantity_idx is not None and quantity_idx < len(row):
+            v = _parse_number(row[quantity_idx])
+            if v is not None:
+                quantity_sum += float(v)
+
+        if (need_amount_sum or need_amount_avg) and amount_idx is not None and amount_idx < len(row):
+            v = _parse_number(row[amount_idx])
+            if v is not None:
+                amount_sum += float(v)
+                amount_count += 1
+
+        if row_count >= _TABLE_SCAN_MAX_ROWS or (time.time() - start_ts) > _TABLE_SCAN_MAX_SECONDS:
+            truncated = True
+            break
+
+    return {
+        "row_count": row_count if need_row_count or row_count else row_count,
+        "quantity_sum": quantity_sum,
+        "amount_sum": amount_sum,
+        "amount_count": amount_count,
+        "truncated": truncated,
+        "elapsed_sec": round(time.time() - start_ts, 3),
+    }
+
 def _extract_supported_from_zip(container_name: str, raw: bytes) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     loaded: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -1885,48 +2021,81 @@ def _extract_supported_from_zip(container_name: str, raw: bytes) -> tuple[list[d
 
 
 def _build_zip_preview_block(file_name: str, raw: bytes) -> str:
-    loaded, skipped = _extract_supported_from_zip(file_name, raw)
-    if not loaded and not skipped:
-        return f"— {file_name}: (архив пустой)"
+    """Безопасное превью ZIP: не распаковывает большие файлы целиком и не декодирует весь CSV."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw or b"")) as zf:
+            infos = [info for info in zf.infolist() if not info.is_dir()]
+            if not infos:
+                return f"— {file_name}: (архив пустой)"
 
-    parts = [f"— {file_name} (архив ZIP)"]
+            supported: list[dict[str, Any]] = []
+            skipped: list[dict[str, Any]] = []
 
-    if loaded:
-        parts.append("Найдено читаемых файлов:")
-        for item in loaded:
-            parts.append(f"• {item['inner_name']} ({item['size_bytes']} bytes)")
+            for info in infos:
+                inner_name = str(info.filename or "").strip() or "file"
+                inner_ext = _ext(inner_name)
+                meta = {"inner_name": inner_name, "size_bytes": int(info.file_size or 0), "ext": inner_ext}
 
-        first = loaded[0]
-        ext = str(first.get("ext") or "")
-        content = first.get("content") or b""
-        preview = ""
-        if ext == "csv":
-            preview = _preview_csv(_decode_text(content), ",", min(20, _CSV_PREVIEW_MAX_ROWS))
-        elif ext == "tsv":
-            preview = _preview_csv(_decode_text(content), "\t", min(20, _CSV_PREVIEW_MAX_ROWS))
-        elif ext in {"xlsx", "xlsm"}:
-            preview = _preview_xlsx(content)
-        elif ext in _SUPPORTED_TEXT_EXTS:
-            preview = _trim_text(_decode_text(content), min(_ATT_MAX_CHARS_PER_FILE, 2500))
-        if preview:
-            parts.append(f"Превью {first['inner_name']}:\n{preview}")
+                if inner_ext in (_SUPPORTED_TEXT_EXTS | _SUPPORTED_TABLE_EXTS):
+                    supported.append(meta)
+                else:
+                    skipped.append({**meta, "reason": "unsupported"})
 
-    if skipped:
-        details: list[str] = []
-        for item in skipped[:3]:
-            reason = str(item.get("reason") or "")
-            if reason == "unsupported":
-                details.append(f"{item['inner_name']} — неподдерживаемый формат")
-            elif reason == "too_large":
-                details.append(f"{item['inner_name']} — слишком большой после распаковки")
-            elif reason == "total_limit":
-                details.append(f"{item['inner_name']} — превышен суммарный лимит распаковки")
-            elif reason == "broken_zip":
-                details.append("архив повреждён или не читается")
-        if details:
-            parts.append("Пропущено: " + "; ".join(details))
+            parts = [f"— {file_name} (архив ZIP)"]
 
-    return "\n".join(parts).strip()
+            if supported:
+                parts.append("Файлы внутри (первые):")
+                for item in supported[:_ZIP_PREVIEW_MAX_FILES]:
+                    parts.append(f"• {item['inner_name']} ({item['size_bytes']} bytes)")
+                if len(supported) > _ZIP_PREVIEW_MAX_FILES:
+                    parts.append(f"…и ещё {len(supported) - _ZIP_PREVIEW_MAX_FILES}")
+
+                first = supported[0]
+                first_name = str(first.get("inner_name") or "").strip()
+                first_ext = str(first.get("ext") or "").lower().strip()
+
+                preview = ""
+                try:
+                    with zf.open(first_name) as fp:
+                        sample_bytes = fp.read(_ZIP_SAMPLE_MAX_BYTES)
+
+                    truncated_note = " (фрагмент)" if int(first.get("size_bytes") or 0) > len(sample_bytes or b"") else ""
+
+                    if first_ext in {"csv", "tsv"}:
+                        sample_text = _decode_text(sample_bytes or b"")
+                        delim = "\t" if first_ext == "tsv" else _sniff_csv_delimiter(sample_text, default=",")
+                        preview = _preview_csv(sample_text, delim, max_rows=20)
+                    elif first_ext in {"xlsx", "xlsm"}:
+                        # Для xlsx читаем ограниченный кусок, чтобы не съесть память
+                        max_bytes = min(int(first.get("size_bytes") or 0), 16 * 1024 * 1024)
+                        if max_bytes <= 0:
+                            preview = "(xlsx: пусто)"
+                        elif max_bytes < int(first.get("size_bytes") or 0):
+                            preview = "(xlsx: слишком большой для превью)"
+                        else:
+                            with zf.open(first_name) as fp:
+                                preview_bytes = fp.read(max_bytes)
+                            preview = _preview_xlsx(preview_bytes)
+                    else:
+                        preview = _trim_text(_decode_text(sample_bytes or b""), 2500)
+
+                    if preview:
+                        parts.append(f"Превью {first_name}{truncated_note}:\n{preview}")
+                except Exception as e:
+                    parts.append(f"Превью: не удалось прочитать первый файл ({e.__class__.__name__}).")
+            else:
+                parts.append("Внутри нет файлов поддерживаемых форматов.")
+
+            if skipped:
+                bad = [str(x.get("inner_name") or "") for x in skipped[:3] if x.get("inner_name")]
+                if bad:
+                    tail = " …" if len(skipped) > 3 else ""
+                    parts.append("Неподдерживаемые (первые): " + ", ".join(bad) + tail)
+
+            return "\n".join(parts).strip()
+    except Exception:
+        return f"— {file_name}: (архив повреждён или не читается)"
+
 
 
 def _iter_candidate_task_ids(current_task_id: int, payload: dict[str, Any] | None) -> list[int]:
@@ -2065,13 +2234,26 @@ def _answer_from_attached_tables(current_task_id: int, task: dict[str, Any], que
         return None
 
     source = sources[0]
-    header, rows = _iter_table_rows_from_bytes(source.get("content") or b"", str(source.get("ext") or ""))
+    ext = str(source.get("ext") or "").lower().strip()
+    content = source.get("content") or b""
+
+    header, row_iter, _meta = _open_table_row_iter_from_bytes(content, ext)
     if not header:
         return None
 
     hint = _build_source_hint(current_task_id, source)
 
-    if any(phrase in q_key for phrase in ["что в файле", "о чем файл", "о чем архив", "что в архиве", "какие данные", "что внутри"]):
+    # Вопросы про структуру
+    if any(phrase in q_key for phrase in ["что в файле", "о чем файл", "о чем архив", "что в архиве", "что внутри", "какие данные"]):
+        stats = _scan_table_metrics(
+            row_iter=row_iter,
+            quantity_idx=None,
+            amount_idx=None,
+            need_row_count=True,
+            need_quantity_sum=False,
+            need_amount_sum=False,
+            need_amount_avg=False,
+        )
         key_cols: list[str] = []
         preferred = ["Номер заказа", "Номер отправления", "Статус", "Сумма отправления", "Количество", "Название товара"]
         for candidate in preferred:
@@ -2081,8 +2263,13 @@ def _answer_from_attached_tables(current_task_id: int, task: dict[str, Any], que
         if not key_cols:
             key_cols = header[:6]
         cols_preview = ", ".join(key_cols[:6])
+
+        rows_text = str(stats.get("row_count") or 0)
+        if stats.get("truncated"):
+            rows_text = f"как минимум {rows_text}"
+
         return (
-            f"Саша, это таблица на {len(rows)} строк и {len(header)} столбцов. "
+            f"Саша, это таблица на {rows_text} строк и {len(header)} столбцов. "
             f"Ключевые колонки: {cols_preview}."
             f"{hint}"
         )
@@ -2092,37 +2279,53 @@ def _answer_from_attached_tables(current_task_id: int, task: dict[str, Any], que
         tail = "" if len(header) <= 20 else f" …(+{len(header) - 20})"
         return f"Саша, в таблице {len(header)} столбцов: {cols_preview}{tail}.{hint}"
 
+    # Числовые расчёты
     quantity_col = _choose_best_column(header, ["Количество", "Штук", "Quantity", "Qty"])
     amount_col = _choose_best_column(header, ["Сумма отправления", "Сумма", "Итого", "Оплачено покупателем"])
 
-    if ("средний чек" in q_key or ("средн" in q_key and ("чек" in q_key or "сумм" in q_key))) and amount_col:
-        idx = header.index(amount_col)
-        vals = [_parse_number(row[idx]) for row in rows if idx < len(row)]
-        nums = [v for v in vals if v is not None]
-        if nums:
-            avg = sum(nums) / len(nums)
-            return f"Саша, средний чек по колонке «{amount_col}» — {_format_number_ru(avg, 2)} ₽.{hint}"
-
     quantity_requested = any(marker in q_key for marker in ["штук", "колич", "единиц"])
-    if quantity_requested and quantity_col:
-        idx = header.index(quantity_col)
-        vals = [_parse_number(row[idx]) for row in rows if idx < len(row)]
-        nums = [v for v in vals if v is not None]
-        if nums:
-            total = sum(nums)
-            return f"Саша, всего по колонке «{quantity_col}» — {_format_number_ru(total, 0, integer_if_possible=True)}.{hint}"
+    amount_sum_requested = any(marker in q_key for marker in ["сумма", "выруч", "оборот", "итог"])
+    avg_requested = ("средний чек" in q_key) or ("средн" in q_key and ("чек" in q_key or "сумм" in q_key))
 
-    if any(marker in q_key for marker in ["сумма", "выруч", "оборот", "итог"]) and amount_col:
-        idx = header.index(amount_col)
-        vals = [_parse_number(row[idx]) for row in rows if idx < len(row)]
-        nums = [v for v in vals if v is not None]
-        if nums:
-            total = sum(nums)
-            return f"Саша, итог по колонке «{amount_col}» — {_format_number_ru(total, 2)} ₽.{hint}"
+    qty_idx = header.index(quantity_col) if quantity_col and quantity_col in header else None
+    amt_idx = header.index(amount_col) if amount_col and amount_col in header else None
+
+    need_qty = bool(quantity_requested and qty_idx is not None)
+    need_amt_sum = bool(amount_sum_requested and amt_idx is not None)
+    need_amt_avg = bool(avg_requested and amt_idx is not None)
+
+    if not (need_qty or need_amt_sum or need_amt_avg):
+        return None
+
+    stats = _scan_table_metrics(
+        row_iter=row_iter,
+        quantity_idx=qty_idx,
+        amount_idx=amt_idx,
+        need_row_count=False,
+        need_quantity_sum=need_qty,
+        need_amount_sum=(need_amt_sum or need_amt_avg),
+        need_amount_avg=need_amt_avg,
+    )
+
+    note = ""
+    if stats.get("truncated"):
+        note = " (внимание: файл очень большой, посчитала только по доступному фрагменту — увеличь лимиты OZONATOR_TABLE_SCAN_MAX_ROWS / OZONATOR_TABLE_SCAN_MAX_SECONDS для точного результата)"
+
+    if need_amt_avg and amt_idx is not None:
+        cnt = int(stats.get("amount_count") or 0)
+        if cnt > 0:
+            avg = float(stats.get("amount_sum") or 0.0) / cnt
+            return f"Саша, средний чек по колонке «{amount_col}» — {_format_number_ru(avg, 2)} ₽.{hint}{note}"
+
+    if need_qty and qty_idx is not None:
+        total = float(stats.get("quantity_sum") or 0.0)
+        return f"Саша, всего по колонке «{quantity_col}» — {_format_number_ru(total, 0, integer_if_possible=True)}.{hint}{note}"
+
+    if need_amt_sum and amt_idx is not None:
+        total = float(stats.get("amount_sum") or 0.0)
+        return f"Саша, итог по колонке «{amount_col}» — {_format_number_ru(total, 2)} ₽.{hint}{note}"
 
     return None
-
-
 # -------------------------
 # Core logic
 # -------------------------
@@ -2535,7 +2738,7 @@ def as_run_task(task_id: int):
         )
 
     except Exception as e:
-        err = f"AS error: {e}"
+        err = f"AS error ({e.__class__.__name__}): {e}"
         set_task_result(
             settings.database_url,
             task_id=task_id,
@@ -2549,8 +2752,8 @@ def as_run_task(task_id: int):
             actor_agent="AS",
             event_type="task_run_failed",
             level="error",
-            message="AS завершил обработку с ошибкой",
-            meta={"error": "AS error"},
+            message=f"AS завершил обработку с ошибкой: {e.__class__.__name__}: {str(e)[:180]}",
+            meta={"error": err, "exception": e.__class__.__name__, "traceback": __import__("traceback").format_exc()[:4000]},
         )
         return JSONResponse(
             status_code=500,
