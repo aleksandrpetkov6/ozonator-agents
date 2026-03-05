@@ -47,8 +47,14 @@ def _normalize_text(value: Any) -> str:
 
 
 _ATT_MAX_FILES = 8
-_ATT_MAX_TOTAL_BYTES = 2 * 1024 * 1024
-_ATT_MAX_CHARS_PER_FILE = 20000
+_ATT_MAX_TOTAL_BYTES = int(os.getenv("OZONATOR_ATT_MAX_TOTAL_BYTES", str(2 * 1024 * 1024)) or (2 * 1024 * 1024))
+_ATT_MAX_CHARS_PER_FILE = int(os.getenv("OZONATOR_ATT_MAX_CHARS_PER_FILE", "12000") or 12000)
+_ATT_TEXT_BLOCK_MAX_CHARS = int(os.getenv("OZONATOR_ATT_TEXT_BLOCK_MAX_CHARS", "6000") or 6000)
+
+_CSV_PREVIEW_MAX_ROWS = int(os.getenv("OZONATOR_CSV_PREVIEW_MAX_ROWS", "12") or 12)
+_CSV_PREVIEW_MAX_COLS = int(os.getenv("OZONATOR_CSV_PREVIEW_MAX_COLS", "12") or 12)
+_CSV_PREVIEW_MAX_CELL_CHARS = int(os.getenv("OZONATOR_CSV_PREVIEW_MAX_CELL_CHARS", "80") or 80)
+_CSV_PREVIEW_MAX_CHARS = int(os.getenv("OZONATOR_CSV_PREVIEW_MAX_CHARS", "2500") or 2500)
 
 _ATT_MAX_IMAGES = 5
 _ATT_MAX_IMAGE_BYTES_EACH = 2_900_000
@@ -101,21 +107,52 @@ def _trim_text(s: str, limit: int) -> str:
     return s[:limit] + "\n…(обрезано)"
 
 
-def _preview_csv(text: str, delimiter: str, max_rows: int = 60) -> str:
+def _preview_csv(text: str, delimiter: str, max_rows: int | None = None) -> str:
     if not text:
         return "(пусто)"
+
+    if max_rows is None:
+        max_rows = _CSV_PREVIEW_MAX_ROWS
+
+    def _cell(v: Any) -> str:
+        s = re.sub(r"\s+", " ", str(v or "")).strip()
+        if len(s) > _CSV_PREVIEW_MAX_CELL_CHARS:
+            s = s[:_CSV_PREVIEW_MAX_CELL_CHARS].rstrip() + "…"
+        return s
+
+    def _row(row: list[Any]) -> str:
+        cells = [_cell(x) for x in list(row)[:_CSV_PREVIEW_MAX_COLS]]
+        line = " | ".join([x for x in cells if x]).strip()
+        if len(row) > _CSV_PREVIEW_MAX_COLS:
+            suffix = f"…(+{len(row) - _CSV_PREVIEW_MAX_COLS} стлб.)"
+            line = f"{line} | {suffix}" if line else suffix
+        return line or "(пусто)"
+
     try:
         f = io.StringIO(text)
         reader = csv.reader(f, delimiter=delimiter)
-        out_lines = []
-        for i, row in enumerate(reader):
-            if i >= max_rows:
-                out_lines.append("…(обрезано)")
+        first = next(reader, None)
+        if first is None:
+            return "(пусто)"
+
+        out_lines = [f"Столбцы: {_row(first)}"]
+        shown_rows = 0
+        truncated_rows = False
+
+        for row in reader:
+            if shown_rows >= max_rows:
+                truncated_rows = True
                 break
-            out_lines.append("\t".join(row))
-        return "\n".join(out_lines).strip() or "(пусто)"
+            shown_rows += 1
+            out_lines.append(f"Строка {shown_rows}: {_row(row)}")
+
+        if truncated_rows:
+            out_lines.append(f"…(показаны первые {shown_rows} строк)")
+
+        preview = "\n".join(out_lines).strip() or "(пусто)"
+        return _trim_text(preview, _CSV_PREVIEW_MAX_CHARS)
     except Exception:
-        return _trim_text(text, _ATT_MAX_CHARS_PER_FILE)
+        return _trim_text(text, min(_ATT_MAX_CHARS_PER_FILE, _CSV_PREVIEW_MAX_CHARS))
 
 
 def _preview_xlsx(raw: bytes) -> str:
@@ -691,6 +728,8 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = 
         return "", []
 
     text_block = "\n\n".join(["Вложения к задаче (используй их при ответе):", *blocks]).strip() if blocks else ""
+    if text_block:
+        text_block = _trim_text(text_block, _ATT_TEXT_BLOCK_MAX_CHARS)
     return text_block, image_parts
 
 
@@ -888,6 +927,40 @@ def _normalize_conversation_pins(
             break
 
     return prepared
+
+
+def _compact_question_for_llm(question_ru: str, limit: int) -> str:
+    text = _safe_strip(question_ru)
+    if not text or limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+
+    marker = "Вложения к задаче (используй их при ответе):"
+    if marker in text:
+        head, _sep, tail = text.partition(marker)
+        head = _trim_text(head.strip(), max(600, min(len(head.strip() or text), limit // 3)))
+        tail_budget = max(800, limit - len(head) - len(marker) - 4)
+        tail = _trim_text(tail.strip(), tail_budget)
+        compact = f"{head}\n\n{marker}\n{tail}".strip()
+        return _trim_text(compact, limit)
+
+    return _trim_text(text, limit)
+
+
+def _is_request_too_large_message(message: str) -> bool:
+    m = (message or "").lower()
+    if not m:
+        return False
+    needles = [
+        "request too large",
+        "tokens per minute",
+        "reduce your message size",
+        "context length",
+        "prompt is too long",
+        "too many tokens",
+    ]
+    return any(x in m for x in needles)
 
 
 def _pick_addressing(user_text: str, default_name: str, variants: list[str]) -> str:
@@ -1447,8 +1520,40 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
         f"SelfProfile(JSON): {json.dumps(prof, ensure_ascii=False)}"
     )
 
-    pins = _normalize_conversation_pins(payload)
-    history = _normalize_conversation_history(payload)
+    has_attachment_block = "Вложения к задаче (используй их при ответе):" in (question_ru or "")
+    question_limit = (
+        int(os.getenv("OZONATOR_LLM_QUESTION_MAX_CHARS_ATTACH") or 5000)
+        if has_attachment_block
+        else int(os.getenv("OZONATOR_LLM_QUESTION_MAX_CHARS") or 7000)
+    )
+    question_ru = _compact_question_for_llm(question_ru, question_limit)
+
+    if has_attachment_block:
+        pins = _normalize_conversation_pins(
+            payload,
+            max_items=int(os.getenv("OZONATOR_PINS_MAX_ITEMS_ATTACH") or 2),
+            max_chars=int(os.getenv("OZONATOR_PINS_MAX_CHARS_ATTACH") or 900),
+            max_each=int(os.getenv("OZONATOR_PINS_MAX_EACH_ATTACH") or 400),
+        )
+        history = _normalize_conversation_history(
+            payload,
+            max_items=int(os.getenv("OZONATOR_HISTORY_MAX_ITEMS_ATTACH") or 16),
+            max_chars=int(os.getenv("OZONATOR_HISTORY_MAX_CHARS_ATTACH") or 5000),
+            max_each=int(os.getenv("OZONATOR_HISTORY_MAX_EACH_ATTACH") or 700),
+        )
+    else:
+        pins = _normalize_conversation_pins(
+            payload,
+            max_items=int(os.getenv("OZONATOR_PINS_MAX_ITEMS") or 4),
+            max_chars=int(os.getenv("OZONATOR_PINS_MAX_CHARS") or 1800),
+            max_each=int(os.getenv("OZONATOR_PINS_MAX_EACH") or 700),
+        )
+        history = _normalize_conversation_history(
+            payload,
+            max_items=int(os.getenv("OZONATOR_HISTORY_MAX_ITEMS") or 24),
+            max_chars=int(os.getenv("OZONATOR_HISTORY_MAX_CHARS") or 10000),
+            max_each=int(os.getenv("OZONATOR_HISTORY_MAX_EACH") or 900),
+        )
 
     try:
         import urllib.error as urllib_error
@@ -1525,6 +1630,45 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
                             if len(msg) > 240:
                                 msg = msg[:240] + "…"
                             low_msg = msg.lower()
+                            if (not image_parts) and _is_request_too_large_message(low_msg):
+                                try:
+                                    compact_retry_question = _compact_question_for_llm(
+                                        question_ru,
+                                        max(1200, min(3000, question_limit // 2)),
+                                    )
+                                    body2 = {
+                                        "model": model,
+                                        "messages": [
+                                            {"role": "system", "content": system_msg},
+                                            {"role": "user", "content": compact_retry_question},
+                                        ],
+                                        "temperature": 0.2,
+                                        "max_tokens": 400,
+                                    }
+                                    req2 = urllib_request.Request(
+                                        url,
+                                        data=json.dumps(body2, ensure_ascii=False).encode("utf-8"),
+                                        headers={
+                                            "Content-Type": "application/json; charset=utf-8",
+                                            "Accept": "application/json",
+                                            "User-Agent": (
+                                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                                "Chrome/122.0.0.0 Safari/537.36 OzonatorAgents-AS"
+                                            ),
+                                            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                                            "Authorization": f"Bearer {key}",
+                                        },
+                                        method="POST",
+                                    )
+                                    with urllib_request.urlopen(req2, timeout=60) as r2:
+                                        raw2 = r2.read()
+                                    data2 = json.loads(raw2.decode("utf-8")) if raw2 else {}
+                                    ans2 = _safe_strip(_extract_chat_completion_text(data2))
+                                    if ans2:
+                                        return _enforce_feminine_ru(_strip_and_apply_self_profile_updates(ans2))
+                                except Exception:
+                                    pass
                             # Если модель была снята с поддержки — пробуем автоматически переключиться на актуальную vision‑модель Groq.
                             if image_parts and key.startswith("gsk_") and ("decommissioned" in low_msg or "no longer supported" in low_msg):
                                 try:
