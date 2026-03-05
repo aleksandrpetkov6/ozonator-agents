@@ -299,6 +299,12 @@ def _extract_urls(text_ru: str) -> list[str]:
 
 def _is_piracy_intent(text_ru: str) -> bool:
     t = (text_ru or "").lower()
+
+    # Если пользователь явно просит ЛЕГАЛЬНЫЕ/ОФИЦИАЛЬНЫЕ варианты — это не «пиратский» интент.
+    # Мы всё равно не дадим пиратские ссылки, но можем помочь найти официальные страницы/сервисы.
+    if any(k in t for k in ["легаль", "официал", "лиценз", "подписк", "netflix", "amazon prime", "prime video", "google play", "itunes", "apple tv"]):
+        return False
+
     # запросы на скачивание фильмов/сериалов/игр и т.п.
     piracy_words = [
         "скачать фильм",
@@ -2069,25 +2075,19 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
                                     pass
 
                             # rate limit / quota / request size: не показываем пользователю «внутренности провайдера»,
-
                             # а даём шанс на fallback (например, отдать web-результаты без LLM).
 
-                            if status in {429, 400, 503} and _llm_msg_is_rate_limit(msg):
-
+                            if _llm_msg_is_rate_limit(msg):
                                 _set_last_llm_error("rate_limit", msg, status=status)
-
                                 return ""
 
-                            if status == 400 and _llm_msg_is_request_too_large(msg):
-
+                            if _llm_msg_is_request_too_large(msg):
                                 _set_last_llm_error("request_too_large", msg, status=status)
-
                                 return ""
 
-
+                            # прочие ошибки провайдера: логируем, но пользователю не показываем текст провайдера
                             _set_last_llm_error("provider_error", msg, status=status)
-
-                            return f"{addr}, я получила ошибку от провайдера: {msg}"
+                            return 
             except Exception:
                 pass
 
@@ -2961,11 +2961,41 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
         return _enforce_feminine_ru(ans)
 
 
+    # Авто‑экономия токенов: если запрос по сути «дай ссылки/источники», а не «проанализируй» —
+    # отдаём результаты web‑поиска напрямую, без вызова LLM.
+    if web_results:
+        t = (main_goal or "").lower()
+        wants_just_links = any(k in t for k in ["ссылк", "источник", "пруф", "где посмотреть", "где скачать", "официал", "легал", "лиценз"])
+        wants_analysis = any(k in t for k in ["проанализ", "сравн", "вывод", "объясн", "сделай вывод", "сделай анализ"])
+        if wants_just_links and not wants_analysis:
+            ans = _format_web_results_answer_ru(addr, web_results, max_items=_WEB_SEARCH_MAX_RESULTS)
+            if web_notice:
+                ans = ans.rstrip() + "\n\n" + web_notice
+            return _enforce_feminine_ru(ans)
+
+
     _clear_last_llm_error()
 
     ai_answer = _llm_answer(llm_question, payload, image_parts=image_parts)
     if ai_answer:
         ai_answer = _strip_and_apply_self_profile_updates(ai_answer)
+
+        # Если мы делали web‑поиск, но модель не вставила ссылки — добавим их принудительно,
+        # чтобы пользователь всегда видел источники прямо в чате.
+        if web_results and ("http://" not in ai_answer and "https://" not in ai_answer):
+            try:
+                items = web_results[: max(1, min(int(_WEB_SEARCH_MAX_RESULTS or 6), 5))]
+                link_lines = ["Ссылки (из web‑поиска):"]
+                for i, r in enumerate(items, start=1):
+                    title = (r.get("title") or "").strip() or "(без названия)"
+                    url = (r.get("url") or "").strip()
+                    if url:
+                        link_lines.append(f"{i}. {title} — {url}")
+                if len(link_lines) > 1:
+                    ai_answer = ai_answer.rstrip() + "\n\n" + "\n".join(link_lines).strip()
+            except Exception:
+                pass
+
         if 'web_notice' in locals() and web_notice:
             if web_notice not in ai_answer:
                 ai_answer = ai_answer.rstrip() + "\n\n" + web_notice
