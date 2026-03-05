@@ -1949,6 +1949,17 @@ _DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 _DEFAULT_GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 # Альтернативный vision‑модель (может быть доступна/устаревать; используем только как fallback)
 _DEFAULT_GROQ_VISION_MODEL_FALLBACK = "meta-llama/llama-4-maverick-17b-128e-instruct"
+# Дополнительные OpenAI‑compatible провайдеры (для автоматического fallback)
+_DEFAULT_CEREBRAS_BASE = "https://api.cerebras.ai/v1"
+_DEFAULT_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+_DEFAULT_MISTRAL_BASE = "https://api.mistral.ai/v1"
+_DEFAULT_FIREWORKS_BASE = "https://api.fireworks.ai/inference/v1"
+
+# Дефолтные модели (можно переопределить env‑переменными ниже)
+_DEFAULT_CEREBRAS_MODEL = "gpt-oss-120b"
+_DEFAULT_OPENROUTER_MODEL = "openrouter/free"
+_DEFAULT_MISTRAL_MODEL = "mistral-small-latest"
+_DEFAULT_FIREWORKS_MODEL = "accounts/fireworks/models/llama-v3p1-8b-instruct"
 _DEPRECATED_GROQ_VISION_MODELS = {
     "llama-3.2-11b-vision-preview",
     "llama-3.2-90b-vision-preview",
@@ -1966,15 +1977,129 @@ def _clean_api_key(raw: str) -> str:
         s = s[1:-1].strip()
     s = "".join(ch for ch in s if 33 <= ord(ch) <= 126)
     return s
+# -------------------------
+# LLM provider routing (diversification + auto-fallback)
+# -------------------------
+_LLM_PROVIDER_DEFS: dict[str, dict[str, Any]] = {
+    # Бесплатные/условно‑бесплатные (free tier / free credits)
+    "groq": {
+        "key_env": "GROQ_API_KEY",
+        "base_env": "GROQ_API_BASE",
+        "model_env": "GROQ_MODEL",
+        "default_base": _DEFAULT_GROQ_BASE,
+        "default_model": _DEFAULT_GROQ_MODEL,
+        "supports_vision": True,
+    },
+    "cerebras": {
+        "key_env": "CEREBRAS_API_KEY",
+        "base_env": "CEREBRAS_API_BASE",
+        "model_env": "CEREBRAS_MODEL",
+        "default_base": _DEFAULT_CEREBRAS_BASE,
+        "default_model": _DEFAULT_CEREBRAS_MODEL,
+        "supports_vision": False,
+    },
+    "openrouter": {
+        "key_env": "OPENROUTER_API_KEY",
+        "base_env": "OPENROUTER_API_BASE",
+        "model_env": "OPENROUTER_MODEL",
+        "default_base": _DEFAULT_OPENROUTER_BASE,
+        "default_model": _DEFAULT_OPENROUTER_MODEL,
+        "supports_vision": True,  # зависит от выбранной модели/роутера; оставляем True
+    },
+    "mistral": {
+        "key_env": "MISTRAL_API_KEY",
+        "base_env": "MISTRAL_API_BASE",
+        "model_env": "MISTRAL_MODEL",
+        "default_base": _DEFAULT_MISTRAL_BASE,
+        "default_model": _DEFAULT_MISTRAL_MODEL,
+        "supports_vision": False,
+    },
+    "fireworks": {
+        "key_env": "FIREWORKS_API_KEY",
+        "base_env": "FIREWORKS_API_BASE",
+        "model_env": "FIREWORKS_MODEL",
+        "default_base": _DEFAULT_FIREWORKS_BASE,
+        "default_model": _DEFAULT_FIREWORKS_MODEL,
+        "supports_vision": True,  # если указать vision‑модель Fireworks
+    },
+    # Опционально (не free tier): OpenAI или любой другой OpenAI‑compatible через OPENAI_API_URL/OPENAI_API_KEY
+    "openai": {
+        "key_env": "OPENAI_API_KEY",
+        "base_env": "OPENAI_API_URL",   # исторически у нас так называлось; может быть полной ссылкой на /chat/completions
+        "model_env": "OPENAI_MODEL",
+        "default_base": _DEFAULT_OPENAI_BASE,
+        "default_model": "gpt-4o-mini",
+        "supports_vision": True,
+    },
+}
+
+def _llm_provider_order() -> list[str]:
+    raw = (os.getenv("OZONATOR_LLM_PROVIDER_ORDER") or "").strip()
+    if not raw:
+        raw = "groq,cerebras,openrouter,mistral,fireworks,openai"
+    items = []
+    for part in raw.split(","):
+        name = part.strip().lower()
+        if name and name not in items:
+            items.append(name)
+    return items
+
+def _llm_url_from_base(raw_base: str, *, key: str) -> str:
+    # base может быть уже /chat/completions или /v1
+    u = (raw_base or "").strip().rstrip("/")
+    if not u:
+        # если base не задан — fallback по ключу (исторически: gsk_ => Groq)
+        base = _DEFAULT_GROQ_BASE if key.startswith("gsk_") else _DEFAULT_OPENAI_BASE
+        return base + "/chat/completions"
+    low = u.lower()
+    if "/chat/completions" in low:
+        return u
+    if low.endswith("/v1") or low.endswith("/openai/v1"):
+        return u + "/chat/completions"
+    return u + "/chat/completions"
+
+def _iter_llm_provider_candidates(payload: dict[str, Any] | None, *, want_vision: bool) -> list[dict[str, str]]:
+    payload = payload or {}
+    cands: list[dict[str, str]] = []
+    for name in _llm_provider_order():
+        p = _LLM_PROVIDER_DEFS.get(name)
+        if not p:
+            continue
+        if want_vision and not bool(p.get("supports_vision")):
+            continue
+        key = _clean_api_key(os.getenv(str(p.get("key_env") or ""), ""))
+        if not key:
+            continue
+        base_raw = os.getenv(str(p.get("base_env") or ""), "") or str(p.get("default_base") or "")
+        # OPENAI_API_URL может быть полной ссылкой (включая /chat/completions) — поддержим.
+        url = _llm_url_from_base(base_raw, key=key)
+        model = (os.getenv(str(p.get("model_env") or ""), "") or str(p.get("default_model") or "")).strip()
+        if not model:
+            continue
+        cands.append({
+            "name": name,
+            "key": key,
+            "url": url,
+            "model": model,
+            "key_env": str(p.get("key_env") or ""),
+        })
+    return cands
+
 
 
 def _pick_llm_key() -> str:
-    for name in ("GROQ_API_KEY", "OPENAI_API_KEY", "Agents"):
-        key = _clean_api_key(os.getenv(name, ""))
-        if key:
-            return key
+    # Legacy helper: возвращает первый доступный ключ по порядку провайдеров.
+    # (используется в некоторых второстепенных ветках, например vision/asr)
+    for p in _iter_llm_provider_candidates({}, want_vision=False):
+        k = _clean_api_key(p.get("key", ""))
+        if k:
+            return k
+    # Backward compat:
+    for name in ("GROQ_API_KEY", "OPENAI_API_KEY"):
+        k = _clean_api_key(os.getenv(name, ""))
+        if k:
+            return k
     return ""
-
 
 def _pick_llm_model(payload: dict[str, Any] | None = None) -> str:
     payload = payload or {}
@@ -2139,14 +2264,34 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
             "max_tokens": 600,
         }
 
-        # Groq vision поддерживает JSON mode (response_format)
-        if image_parts and key.startswith("gsk_"):
-            body["response_format"] = {"type": "json_object"}
+                # Multi-provider routing: пробуем несколько LLM по очереди и переключаемся при ошибках/лимитах.
+        candidates = _iter_llm_provider_candidates(payload, want_vision=bool(image_parts))
+        if not candidates:
+            return ""
 
-        req = urllib_request.Request(
-            url,
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers={
+        raw = b""
+        used_provider = ""
+        used_model = ""
+
+        for cand in candidates:
+            used_provider = cand.get("name", "")
+            key = cand.get("key", "")
+            url = cand.get("url", "")
+            model = cand.get("model", "")
+            used_model = model
+
+            if not key or not url or not model:
+                continue
+
+            body["model"] = model
+
+            # JSON mode для Groq vision (остальные провайдеры могут отличаться по поддержке)
+            if image_parts:
+                body.pop("response_format", None)
+                if used_provider == "groq":
+                    body["response_format"] = {"type": "json_object"}
+
+            headers = {
                 "Content-Type": "application/json; charset=utf-8",
                 "Accept": "application/json",
                 "User-Agent": (
@@ -2156,70 +2301,88 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
                 ),
                 "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Authorization": f"Bearer {key}",
-            },
-            method="POST",
-        )
+            }
 
-        try:
-            with urllib_request.urlopen(req, timeout=60) as r:
-                raw = r.read()
-        except urllib_error.HTTPError as e:
-            status = int(getattr(e, "code", 0) or 0)
-            if status == 403:
-                return f"{addr}, у меня ошибка: запрос к провайдеру заблокирован (403 Forbidden)."
-            if status == 401:
-                return f"{addr}, у меня ошибка: ключ провайдера отклонён (401 Unauthorized)."
+            # OpenRouter рекомендует указывать Referer/Title (опционально)
+            if used_provider == "openrouter":
+                ref = (os.getenv("OPENROUTER_REFERER") or os.getenv("OPENROUTER_APP_URL") or "").strip()
+                title = (os.getenv("OPENROUTER_APP_NAME") or "Ozonator Agents").strip()
+                if ref:
+                    headers["HTTP-Referer"] = ref
+                if title:
+                    headers["X-Title"] = title
 
-            # Пытаемся вытащить человекочитаемое сообщение (без секретов)
+            req = urllib_request.Request(
+                url,
+                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+
             try:
-                err_raw = e.read()  # type: ignore[attr-defined]
-                if err_raw:
-                    err_data = json.loads(err_raw.decode("utf-8", errors="ignore"))
-                    if isinstance(err_data, dict):
-                        err_obj = err_data.get("error") if isinstance(err_data.get("error"), dict) else {}
-                        msg = err_obj.get("message") if isinstance(err_obj.get("message"), str) else ""
-                        if msg.strip():
-                            msg = msg.strip()
-                            if len(msg) > 240:
-                                msg = msg[:240] + "…"
-                            low_msg = msg.lower()
-                            # Если модель была снята с поддержки — пробуем автоматически переключиться на актуальную vision‑модель Groq.
-                            if image_parts and key.startswith("gsk_") and ("decommissioned" in low_msg or "no longer supported" in low_msg):
-                                try:
-                                    body2 = dict(body)
-                                    body2["model"] = _DEFAULT_GROQ_VISION_MODEL
-                                    req2 = urllib_request.Request(
-                                        url,
-                                        data=json.dumps(body2, ensure_ascii=False).encode("utf-8"),
-                                        headers=req.headers,
-                                        method="POST",
-                                    )
-                                    with urllib_request.urlopen(req2, timeout=60) as r2:
-                                        raw2 = r2.read()
-                                    data2 = json.loads(raw2.decode("utf-8")) if raw2 else {}
-                                    ans2 = _extract_chat_completion_text(data2)
-                                    if isinstance(ans2, str) and ans2.strip():
-                                        return _enforce_feminine_ru(_strip_and_apply_self_profile_updates(ans2.strip()))
-                                except Exception:
-                                    pass
+                with urllib_request.urlopen(req, timeout=60) as r:
+                    raw = r.read()
+                if raw:
+                    break
+            except urllib_error.HTTPError as e:
+                status = int(getattr(e, "code", 0) or 0)
 
-                            # rate limit / quota / request size: не показываем пользователю «внутренности провайдера»,
-                            # а даём шанс на fallback (например, отдать web-результаты без LLM).
+                # Пытаемся вытащить человекочитаемое сообщение (без секретов)
+                msg = ""
+                try:
+                    err_raw = e.read()  # type: ignore[attr-defined]
+                    if err_raw:
+                        err_data = json.loads(err_raw.decode("utf-8", errors="ignore"))
+                        if isinstance(err_data, dict):
+                            err_obj = err_data.get("error") if isinstance(err_data.get("error"), dict) else {}
+                            msg = err_obj.get("message") if isinstance(err_obj.get("message"), str) else ""
+                            msg = (msg or "").strip()
+                except Exception:
+                    msg = ""
 
-                            if _llm_msg_is_rate_limit(msg):
-                                _set_last_llm_error("rate_limit", msg, status=status)
-                                return ""
+                # 401/403: пробуем следующий провайдер
+                if status in (401, 403):
+                    _set_last_llm_error("auth_error", f"{used_provider}: {msg or status}", status=status)
+                    continue
 
-                            if _llm_msg_is_request_too_large(msg):
-                                _set_last_llm_error("request_too_large", msg, status=status)
-                                return ""
+                low_msg = (msg or "").lower()
+                # Если модель vision на Groq снята с поддержки — переключаемся на актуальную
+                if image_parts and used_provider == "groq" and (("decommissioned" in low_msg) or ("no longer supported" in low_msg)):
+                    try:
+                        body2 = dict(body)
+                        body2["model"] = _DEFAULT_GROQ_VISION_MODEL
+                        body2["response_format"] = {"type": "json_object"}
+                        req2 = urllib_request.Request(
+                            url,
+                            data=json.dumps(body2, ensure_ascii=False).encode("utf-8"),
+                            headers=headers,
+                            method="POST",
+                        )
+                        with urllib_request.urlopen(req2, timeout=60) as r2:
+                            raw2 = r2.read()
+                        if raw2:
+                            raw = raw2
+                            used_model = _DEFAULT_GROQ_VISION_MODEL
+                            break
+                    except Exception:
+                        pass
 
-                            # прочие ошибки провайдера: логируем, но пользователю не показываем текст провайдера
-                            _set_last_llm_error("provider_error", msg, status=status)
-                            return 
-            except Exception:
-                pass
+                # Лимиты / размер: пробуем следующий провайдер
+                if msg and _llm_msg_is_rate_limit(msg):
+                    _set_last_llm_error("rate_limit", f"{used_provider}: {msg}", status=status)
+                    continue
+                if msg and _llm_msg_is_request_too_large(msg):
+                    _set_last_llm_error("request_too_large", f"{used_provider}: {msg}", status=status)
+                    continue
 
+                _set_last_llm_error("provider_error", f"{used_provider}: {msg or ('HTTP ' + str(status))}", status=status)
+                continue
+            except Exception as e:
+                _set_last_llm_error("network_error", f"{used_provider}: {type(e).__name__}", status=None)
+                continue
+
+        if not raw:
+            # Если ни один провайдер не сработал — отдаём пусто, чтобы сработали внешние fallback‑механизмы (web и т.п.)
             return ""
 
         data = json.loads(raw.decode("utf-8")) if raw else {}
