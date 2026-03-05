@@ -8,10 +8,10 @@ import re
 import base64
 import io
 import csv
-import html
 import subprocess
 import tempfile
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
@@ -30,7 +30,7 @@ from db.tasks import (
     update_task_status,
     write_orchestration_log,
 )
-from db.files import add_task_file, get_task_file_content, list_task_files
+from db.files import get_task_file_content, list_task_files
 
 app = FastAPI(title="Ozonator Agents AS")
 
@@ -49,23 +49,13 @@ def _normalize_text(value: Any) -> str:
 
 
 _ATT_MAX_FILES = 8
-_ATT_MAX_TOTAL_BYTES = int(os.getenv("OZONATOR_ATT_MAX_TOTAL_BYTES", str(2 * 1024 * 1024)) or (2 * 1024 * 1024))
-_ATT_MAX_CHARS_PER_FILE = int(os.getenv("OZONATOR_ATT_MAX_CHARS_PER_FILE", "12000") or 12000)
-_ATT_TEXT_BLOCK_MAX_CHARS = int(os.getenv("OZONATOR_ATT_TEXT_BLOCK_MAX_CHARS", "6000") or 6000)
-
-_CSV_PREVIEW_MAX_ROWS = int(os.getenv("OZONATOR_CSV_PREVIEW_MAX_ROWS", "12") or 12)
-_CSV_PREVIEW_MAX_COLS = int(os.getenv("OZONATOR_CSV_PREVIEW_MAX_COLS", "12") or 12)
-_CSV_PREVIEW_MAX_CELL_CHARS = int(os.getenv("OZONATOR_CSV_PREVIEW_MAX_CELL_CHARS", "80") or 80)
-_CSV_PREVIEW_MAX_CHARS = int(os.getenv("OZONATOR_CSV_PREVIEW_MAX_CHARS", "2500") or 2500)
+_ATT_MAX_TOTAL_BYTES = 2 * 1024 * 1024
+_ATT_MAX_CHARS_PER_FILE = 20000
 
 _ATT_MAX_IMAGES = 5
 _ATT_MAX_IMAGE_BYTES_EACH = 2_900_000
 _ATT_MAX_TOTAL_IMAGE_BYTES = 2_900_000
 
-_FILE_EXPORT_MAX_BYTES = int(os.getenv("OZONATOR_FILE_EXPORT_MAX_BYTES", str(8 * 1024 * 1024)) or (8 * 1024 * 1024))
-_FILE_RECENT_TASK_LOOKBACK = max(1, int(os.getenv("OZONATOR_FILE_RECENT_TASK_LOOKBACK", "8") or 8))
-_FILE_SUMMARY_MAX_COLUMNS = max(3, int(os.getenv("OZONATOR_FILE_SUMMARY_MAX_COLUMNS", "12") or 12))
-_FILE_SUMMARY_MAX_PREVIEW_ROWS = max(1, int(os.getenv("OZONATOR_FILE_SUMMARY_MAX_PREVIEW_ROWS", "3") or 3))
 
 _VIDEO_EXTS = {"mp4", "mov", "mkv", "avi", "webm", "m4v"}
 _VIDEO_FPS = float(os.getenv("OZONATOR_VIDEO_FPS", "1") or 1)  # 1 кадр/сек
@@ -113,52 +103,21 @@ def _trim_text(s: str, limit: int) -> str:
     return s[:limit] + "\n…(обрезано)"
 
 
-def _preview_csv(text: str, delimiter: str, max_rows: int | None = None) -> str:
+def _preview_csv(text: str, delimiter: str, max_rows: int = 60) -> str:
     if not text:
         return "(пусто)"
-
-    if max_rows is None:
-        max_rows = _CSV_PREVIEW_MAX_ROWS
-
-    def _cell(v: Any) -> str:
-        s = re.sub(r"\s+", " ", str(v or "")).strip()
-        if len(s) > _CSV_PREVIEW_MAX_CELL_CHARS:
-            s = s[:_CSV_PREVIEW_MAX_CELL_CHARS].rstrip() + "…"
-        return s
-
-    def _row(row: list[Any]) -> str:
-        cells = [_cell(x) for x in list(row)[:_CSV_PREVIEW_MAX_COLS]]
-        line = " | ".join([x for x in cells if x]).strip()
-        if len(row) > _CSV_PREVIEW_MAX_COLS:
-            suffix = f"…(+{len(row) - _CSV_PREVIEW_MAX_COLS} стлб.)"
-            line = f"{line} | {suffix}" if line else suffix
-        return line or "(пусто)"
-
     try:
         f = io.StringIO(text)
         reader = csv.reader(f, delimiter=delimiter)
-        first = next(reader, None)
-        if first is None:
-            return "(пусто)"
-
-        out_lines = [f"Столбцы: {_row(first)}"]
-        shown_rows = 0
-        truncated_rows = False
-
-        for row in reader:
-            if shown_rows >= max_rows:
-                truncated_rows = True
+        out_lines = []
+        for i, row in enumerate(reader):
+            if i >= max_rows:
+                out_lines.append("…(обрезано)")
                 break
-            shown_rows += 1
-            out_lines.append(f"Строка {shown_rows}: {_row(row)}")
-
-        if truncated_rows:
-            out_lines.append(f"…(показаны первые {shown_rows} строк)")
-
-        preview = "\n".join(out_lines).strip() or "(пусто)"
-        return _trim_text(preview, _CSV_PREVIEW_MAX_CHARS)
+            out_lines.append("\t".join(row))
+        return "\n".join(out_lines).strip() or "(пусто)"
     except Exception:
-        return _trim_text(text, min(_ATT_MAX_CHARS_PER_FILE, _CSV_PREVIEW_MAX_CHARS))
+        return _trim_text(text, _ATT_MAX_CHARS_PER_FILE)
 
 
 def _preview_xlsx(raw: bytes) -> str:
@@ -639,8 +598,8 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = 
     if not db_url:
         return "", []
 
-    source_task_id, files, _message = _find_task_files_context(task_id, payload)
-    if not source_task_id or not files:
+    ok, files, _message = list_task_files(db_url, task_id)
+    if not ok or not files:
         return "", []
 
     total_text_bytes = 0
@@ -654,20 +613,22 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = 
         size_bytes = int(meta.get("size_bytes") or 0)
         content_type = str(meta.get("content_type") or "")
 
-        ok_c, _meta_c, content, _msg_c = get_task_file_content(db_url, source_task_id, file_id)
+        ok_c, _meta_c, content, _msg_c = get_task_file_content(db_url, task_id, file_id)
         if not ok_c or content is None:
             blocks.append(f"— {file_name}: (не удалось загрузить содержимое)")
             continue
 
         ext = _ext(file_name)
 
-        # --- Images (vision) ---
+        if _is_zip_file(file_name, content_type):
+            blocks.append(_build_zip_preview_block(file_name, content))
+            continue
+
         if ext in {"jpg", "jpeg", "png", "webp", "gif"} or (content_type or "").lower().startswith("image/"):
             if len(image_parts) >= _ATT_MAX_IMAGES:
                 blocks.append(f"— {file_name}: (изображение, пропущено — достигнут лимит {_ATT_MAX_IMAGES} шт.)")
                 continue
 
-            # Сначала ужимаем/уменьшаем, затем применяем лимиты уже к обработанным данным.
             processed, mime = _prepare_image_for_vision(file_name, content_type, content)
             processed_size = len(processed or b"")
 
@@ -689,7 +650,6 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = 
             blocks.append(f"— {file_name}: (изображение, приложено к сообщению)")
             continue
 
-        # --- Audio (ASR transcription) ---
         ct_low = (content_type or "").lower().strip()
         if ct_low.startswith("audio/") or (ext in _AUDIO_EXTS and not ct_low.startswith("video/")):
             try:
@@ -698,7 +658,6 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = 
                 blocks.append(f"— {file_name}: (аудио, не удалось расшифровать)")
             continue
 
-        # --- Video (frames 1fps + audio transcription) ---
         if ext in _VIDEO_EXTS or (content_type or "").lower().startswith("video/"):
             try:
                 blocks.append(_analyze_video_to_block(file_name, content_type, content, payload=payload))
@@ -706,13 +665,12 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = 
                 blocks.append(f"— {file_name}: (видео, не удалось разобрать)")
             continue
 
-        # --- Text-like ---
         if total_text_bytes + size_bytes > _ATT_MAX_TOTAL_BYTES:
             blocks.append("(достигнут лимит по суммарному размеру текстовых вложений, остальное пропущено)")
             break
 
         total_text_bytes += len(content)
-        if ext in {"txt", "md", "log", "json", "yaml", "yml"}:
+        if ext in _SUPPORTED_TEXT_EXTS:
             txt = _trim_text(_decode_text(content), _ATT_MAX_CHARS_PER_FILE)
             blocks.append(f"— {file_name}\n{txt}")
             continue
@@ -733,14 +691,10 @@ def _collect_attachments_for_llm(task_id: int, payload: dict[str, Any] | None = 
     if not blocks and not image_parts:
         return "", []
 
-    header = "Вложения к задаче (используй их при ответе):"
-    if source_task_id and source_task_id != int(task_id):
-        header = f"Вложения из предыдущей задачи #{source_task_id} (используй их при ответе):"
-    text_block = "\n\n".join([header, *blocks]).strip() if blocks else ""
+    text_block = "\n\n".join(["Вложения к задаче (используй их при ответе):", *blocks]).strip() if blocks else ""
     if text_block:
         text_block = _trim_text(text_block, _ATT_TEXT_BLOCK_MAX_CHARS)
     return text_block, image_parts
-
 
 def _normalize_str_list(value: Any) -> list[str]:
     if value is None:
@@ -936,40 +890,6 @@ def _normalize_conversation_pins(
             break
 
     return prepared
-
-
-def _compact_question_for_llm(question_ru: str, limit: int) -> str:
-    text = _safe_strip(question_ru)
-    if not text or limit <= 0:
-        return ""
-    if len(text) <= limit:
-        return text
-
-    marker = "Вложения к задаче (используй их при ответе):"
-    if marker in text:
-        head, _sep, tail = text.partition(marker)
-        head = _trim_text(head.strip(), max(600, min(len(head.strip() or text), limit // 3)))
-        tail_budget = max(800, limit - len(head) - len(marker) - 4)
-        tail = _trim_text(tail.strip(), tail_budget)
-        compact = f"{head}\n\n{marker}\n{tail}".strip()
-        return _trim_text(compact, limit)
-
-    return _trim_text(text, limit)
-
-
-def _is_request_too_large_message(message: str) -> bool:
-    m = (message or "").lower()
-    if not m:
-        return False
-    needles = [
-        "request too large",
-        "tokens per minute",
-        "reduce your message size",
-        "context length",
-        "prompt is too long",
-        "too many tokens",
-    ]
-    return any(x in m for x in needles)
 
 
 def _pick_addressing(user_text: str, default_name: str, variants: list[str]) -> str:
@@ -1529,40 +1449,8 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
         f"SelfProfile(JSON): {json.dumps(prof, ensure_ascii=False)}"
     )
 
-    has_attachment_block = "Вложения к задаче (используй их при ответе):" in (question_ru or "")
-    question_limit = (
-        int(os.getenv("OZONATOR_LLM_QUESTION_MAX_CHARS_ATTACH") or 5000)
-        if has_attachment_block
-        else int(os.getenv("OZONATOR_LLM_QUESTION_MAX_CHARS") or 7000)
-    )
-    question_ru = _compact_question_for_llm(question_ru, question_limit)
-
-    if has_attachment_block:
-        pins = _normalize_conversation_pins(
-            payload,
-            max_items=int(os.getenv("OZONATOR_PINS_MAX_ITEMS_ATTACH") or 2),
-            max_chars=int(os.getenv("OZONATOR_PINS_MAX_CHARS_ATTACH") or 900),
-            max_each=int(os.getenv("OZONATOR_PINS_MAX_EACH_ATTACH") or 400),
-        )
-        history = _normalize_conversation_history(
-            payload,
-            max_items=int(os.getenv("OZONATOR_HISTORY_MAX_ITEMS_ATTACH") or 16),
-            max_chars=int(os.getenv("OZONATOR_HISTORY_MAX_CHARS_ATTACH") or 5000),
-            max_each=int(os.getenv("OZONATOR_HISTORY_MAX_EACH_ATTACH") or 700),
-        )
-    else:
-        pins = _normalize_conversation_pins(
-            payload,
-            max_items=int(os.getenv("OZONATOR_PINS_MAX_ITEMS") or 4),
-            max_chars=int(os.getenv("OZONATOR_PINS_MAX_CHARS") or 1800),
-            max_each=int(os.getenv("OZONATOR_PINS_MAX_EACH") or 700),
-        )
-        history = _normalize_conversation_history(
-            payload,
-            max_items=int(os.getenv("OZONATOR_HISTORY_MAX_ITEMS") or 24),
-            max_chars=int(os.getenv("OZONATOR_HISTORY_MAX_CHARS") or 10000),
-            max_each=int(os.getenv("OZONATOR_HISTORY_MAX_EACH") or 900),
-        )
+    pins = _normalize_conversation_pins(payload)
+    history = _normalize_conversation_history(payload)
 
     try:
         import urllib.error as urllib_error
@@ -1639,45 +1527,6 @@ def _llm_answer(question_ru: str, payload: dict[str, Any] | None = None, *, imag
                             if len(msg) > 240:
                                 msg = msg[:240] + "…"
                             low_msg = msg.lower()
-                            if (not image_parts) and _is_request_too_large_message(low_msg):
-                                try:
-                                    compact_retry_question = _compact_question_for_llm(
-                                        question_ru,
-                                        max(1200, min(3000, question_limit // 2)),
-                                    )
-                                    body2 = {
-                                        "model": model,
-                                        "messages": [
-                                            {"role": "system", "content": system_msg},
-                                            {"role": "user", "content": compact_retry_question},
-                                        ],
-                                        "temperature": 0.2,
-                                        "max_tokens": 400,
-                                    }
-                                    req2 = urllib_request.Request(
-                                        url,
-                                        data=json.dumps(body2, ensure_ascii=False).encode("utf-8"),
-                                        headers={
-                                            "Content-Type": "application/json; charset=utf-8",
-                                            "Accept": "application/json",
-                                            "User-Agent": (
-                                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                                "Chrome/122.0.0.0 Safari/537.36 OzonatorAgents-AS"
-                                            ),
-                                            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                                            "Authorization": f"Bearer {key}",
-                                        },
-                                        method="POST",
-                                    )
-                                    with urllib_request.urlopen(req2, timeout=60) as r2:
-                                        raw2 = r2.read()
-                                    data2 = json.loads(raw2.decode("utf-8")) if raw2 else {}
-                                    ans2 = _safe_strip(_extract_chat_completion_text(data2))
-                                    if ans2:
-                                        return _enforce_feminine_ru(_strip_and_apply_self_profile_updates(ans2))
-                                except Exception:
-                                    pass
                             # Если модель была снята с поддержки — пробуем автоматически переключиться на актуальную vision‑модель Groq.
                             if image_parts and key.startswith("gsk_") and ("decommissioned" in low_msg or "no longer supported" in low_msg):
                                 try:
@@ -1869,322 +1718,51 @@ def _heuristic_answer(question: str) -> str:
     return ""
 
 
-# -------------------------
-# File intelligence / exports
-# -------------------------
-_FILE_EXPORT_FORMATS = {"xlsx", "csv", "tsv", "json", "txt", "md", "html", "xml"}
-_FILE_TEXT_EXTS = {"txt", "md", "log", "json", "yaml", "yml"}
+_ZIP_PREVIEW_MAX_FILES = int(os.getenv("OZONATOR_ZIP_PREVIEW_MAX_FILES", "6") or 6)
+_ZIP_MAX_ENTRY_BYTES = int(os.getenv("OZONATOR_ZIP_MAX_ENTRY_BYTES", str(64 * 1024 * 1024)) or (64 * 1024 * 1024))
+_ZIP_MAX_TOTAL_UNPACKED_BYTES = int(os.getenv("OZONATOR_ZIP_MAX_TOTAL_UNPACKED_BYTES", str(96 * 1024 * 1024)) or (96 * 1024 * 1024))
+_FILE_CONTEXT_LOOKBACK_TASKS = int(os.getenv("OZONATOR_FILE_CONTEXT_LOOKBACK_TASKS", "12") or 12)
+
+_SUPPORTED_TEXT_EXTS = {"txt", "md", "log", "json", "yaml", "yml"}
+_SUPPORTED_TABLE_EXTS = {"csv", "tsv", "xlsx", "xlsm"}
 
 
-def _user_identity_from_payload(payload: dict[str, Any] | None) -> tuple[str, str]:
-    payload = payload if isinstance(payload, dict) else {}
-    user_key = str(payload.get("user_key") or "").strip()
-    prefs = payload.get("user_prefs") if isinstance(payload.get("user_prefs"), dict) else {}
-    user_name = str(prefs.get("user_name") or "").strip()
-    return user_key, user_name
-
-
-def _task_file_candidates(task_id: int, payload: dict[str, Any] | None = None) -> list[int]:
-    settings = get_settings()
-    db_url = getattr(settings, "database_url", None)
-    candidates: list[int] = [int(task_id)]
-    if not db_url:
-        return candidates
-
-    user_key, user_name = _user_identity_from_payload(payload)
-    if not user_key and not user_name:
-        return candidates
-
-    ok, items, _message = list_recent_user_tasks(
-        db_url,
-        user_key=user_key or None,
-        user_name=user_name or None,
-        limit=_FILE_RECENT_TASK_LOOKBACK,
-    )
-    if not ok or not items:
-        return candidates
-
-    for item in items:
-        try:
-            other_task_id = int(item.get("task_id") or 0)
-        except Exception:
-            other_task_id = 0
-        if other_task_id > 0 and other_task_id not in candidates:
-            candidates.append(other_task_id)
-
-    return candidates
-
-
-def _find_task_files_context(task_id: int, payload: dict[str, Any] | None = None) -> tuple[int | None, list[dict[str, Any]], str | None]:
-    settings = get_settings()
-    db_url = getattr(settings, "database_url", None)
-    if not db_url:
-        return None, [], None
-
-    for candidate_task_id in _task_file_candidates(task_id, payload):
-        ok, files, message = list_task_files(db_url, candidate_task_id)
-        if ok and files:
-            return candidate_task_id, list(files), None
-        if not ok and message not in {"schema_not_initialized", "OK"}:
-            return None, [], message
-
-    return None, [], "Файлы не найдены"
+def _is_zip_file(file_name: str, content_type: str | None = None) -> bool:
+    ext = _ext(file_name)
+    ct = (content_type or "").strip().lower()
+    return ext == "zip" or ct in {
+        "application/zip",
+        "application/x-zip-compressed",
+        "multipart/x-zip",
+    }
 
 
 def _normalize_match_key(value: Any) -> str:
     s = str(value or "").lower().replace("ё", "е")
     s = re.sub(r"[^a-zа-я0-9]+", " ", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _match_tokens(value: Any) -> list[str]:
-    s = _normalize_match_key(value)
-    return [x for x in s.split(" ") if x]
-
-
-def _detect_csv_delimiter(text: str, default: str = ",") -> str:
-    sample = "\n".join((text or "").splitlines()[:5])
-    if not sample:
-        return default
-    scores = {delim: sample.count(delim) for delim in [",", ";", "\t", "|"]}
-    best = max(scores, key=scores.get)
-    return best if scores.get(best, 0) > 0 else default
-
-
-def _parse_csv_table(text: str, default_delimiter: str = ",") -> dict[str, Any] | None:
-    txt = text or ""
-    if not txt.strip():
-        return None
-
-    delimiter = _detect_csv_delimiter(txt, default=default_delimiter)
-    try:
-        reader = csv.reader(io.StringIO(txt), delimiter=delimiter)
-        all_rows = [list(row) for row in reader]
-    except Exception:
-        return None
-
-    if not all_rows:
-        return None
-
-    raw_headers = [str(x or "").strip() for x in all_rows[0]]
-    headers = [h if h else f"column_{idx + 1}" for idx, h in enumerate(raw_headers)]
-    rows: list[list[str]] = []
-    for row in all_rows[1:]:
-        row_vals = [str(x or "").strip() for x in row]
-        if len(row_vals) < len(headers):
-            row_vals.extend([""] * (len(headers) - len(row_vals)))
-        elif len(row_vals) > len(headers):
-            extra = len(row_vals) - len(headers)
-            headers.extend([f"extra_{len(headers) + i + 1}" for i in range(extra)])
-            for existing in rows:
-                existing.extend([""] * extra)
-        rows.append(row_vals[: len(headers)])
-
-    return {
-        "kind": "table",
-        "delimiter": delimiter,
-        "headers": headers,
-        "rows": rows,
-    }
-
-
-def _parse_xlsx_table(raw: bytes) -> dict[str, Any] | None:
-    try:
-        from openpyxl import load_workbook
-    except Exception:
-        return None
-
-    try:
-        wb = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
-        ws = wb.worksheets[0] if wb.worksheets else None
-        if ws is None:
-            return None
-
-        matrix: list[list[str]] = []
-        for row in ws.iter_rows(values_only=True):
-            vals = ["" if v is None else str(v).strip() for v in row]
-            matrix.append(vals)
-
-        if not matrix:
-            return None
-
-        raw_headers = [str(x or "").strip() for x in matrix[0]]
-        headers = [h if h else f"column_{idx + 1}" for idx, h in enumerate(raw_headers)]
-        rows: list[list[str]] = []
-        for row in matrix[1:]:
-            row_vals = [str(x or "").strip() for x in row]
-            if len(row_vals) < len(headers):
-                row_vals.extend([""] * (len(headers) - len(row_vals)))
-            elif len(row_vals) > len(headers):
-                extra = len(row_vals) - len(headers)
-                headers.extend([f"extra_{len(headers) + i + 1}" for i in range(extra)])
-                for existing in rows:
-                    existing.extend([""] * extra)
-            rows.append(row_vals[: len(headers)])
-
-        return {
-            "kind": "table",
-            "sheet_name": ws.title,
-            "headers": headers,
-            "rows": rows,
-        }
-    except Exception:
-        return None
-
-
-def _load_files_for_processing(task_id: int, payload: dict[str, Any] | None = None) -> tuple[int | None, list[dict[str, Any]]]:
-    settings = get_settings()
-    db_url = getattr(settings, "database_url", None)
-    if not db_url:
-        return None, []
-
-    source_task_id, files_meta, _message = _find_task_files_context(task_id, payload)
-    if not source_task_id or not files_meta:
-        return None, []
-
-    loaded: list[dict[str, Any]] = []
-    for meta in files_meta[:_ATT_MAX_FILES]:
-        file_id = int(meta.get("id") or 0)
-        file_name = str(meta.get("file_name") or f"file_{file_id}")
-        content_type = str(meta.get("content_type") or "application/octet-stream")
-        ok, _meta_c, content, _msg = get_task_file_content(db_url, source_task_id, file_id)
-        if not ok or content is None:
-            continue
-
-        ext = _ext(file_name)
-        info: dict[str, Any] = {
-            "task_id": source_task_id,
-            "id": file_id,
-            "file_name": file_name,
-            "content_type": content_type,
-            "size_bytes": int(meta.get("size_bytes") or len(content)),
-            "ext": ext,
-            "raw": content,
-        }
-
-        table = None
-        if ext == "csv":
-            table = _parse_csv_table(_decode_text(content), default_delimiter=",")
-        elif ext == "tsv":
-            table = _parse_csv_table(_decode_text(content), default_delimiter="\t")
-        elif ext in {"xlsx", "xlsm"}:
-            table = _parse_xlsx_table(content)
-
-        if table:
-            info.update(table)
-            loaded.append(info)
-            continue
-
-        if ext in _FILE_TEXT_EXTS:
-            info["kind"] = "text"
-            info["text"] = _decode_text(content)
-            loaded.append(info)
-            continue
-
-        info["kind"] = "binary"
-        loaded.append(info)
-
-    return source_task_id, loaded
-
-
-def _pick_export_ext(question: str, source_info: dict[str, Any] | None = None) -> str | None:
-    q = _normalize_match_key(question)
-    m = re.search(r"\b(xlsx|csv|tsv|json|txt|md|markdown|html|htm|xml)\b", q)
-    if m:
-        ext = m.group(1)
-        if ext == "markdown":
-            ext = "md"
-        if ext == "htm":
-            ext = "html"
-        return ext
-
-    if any(x in q for x in ["скач", "выгруз", "экспорт", "сохрани", "скачать"]):
-        if source_info and source_info.get("kind") == "table":
-            return "xlsx"
-        return "txt"
-
-    return None
-
-
-def _looks_like_file_request(question: str, files: list[dict[str, Any]]) -> bool:
-    q = _normalize_match_key(question)
-    if not q or not files:
-        return False
-
-    if _pick_export_ext(question, None) is not None:
-        return True
-
-    hints = [
-        "файл", "таблиц", "csv", "xlsx", "json", "tsv", "xml", "html",
-        "столб", "колон", "строк", "запис", "выгруз", "экспорт", "скач",
-        "данн", "продаж", "заказ", "штук", "колич", "сумм", "выруч", "остатк", "склад",
-    ]
-    return any(h in q for h in hints)
-
-
-def _guess_table_topic(file_name: str, headers: list[str]) -> str:
-    corpus = " ".join([_normalize_match_key(file_name), *[_normalize_match_key(h) for h in headers]])
-    if any(x in corpus for x in ["продаж", "заказ", "отгруз", "fbs", "fbo"]):
-        return "данные о продажах и заказах"
-    if any(x in corpus for x in ["остат", "склад", "зона размещ", "ячейк"]):
-        return "данные об остатках и складе"
-    if any(x in corpus for x in ["клиент", "покупат", "customer"]):
-        return "данные по клиентам"
-    return "табличные данные"
-
-
-def _format_table_summary(info: dict[str, Any], current_task_id: int) -> str:
-    headers = list(info.get("headers") or [])
-    rows = list(info.get("rows") or [])
-    preview_headers = ", ".join([h for h in headers[:_FILE_SUMMARY_MAX_COLUMNS] if h]) or "(пусто)"
-    preview_lines = []
-    for idx, row in enumerate(rows[:_FILE_SUMMARY_MAX_PREVIEW_ROWS], start=1):
-        row_text = " | ".join([str(x or "").strip() for x in row[:_FILE_SUMMARY_MAX_COLUMNS]])
-        preview_lines.append(f"{idx}) {row_text or '(пусто)'}")
-
-    source_note = ""
-    source_task_id = int(info.get("task_id") or 0)
-    if source_task_id and source_task_id != int(current_task_id):
-        source_note = f" Использую вложение из предыдущей задачи #{source_task_id}."
-
-    parts = [
-        f"Саша, я открыла файл {info.get('file_name')}. Это {_guess_table_topic(str(info.get('file_name') or ''), headers)}.{source_note}",
-        f"Строк данных: {len(rows)}. Столбцов: {len(headers)}.",
-        f"Колонки: {preview_headers}.",
-    ]
-    if preview_lines:
-        parts.append("Первые строки:\n" + "\n".join(preview_lines))
-    return " ".join(parts).strip()
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def _parse_number(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
+    if value is None:
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
-
     s = str(value).strip()
     if not s:
         return None
-
     s = s.replace("\xa0", " ").replace(" ", "")
-    s = s.replace("−", "-").replace("–", "-")
-    s = re.sub(r"[^0-9,\.\-]", "", s)
+    s = s.replace("%", "")
+    s = s.replace("−", "-").replace("–", "-").replace("—", "-")
     if not s or s in {"-", ".", ","}:
         return None
 
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "").replace(",", ".")
+            s = s.replace(".", "")
+            s = s.replace(",", ".")
         else:
             s = s.replace(",", "")
-    elif s.count(",") == 1 and s.count(".") == 0:
+    elif "," in s:
         s = s.replace(",", ".")
-    elif s.count(",") > 1 and s.count(".") == 0:
-        s = s.replace(",", "")
-    elif s.count(".") > 1 and s.count(",") == 0:
-        s = s.replace(".", "")
 
     try:
         return float(s)
@@ -2192,370 +1770,357 @@ def _parse_number(value: Any) -> float | None:
         return None
 
 
-def _format_number_ru(value: float) -> str:
-    if abs(value - round(value)) < 1e-9:
+def _format_number_ru(value: float, decimals: int = 2, *, integer_if_possible: bool = False) -> str:
+    if integer_if_possible and abs(value - round(value)) < 1e-9:
         return f"{int(round(value)):,}".replace(",", " ")
-    txt = f"{value:,.2f}".replace(",", " ")
-    return txt.replace(".", ",")
+    fmt = f"{{:,.{decimals}f}}".format(value)
+    return fmt.replace(",", " ").replace(".", ",")
 
 
-def _numeric_column_stats(headers: list[str], rows: list[list[str]]) -> list[dict[str, Any]]:
-    stats: list[dict[str, Any]] = []
+def _choose_best_column(headers: list[str], preferred: list[str]) -> str | None:
     if not headers:
-        return stats
-
-    for idx, header in enumerate(headers):
-        values: list[float] = []
-        for row in rows:
-            if idx >= len(row):
-                continue
-            num = _parse_number(row[idx])
-            if num is not None:
-                values.append(num)
-        if values:
-            stats.append(
-                {
-                    "index": idx,
-                    "header": header,
-                    "count": len(values),
-                    "sum": sum(values),
-                    "avg": sum(values) / float(len(values)),
-                    "max": max(values),
-                    "min": min(values),
-                }
-            )
-    return stats
-
-
-def _pick_best_numeric_column(question: str, headers: list[str], rows: list[list[str]]) -> dict[str, Any] | None:
-    stats = _numeric_column_stats(headers, rows)
-    if not stats:
         return None
 
-    q = _normalize_match_key(question)
-    quantity_intent = any(x in q for x in ["штук", "штука", "шт", "колич", "единиц", "qty", "units"])
-    money_intent = any(x in q for x in ["сумм", "выруч", "оборот", "руб", "доход", "цен", "стоим"])
-    average_intent = any(x in q for x in ["средн", "average"])
-    max_intent = any(x in q for x in ["максим", "наибол", "max"])
-    min_intent = any(x in q for x in ["миним", "наимен", "min"])
-    q_tokens = set(_match_tokens(question))
+    norm_headers = [(header, _normalize_match_key(header)) for header in headers]
+    norm_pref = [_normalize_match_key(x) for x in preferred if str(x).strip()]
 
-    best = None
-    best_score = -10**9
-    for item in stats:
-        h_norm = _normalize_match_key(item["header"])
-        h_tokens = set(_match_tokens(item["header"]))
-        score = float(item["count"])
-        score += len(q_tokens & h_tokens) * 8
-
-        if quantity_intent:
-            if any(x in h_norm for x in ["колич", "штук", "qty", "unit", "единиц", "шт"]):
-                score += 40
-            if any(x in h_norm for x in ["сумм", "цена", "руб", "стоим", "выруч"]):
-                score -= 25
-
-        if money_intent:
-            if any(x in h_norm for x in ["сумм", "цена", "руб", "стоим", "выруч", "оборот"]):
-                score += 40
-            if any(x in h_norm for x in ["колич", "штук", "qty", "unit", "единиц", "шт"]):
-                score -= 20
-
-        if not quantity_intent and not money_intent and any(x in q for x in ["продаж", "заказ"]):
-            if any(x in h_norm for x in ["колич", "штук", "qty", "unit", "единиц", "шт", "заказ"]):
-                score += 20
-
-        if average_intent:
-            score += 2
-        if max_intent:
-            score += 1
-        if min_intent:
-            score += 1
-
-        if score > best_score:
-            best = item
-            best_score = score
-
-    return best
+    for pref in norm_pref:
+        for header, norm_header in norm_headers:
+            if norm_header == pref:
+                return header
+    for pref in norm_pref:
+        for header, norm_header in norm_headers:
+            if pref and pref in norm_header:
+                return header
+    for pref in norm_pref:
+        pref_tokens = set(pref.split())
+        for header, norm_header in norm_headers:
+            header_tokens = set(norm_header.split())
+            if pref_tokens and pref_tokens.issubset(header_tokens):
+                return header
+    return headers[0] if headers else None
 
 
-def _answer_table_question(question: str, info: dict[str, Any], current_task_id: int) -> str:
-    headers = list(info.get("headers") or [])
-    rows = list(info.get("rows") or [])
-    q = _normalize_match_key(question)
-    file_name = str(info.get("file_name") or "файл")
-    source_task_id = int(info.get("task_id") or 0)
-    source_note = f" Использую ранее прикреплённый файл из задачи #{source_task_id}." if source_task_id and source_task_id != int(current_task_id) else ""
-
-    if any(x in q for x in ["что в файле", "о чем файл", "что за файл", "какие данные", "что внутри"]):
-        return _format_table_summary(info, current_task_id)
-
-    if "колон" in q or "столб" in q:
-        cols = ", ".join([h for h in headers if h]) or "(пусто)"
-        return f"Саша, в файле {file_name} {len(headers)} столбцов.{source_note} Колонки: {cols}."
-
-    if "строк" in q or "запис" in q:
-        return f"Саша, в файле {file_name} {len(rows)} строк данных.{source_note}"
-
-    if any(x in q for x in ["сколько", "сумма", "итого", "всего", "средн", "максим", "миним"]):
-        col = _pick_best_numeric_column(question, headers, rows)
-        if col is None:
-            return f"Саша, я открыла {file_name}, но не нашла числовую колонку, по которой можно посчитать итог.{source_note}"
-
-        metric = "sum"
-        metric_label = "итог"
-        if any(x in q for x in ["средн", "average"]):
-            metric = "avg"
-            metric_label = "среднее"
-        elif any(x in q for x in ["максим", "наибол", "max"]):
-            metric = "max"
-            metric_label = "максимум"
-        elif any(x in q for x in ["миним", "наимен", "min"]):
-            metric = "min"
-            metric_label = "минимум"
-
-        value = float(col.get(metric) or 0.0)
-        return (
-            f"Саша, {metric_label} по файлу {file_name}: {_format_number_ru(value)}. "
-            f"Посчитала по колонке «{col.get('header')}».{source_note}"
-        )
-
-    return _format_table_summary(info, current_task_id)
-
-
-def _answer_text_question(question: str, info: dict[str, Any], current_task_id: int) -> str:
-    txt = str(info.get("text") or "")
-    preview = _trim_text(txt, 1200).strip() or "(пусто)"
-    source_task_id = int(info.get("task_id") or 0)
-    source_note = f" Использую ранее прикреплённый файл из задачи #{source_task_id}." if source_task_id and source_task_id != int(current_task_id) else ""
-    return (
-        f"Саша, я открыла текстовый файл {info.get('file_name')}. "
-        f"Длина: {len(txt)} символов.{source_note}\n\n{preview}"
-    ).strip()
-
-
-def _content_type_for_export(ext: str) -> str:
-    mapping = {
-        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "csv": "text/csv; charset=utf-8",
-        "tsv": "text/tab-separated-values; charset=utf-8",
-        "json": "application/json; charset=utf-8",
-        "txt": "text/plain; charset=utf-8",
-        "md": "text/markdown; charset=utf-8",
-        "html": "text/html; charset=utf-8",
-        "xml": "application/xml; charset=utf-8",
-    }
-    return mapping.get(ext, "application/octet-stream")
-
-
-def _make_export_file_name(source_name: str, ext: str) -> str:
-    base = (source_name or "data").rsplit(".", 1)[0].strip() or "data"
-    safe = re.sub(r'[\\/:*?"<>|]+', "_", base).strip() or "data"
-    return f"{safe}.{ext}"
-
-
-def _table_to_json_records(info: dict[str, Any]) -> list[dict[str, Any]]:
-    headers = list(info.get("headers") or [])
-    rows = list(info.get("rows") or [])
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        record = {}
-        for idx, header in enumerate(headers):
-            record[str(header)] = row[idx] if idx < len(row) else ""
-        records.append(record)
-    return records
-
-
-def _render_table_export(info: dict[str, Any], ext: str) -> bytes:
-    headers = list(info.get("headers") or [])
-    rows = list(info.get("rows") or [])
+def _iter_table_rows_from_bytes(content: bytes, ext: str) -> tuple[list[str], list[list[Any]]]:
+    ext = (ext or "").lower()
 
     if ext in {"csv", "tsv"}:
-        delim = "," if ext == "csv" else "\t"
-        buf = io.StringIO()
-        writer = csv.writer(buf, delimiter=delim, lineterminator="\n")
-        writer.writerow(headers)
-        writer.writerows(rows)
-        return buf.getvalue().encode("utf-8")
+        delimiter = "\t" if ext == "tsv" else ","
+        txt = _decode_text(content)
+        f = io.StringIO(txt)
+        reader = csv.reader(f, delimiter=delimiter)
+        rows = list(reader)
+        if not rows:
+            return [], []
+        header = [str(x or "").strip() for x in rows[0]]
+        data_rows = [list(row) for row in rows[1:]]
+        return header, data_rows
 
-    if ext == "json":
-        return json.dumps(_table_to_json_records(info), ensure_ascii=False, indent=2).encode("utf-8")
-
-    if ext == "txt":
-        lines = ["\t".join([str(x or "") for x in headers])]
-        lines.extend(["\t".join([str(x or "") for x in row]) for row in rows])
-        return "\n".join(lines).encode("utf-8")
-
-    if ext == "md":
-        if not headers:
-            return b""
-        head = "| " + " | ".join([str(x or "") for x in headers]) + " |"
-        sep = "| " + " | ".join(["---"] * len(headers)) + " |"
-        body = ["| " + " | ".join([str(x or "") for x in row[: len(headers)]]) + " |" for row in rows]
-        return "\n".join([head, sep, *body]).encode("utf-8")
-
-    if ext == "html":
-        parts = ["<table>", "  <thead>", "    <tr>"]
-        for h in headers:
-            parts.append(f"      <th>{html.escape(str(h or ''))}</th>")
-        parts.extend(["    </tr>", "  </thead>", "  <tbody>"])
-        for row in rows:
-            parts.append("    <tr>")
-            for val in row[: len(headers)]:
-                parts.append(f"      <td>{html.escape(str(val or ''))}</td>")
-            parts.append("    </tr>")
-        parts.extend(["  </tbody>", "</table>"])
-        return "\n".join(parts).encode("utf-8")
-
-    if ext == "xml":
-        lines = ["<rows>"]
-        records = _table_to_json_records(info)
-        for rec in records:
-            lines.append("  <row>")
-            for key, value in rec.items():
-                tag = re.sub(r"[^a-zA-Z0-9_]+", "_", str(key or "field")).strip("_") or "field"
-                lines.append(f"    <{tag}>{html.escape(str(value or ''))}</{tag}>")
-            lines.append("  </row>")
-        lines.append("</rows>")
-        return "\n".join(lines).encode("utf-8")
-
-    if ext == "xlsx":
+    if ext in {"xlsx", "xlsm"}:
         try:
-            from openpyxl import Workbook
+            from openpyxl import load_workbook
         except Exception:
-            raise RuntimeError("openpyxl не установлен")
-        wb = Workbook()
-        ws = wb.active
-        ws.title = str(info.get("sheet_name") or "Данные")[:31] or "Данные"
-        ws.append(headers)
-        for row in rows:
-            ws.append(list(row[: len(headers)]))
-        buf = io.BytesIO()
-        wb.save(buf)
-        return buf.getvalue()
-
-    raise RuntimeError(f"Неподдерживаемый формат: {ext}")
-
-
-def _render_text_export(info: dict[str, Any], ext: str) -> bytes:
-    text_value = str(info.get("text") or "")
-    if ext in {"txt", "md"}:
-        return text_value.encode("utf-8")
-    if ext == "html":
-        return f"<pre>{html.escape(text_value)}</pre>".encode("utf-8")
-    if ext == "xml":
-        return f"<document>{html.escape(text_value)}</document>".encode("utf-8")
-    if ext == "json":
-        return json.dumps({"text": text_value}, ensure_ascii=False, indent=2).encode("utf-8")
-    if ext in {"csv", "tsv"}:
-        delim = "," if ext == "csv" else "\t"
-        buf = io.StringIO()
-        writer = csv.writer(buf, delimiter=delim, lineterminator="\n")
-        writer.writerow(["text"])
-        for line in text_value.splitlines() or [text_value]:
-            writer.writerow([line])
-        return buf.getvalue().encode("utf-8")
-    if ext == "xlsx":
+            return [], []
         try:
-            from openpyxl import Workbook
+            wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+            ws = wb.worksheets[0] if wb.worksheets else None
+            if ws is None:
+                return [], []
+            iterator = ws.iter_rows(values_only=True)
+            first = next(iterator, None)
+            if first is None:
+                return [], []
+            header = [str(x or "").strip() for x in first]
+            data_rows: list[list[Any]] = []
+            for row in iterator:
+                data_rows.append(list(row))
+            return header, data_rows
         except Exception:
-            raise RuntimeError("openpyxl не установлен")
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Текст"
-        ws.append(["text"])
-        for line in text_value.splitlines() or [text_value]:
-            ws.append([line])
-        buf = io.BytesIO()
-        wb.save(buf)
-        return buf.getvalue()
-    raise RuntimeError(f"Неподдерживаемый формат: {ext}")
+            return [], []
+
+    return [], []
 
 
-def _create_export_file(task_id: int, source_info: dict[str, Any], export_ext: str) -> tuple[bool, dict[str, Any] | None, str]:
+def _extract_supported_from_zip(container_name: str, raw: bytes) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    loaded: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            infos = [info for info in zf.infolist() if not info.is_dir()]
+            unpacked_total = 0
+            for info in infos[:_ZIP_PREVIEW_MAX_FILES]:
+                inner_name = str(info.filename or "").strip() or "file"
+                inner_ext = _ext(inner_name)
+                entry_meta = {
+                    "inner_name": inner_name,
+                    "size_bytes": int(info.file_size or 0),
+                    "ext": inner_ext,
+                }
+
+                if inner_ext not in (_SUPPORTED_TEXT_EXTS | _SUPPORTED_TABLE_EXTS):
+                    skipped.append({**entry_meta, "reason": "unsupported"})
+                    continue
+                if int(info.file_size or 0) > _ZIP_MAX_ENTRY_BYTES:
+                    skipped.append({**entry_meta, "reason": "too_large"})
+                    continue
+                if unpacked_total + int(info.file_size or 0) > _ZIP_MAX_TOTAL_UNPACKED_BYTES:
+                    skipped.append({**entry_meta, "reason": "total_limit"})
+                    continue
+
+                data = zf.read(info)
+                unpacked_total += len(data or b"")
+                loaded.append(
+                    {
+                        **entry_meta,
+                        "container_name": container_name,
+                        "display_name": f"{container_name} → {inner_name}",
+                        "content": data,
+                    }
+                )
+    except Exception:
+        return [], [{"inner_name": container_name, "size_bytes": len(raw or b""), "ext": "zip", "reason": "broken_zip"}]
+
+    return loaded, skipped
+
+
+def _build_zip_preview_block(file_name: str, raw: bytes) -> str:
+    loaded, skipped = _extract_supported_from_zip(file_name, raw)
+    if not loaded and not skipped:
+        return f"— {file_name}: (архив пустой)"
+
+    parts = [f"— {file_name} (архив ZIP)"]
+
+    if loaded:
+        parts.append("Найдено читаемых файлов:")
+        for item in loaded:
+            parts.append(f"• {item['inner_name']} ({item['size_bytes']} bytes)")
+
+        first = loaded[0]
+        ext = str(first.get("ext") or "")
+        content = first.get("content") or b""
+        preview = ""
+        if ext == "csv":
+            preview = _preview_csv(_decode_text(content), ",", min(20, _CSV_PREVIEW_MAX_ROWS))
+        elif ext == "tsv":
+            preview = _preview_csv(_decode_text(content), "\t", min(20, _CSV_PREVIEW_MAX_ROWS))
+        elif ext in {"xlsx", "xlsm"}:
+            preview = _preview_xlsx(content)
+        elif ext in _SUPPORTED_TEXT_EXTS:
+            preview = _trim_text(_decode_text(content), min(_ATT_MAX_CHARS_PER_FILE, 2500))
+        if preview:
+            parts.append(f"Превью {first['inner_name']}:\n{preview}")
+
+    if skipped:
+        details: list[str] = []
+        for item in skipped[:3]:
+            reason = str(item.get("reason") or "")
+            if reason == "unsupported":
+                details.append(f"{item['inner_name']} — неподдерживаемый формат")
+            elif reason == "too_large":
+                details.append(f"{item['inner_name']} — слишком большой после распаковки")
+            elif reason == "total_limit":
+                details.append(f"{item['inner_name']} — превышен суммарный лимит распаковки")
+            elif reason == "broken_zip":
+                details.append("архив повреждён или не читается")
+        if details:
+            parts.append("Пропущено: " + "; ".join(details))
+
+    return "\n".join(parts).strip()
+
+
+def _iter_candidate_task_ids(current_task_id: int, payload: dict[str, Any] | None) -> list[int]:
+    payload = payload or {}
+    settings = get_settings()
+    db_url = getattr(settings, "database_url", None)
+    task_ids: list[int] = []
+    seen: set[int] = set()
+
+    def _push(value: Any) -> None:
+        try:
+            tid = int(value or 0)
+        except Exception:
+            tid = 0
+        if tid > 0 and tid not in seen:
+            seen.add(tid)
+            task_ids.append(tid)
+
+    _push(current_task_id)
+
+    if not db_url:
+        return task_ids
+
+    user_key = str(payload.get("user_key") or "").strip()
+    user_name = ""
+    user_prefs = payload.get("user_prefs")
+    if isinstance(user_prefs, dict):
+        user_name = str(user_prefs.get("user_name") or "").strip()
+
+    if not user_key and not user_name:
+        return task_ids
+
+    ok, items, _message = list_recent_user_tasks(
+        db_url,
+        user_key=user_key,
+        user_name=user_name,
+        limit=_FILE_CONTEXT_LOOKBACK_TASKS,
+    )
+    if not ok or not items:
+        return task_ids
+
+    for item in items:
+        _push(item.get("task_id"))
+
+    return task_ids
+
+
+def _collect_candidate_table_sources(current_task_id: int, payload: dict[str, Any] | None) -> list[dict[str, Any]]:
     settings = get_settings()
     db_url = getattr(settings, "database_url", None)
     if not db_url:
-        return False, None, "DATABASE_URL не задан"
+        return []
 
-    if export_ext not in _FILE_EXPORT_FORMATS:
-        return False, None, f"Формат {export_ext} пока не поддерживается"
+    sources: list[dict[str, Any]] = []
 
-    try:
-        if source_info.get("kind") == "table":
-            content = _render_table_export(source_info, export_ext)
-        elif source_info.get("kind") == "text":
-            content = _render_text_export(source_info, export_ext)
-        else:
-            return False, None, "Этот тип файла пока нельзя автоматически преобразовать"
-    except Exception as e:
-        return False, None, f"Не удалось подготовить файл: {e}"
+    for task_id in _iter_candidate_task_ids(current_task_id, payload):
+        ok, files, _message = list_task_files(db_url, task_id)
+        if not ok or not files:
+            continue
 
-    if len(content or b"") > _FILE_EXPORT_MAX_BYTES:
-        return False, None, f"Результат слишком большой ({len(content)} bytes), лимит {_FILE_EXPORT_MAX_BYTES}"
+        for meta in reversed(files):
+            file_id = int(meta.get("id") or 0)
+            file_name = str(meta.get("file_name") or f"file_{file_id}")
+            content_type = str(meta.get("content_type") or "")
+            ext = _ext(file_name)
 
-    export_name = _make_export_file_name(str(source_info.get("file_name") or "data"), export_ext)
-    ok, meta, message = add_task_file(
-        db_url,
-        task_id=task_id,
-        file_name=export_name,
-        content_type=_content_type_for_export(export_ext),
-        content=content,
-    )
-    if not ok:
-        return False, None, message
+            ok_c, _meta_c, content, _msg_c = get_task_file_content(db_url, task_id, file_id)
+            if not ok_c or content is None:
+                continue
 
-    write_orchestration_log(
-        db_url,
-        task_id=task_id,
-        actor_agent="AS",
-        event_type="generated_file_created",
-        level="info",
-        message="AS подготовила файл для скачивания",
-        meta={
-            "file_id": meta.get("id") if isinstance(meta, dict) else None,
-            "file_name": export_name,
-            "source_file": source_info.get("file_name"),
-            "source_task_id": source_info.get("task_id"),
-            "format": export_ext,
-            "size_bytes": len(content or b""),
-        },
-    )
-    return True, meta if isinstance(meta, dict) else None, "OK"
+            base = {
+                "task_id": task_id,
+                "file_id": file_id,
+                "file_name": file_name,
+                "content_type": content_type,
+            }
+
+            if ext in _SUPPORTED_TABLE_EXTS:
+                sources.append({**base, "display_name": file_name, "ext": ext, "content": content, "container_name": None})
+                continue
+
+            if _is_zip_file(file_name, content_type):
+                loaded, _skipped = _extract_supported_from_zip(file_name, content)
+                for item in loaded:
+                    if item.get("ext") not in _SUPPORTED_TABLE_EXTS:
+                        continue
+                    sources.append(
+                        {
+                            **base,
+                            "display_name": item.get("display_name") or file_name,
+                            "file_name": item.get("inner_name") or file_name,
+                            "container_name": file_name,
+                            "ext": item.get("ext") or "",
+                            "content": item.get("content") or b"",
+                        }
+                    )
+
+    return sources
 
 
-def _handle_file_request(task_id: int, task: dict[str, Any]) -> str:
+def _build_source_hint(current_task_id: int, source: dict[str, Any]) -> str:
+    task_id = int(source.get("task_id") or 0)
+    display_name = str(source.get("display_name") or source.get("file_name") or "файл")
+    if task_id and task_id != current_task_id:
+        return f" Использую ранее прикреплённый файл {display_name} из задачи #{task_id}."
+    return f" Использую файл {display_name}."
+
+
+_TABLE_QUESTION_MARKERS = [
+    "файл",
+    "архив",
+    "таблиц",
+    "столб",
+    "колич",
+    "штук",
+    "продаж",
+    "средн",
+    "чек",
+    "выруч",
+    "сумм",
+]
+
+
+def _answer_from_attached_tables(current_task_id: int, task: dict[str, Any], question: str) -> str | None:
+    q = str(question or "").strip()
+    if not q:
+        return None
+
+    q_key = _normalize_match_key(q)
+    if not any(marker in q_key for marker in _TABLE_QUESTION_MARKERS):
+        return None
+
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
-    question = _normalize_text(payload.get("user_request"))
-    source_task_id, files = _load_files_for_processing(task_id, payload)
-    if not files:
-        return ""
+    sources = _collect_candidate_table_sources(current_task_id, payload)
+    if not sources:
+        return None
 
-    if not _looks_like_file_request(question, files):
-        return ""
+    source = sources[0]
+    header, rows = _iter_table_rows_from_bytes(source.get("content") or b"", str(source.get("ext") or ""))
+    if not header:
+        return None
 
-    processable = [f for f in files if f.get("kind") in {"table", "text"}]
-    if not processable:
-        return "Саша, я вижу вложения, но среди них нет файла, который можно автоматически прочитать или преобразовать."
+    hint = _build_source_hint(current_task_id, source)
 
-    primary = processable[0]
-    export_ext = _pick_export_ext(question, primary)
-    if export_ext:
-        ok, meta, message = _create_export_file(task_id, primary, export_ext)
-        if ok and meta:
-            source_note = ""
-            if source_task_id and source_task_id != int(task_id):
-                source_note = f" Исходные данные взяты из ранее загруженного файла (задача #{source_task_id})."
-            return (
-                f"Саша, готово. Я подготовила файл {meta.get('file_name')} для скачивания.{source_note} "
-                f"Нажми «Скачать» в клиенте и выбери этот файл."
-            )
-        return f"Саша, не удалось подготовить файл для скачивания: {message}."
+    if any(phrase in q_key for phrase in ["что в файле", "о чем файл", "о чем архив", "что в архиве", "какие данные", "что внутри"]):
+        key_cols: list[str] = []
+        preferred = ["Номер заказа", "Номер отправления", "Статус", "Сумма отправления", "Количество", "Название товара"]
+        for candidate in preferred:
+            chosen = _choose_best_column(header, [candidate])
+            if chosen and chosen not in key_cols:
+                key_cols.append(chosen)
+        if not key_cols:
+            key_cols = header[:6]
+        cols_preview = ", ".join(key_cols[:6])
+        return (
+            f"Саша, это таблица на {len(rows)} строк и {len(header)} столбцов. "
+            f"Ключевые колонки: {cols_preview}."
+            f"{hint}"
+        )
 
-    if primary.get("kind") == "table":
-        return _answer_table_question(question, primary, task_id)
-    if primary.get("kind") == "text":
-        return _answer_text_question(question, primary, task_id)
-    return ""
+    if "какие столб" in q_key or "какие колонки" in q_key:
+        cols_preview = ", ".join(header[:20])
+        tail = "" if len(header) <= 20 else f" …(+{len(header) - 20})"
+        return f"Саша, в таблице {len(header)} столбцов: {cols_preview}{tail}.{hint}"
+
+    quantity_col = _choose_best_column(header, ["Количество", "Штук", "Quantity", "Qty"])
+    amount_col = _choose_best_column(header, ["Сумма отправления", "Сумма", "Итого", "Оплачено покупателем"])
+
+    if ("средний чек" in q_key or ("средн" in q_key and ("чек" in q_key or "сумм" in q_key))) and amount_col:
+        idx = header.index(amount_col)
+        vals = [_parse_number(row[idx]) for row in rows if idx < len(row)]
+        nums = [v for v in vals if v is not None]
+        if nums:
+            avg = sum(nums) / len(nums)
+            return f"Саша, средний чек по колонке «{amount_col}» — {_format_number_ru(avg, 2)} ₽.{hint}"
+
+    quantity_requested = any(marker in q_key for marker in ["штук", "колич", "единиц"])
+    if quantity_requested and quantity_col:
+        idx = header.index(quantity_col)
+        vals = [_parse_number(row[idx]) for row in rows if idx < len(row)]
+        nums = [v for v in vals if v is not None]
+        if nums:
+            total = sum(nums)
+            return f"Саша, всего по колонке «{quantity_col}» — {_format_number_ru(total, 0, integer_if_possible=True)}.{hint}"
+
+    if any(marker in q_key for marker in ["сумма", "выруч", "оборот", "итог"]) and amount_col:
+        idx = header.index(amount_col)
+        vals = [_parse_number(row[idx]) for row in rows if idx < len(row)]
+        nums = [v for v in vals if v is not None]
+        if nums:
+            total = sum(nums)
+            return f"Саша, итог по колонке «{amount_col}» — {_format_number_ru(total, 2)} ₽.{hint}"
+
+    return None
 
 
 # -------------------------
@@ -2600,10 +2165,6 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
             c = _weather_code_ru(cur.get("weather_code"))
             return f"Саша, сейчас {place}: {t}°C (ощущается как {a}°C), {c}, ветер {w} м/с, осадки {p} мм."
 
-    file_answer = _handle_file_request(task_id, task)
-    if file_answer:
-        return _enforce_feminine_ru(_strip_and_apply_self_profile_updates(file_answer))
-
     llm_question = (main_goal + "\n\n" + attachments_text).strip() if attachments_text else main_goal
 
     endpoints = _normalize_str_list(payload.get("endpoints") or payload.get("endpoint") or az_fix_plan.get("endpoints") or az_fix_plan.get("endpoint"))
@@ -2627,6 +2188,10 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
                 f"Связка между вызовами: {link_text}.",
             ]
         )
+
+    file_answer = _answer_from_attached_tables(task_id, task, main_goal)
+    if file_answer:
+        return file_answer
 
     ai_answer = _llm_answer(llm_question, payload, image_parts=image_parts)
     if ai_answer:
