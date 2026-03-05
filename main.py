@@ -931,6 +931,7 @@ def _finalize_orchestration_result(settings, task_id: int, orchestration_result:
 
 
 @app.post("/aa/run-task/{task_id}")
+@app.post("/run-task/{task_id}")
 def aa_run_task(task_id: int):
     settings = get_settings()
     ok, task, message = get_task_record(settings.database_url, task_id)

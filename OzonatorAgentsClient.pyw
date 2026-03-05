@@ -345,29 +345,53 @@ class AAClient:
         """"Пинок" оркестрации.
 
         Важно: на Render возможен таймаут на cold start — это НЕ ошибка, polling продолжится.
-        Но если сервер явно отвечает 4xx (например, неверный путь/токен) — показываем ошибку,
-        чтобы не зависать бесконечно.
+        Также на части деплоев маршрут запуска может отличаться или временно отдавать 404,
+        хотя сама задача уже создана и доступна для дальнейшего polling.
         """
         had_timeout = False
+        last_auth_error: ApiResponse | None = None
         last_4xx: ApiResponse | None = None
+        saw_404 = False
+
+        route_candidates = [
+            f"/aa/run-task/{task_id}",
+            f"/run-task/{task_id}",
+        ]
 
         for pref in self._prefixes():
             self.api_prefix = pref
-            url = self._mk(f"/aa/run-task/{task_id}")
-            resp = self._request_json("POST", url, {})
-            if resp.ok:
-                return
+            for route in route_candidates:
+                url = self._mk(route)
+                resp = self._request_json("POST", url, {})
+                if resp.ok:
+                    return
 
-            if resp.status == 0:
-                had_timeout = True
-                continue
+                if resp.status == 0:
+                    had_timeout = True
+                    continue
 
-            if 400 <= resp.status < 500:
-                last_4xx = resp
+                if resp.status in {401, 403}:
+                    last_auth_error = resp
+                    continue
+
+                if resp.status == 404:
+                    saw_404 = True
+                    continue
+
+                if 400 <= resp.status < 500:
+                    last_4xx = resp
 
         # Если были только таймауты/сетевые ошибки — считаем, что "пинок" мог сработать.
-        if had_timeout and last_4xx is None:
+        if had_timeout and last_auth_error is None and last_4xx is None:
             return
+
+        # После успешного create_task 404 не должен блокировать пользователя:
+        # задача уже создана, и клиент может продолжать обычный polling.
+        if saw_404:
+            return
+
+        if last_auth_error is not None:
+            raise RuntimeError(last_auth_error.error or f"run_task_failed ({last_auth_error.status})")
 
         if last_4xx is not None:
             raise RuntimeError(last_4xx.error or f"run_task_failed ({last_4xx.status})")
@@ -1338,7 +1362,6 @@ class App(tk.Tk):
                     self._send_stage = ""
                     self._last_send_error = err
                     self._polling = False
-                    self.current_task_id = None
                     self._update_status()
                     self._on_error(f"Не удалось отправить задачу ({stage}): {err}")
 
