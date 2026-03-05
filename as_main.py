@@ -643,6 +643,135 @@ def _format_web_results_answer_ru(addr: str, results: list[dict[str, str]], *, m
             lines.append(f"{i}. {title} — {url}")
     return "\n".join(lines).strip()
 
+
+def _extract_title_candidates_ru(text_ru: str) -> list[str]:
+    t = (text_ru or "").strip()
+    if not t:
+        return []
+    out: list[str] = []
+    # «...» / "..." / '...'
+    for rx in [
+        r"«([^»]{2,120})»",
+        r'"([^"]{2,120})"',
+        r"'([^']{2,120})'",
+    ]:
+        for m in re.finditer(rx, t):
+            cand = (m.group(1) or "").strip()
+            if cand and cand not in out:
+                out.append(cand)
+
+    # эвристика под частый кейс
+    low = t.lower()
+    for known in [
+        "теория большого взрыва",
+        "the big bang theory",
+    ]:
+        if known in low and known not in out:
+            out.append(known)
+    return out
+
+
+def _infer_recent_media_title(task_id: int, payload: dict[str, Any]) -> str:
+    """Пытается восстановить название (сериал/фильм/книга) из недавней истории пользователя.
+
+    Нужен для случаев, когда пользователь пишет: «дай ссылку легально», но не повторяет название в текущем сообщении.
+    """
+    try:
+        settings = get_settings()
+        db_url = settings.database_url
+    except Exception:
+        return ""
+
+    if not db_url:
+        return ""
+
+    user_key = str(payload.get("user_key") or "").strip()
+    user_name = ""
+    user_prefs = payload.get("user_prefs")
+    if isinstance(user_prefs, dict):
+        user_name = str(user_prefs.get("user_name") or "").strip()
+
+    ok, items, _msg = list_recent_user_tasks(db_url, user_key=user_key, user_name=user_name, limit=25)
+    if not ok or not items:
+        return ""
+
+    # идём от самых свежих задач к старым (обычно так и приходит из БД, но не полагаемся)
+    def _ts(x):
+        try:
+            return str(x.get("updated_at") or x.get("created_at") or "")
+        except Exception:
+            return ""
+    items = sorted(items, key=_ts, reverse=True)
+
+    for it in items:
+        tid = it.get("task_id") or it.get("id")
+        # пропускаем текущую
+        try:
+            if int(tid) == int(task_id):
+                continue
+        except Exception:
+            pass
+
+        p = it.get("payload") if isinstance(it.get("payload"), dict) else {}
+        texts = []
+        for k in ["user_request", "title", "brief"]:
+            v = p.get(k)
+            if v:
+                texts.append(str(v))
+        # иногда контекст лежит в az_fix_plan в result
+        r = it.get("result") if isinstance(it.get("result"), dict) else {}
+        az = r.get("az_fix_plan") if isinstance(r.get("az_fix_plan"), dict) else {}
+        for k in ["title", "goal"]:
+            v = az.get(k)
+            if v:
+                texts.append(str(v))
+
+        joined = "\n".join(texts).strip()
+        cands = _extract_title_candidates_ru(joined)
+        if cands:
+            return cands[0]
+
+        # более мягкая эвристика: после слов «сериал/фильм/книга»
+        low = joined.lower()
+        m = re.search(r"(сериал|фильм|книга)\s+([\w\-\s]{3,80})", low)
+        if m:
+            cand = (m.group(2) or "").strip()
+            if cand:
+                return cand
+
+    return ""
+
+
+def _build_legal_platform_links(title: str) -> list[dict[str, str]]:
+    """Формирует безопасный набор ссылок на легальные платформы/поиск.
+
+    Важно: мы не утверждаем, что контент точно доступен — только даём страницы поиска/каталога.
+    """
+    t = (title or "").strip()
+    import urllib.parse as urllib_parse
+    q = urllib_parse.quote_plus(t) if t else ""
+
+    def mk(tt: str, url: str, snip: str) -> dict[str, str]:
+        return {"title": tt, "url": url, "snippet": snip}
+
+    out: list[dict[str, str]] = []
+    if t:
+        out.append(mk("JustWatch — где доступно по стране", f"https://www.justwatch.com/ru/search?q={q}", "Агрегатор покажет, где легально смотреть/купить по твоей стране."))
+        out.append(mk("Netflix — поиск", f"https://www.netflix.com/search?q={q}", "Если сериал есть у Netflix в твоём регионе — найдёшь через поиск."))
+        out.append(mk("Apple TV — поиск", f"https://tv.apple.com/search?term={q}", "Поиск в Apple TV (покупка/подписка зависит от региона)."))
+        out.append(mk("Prime Video — поиск", f"https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}", "Поиск в Amazon Prime Video."))
+        out.append(mk("Google Play / Google TV — поиск", f"https://play.google.com/store/search?q={q}&c=movies", "Поиск в каталоге Google (фильмы/ТВ, доступ зависит от региона)."))
+        out.append(mk("Кинопоиск — поиск", f"https://www.kinopoisk.ru/index.php?kp_query={q}", "Поиск по каталогу Кинопоиска."))
+        out.append(mk("Okko — поиск", f"https://okko.tv/search?query={q}", "Поиск по каталогу Okko."))
+        out.append(mk("ivi — поиск", f"https://www.ivi.ru/search/?q={q}", "Поиск по каталогу ivi."))
+    else:
+        out.append(mk("JustWatch", "https://www.justwatch.com/ru", "Выбери страну и найди контент по названию."))
+        out.append(mk("Netflix", "https://www.netflix.com", "Открой и используй поиск по названию."))
+        out.append(mk("Apple TV", "https://tv.apple.com", "Открой и используй поиск по названию."))
+        out.append(mk("Prime Video", "https://www.primevideo.com", "Открой и используй поиск по названию."))
+    return out
+
+
 def _maybe_download_url_to_task(task_id: int, payload: dict[str, Any], user_text: str) -> str:
     """Если пользователь просит скачать файл по URL — скачиваем и кладём в task_files."""
     t = (user_text or "").lower()
@@ -2947,6 +3076,14 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
 
     addr = _pick_addressing(main_goal, default_addr, variants)
 
+    # Если пользователь просит «ссылку/где посмотреть/где скачать легально», но в текущем сообщении нет названия —
+    # попробуем восстановить контекст из недавних задач. Это позволит дать ссылки сразу, без уточняющих вопросов.
+    _t_low = (main_goal or "").lower()
+    _wants_link_intent = any(k in _t_low for k in ["ссылк", "источник", "где посмотреть", "где скачать", "офлайн", "offline", "легал", "лиценз", "официал"])
+    _recent_title = ""
+    if _wants_link_intent and not any(ch in (main_goal or "") for ch in ["«", "»", '"', "'"]):
+        _recent_title = _infer_recent_media_title(task_id, payload)
+
 
     # Если хочешь экономить токены и получать сразу ссылки — включи флаг OZONATOR_WEB_SKIP_LLM=1
 
@@ -2973,6 +3110,34 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
                 ans = ans.rstrip() + "\n\n" + web_notice
             return _enforce_feminine_ru(ans)
 
+
+
+    # Если web-поиск не дал результатов (или интернет недоступен), но пользователь явно просит ссылки —
+    # дадим безопасные страницы поиска/каталога на легальных сервисах, чтобы он всё равно получил URL.
+    if _wants_link_intent and not web_results:
+        try:
+            title = ""
+            # 1) из недавнего контекста
+            if _recent_title:
+                title = _recent_title
+            # 2) из текущего текста (в кавычках/известные названия)
+            if not title:
+                cands = _extract_title_candidates_ru(main_goal)
+                if cands:
+                    title = cands[0]
+            templ_results = _build_legal_platform_links(title)
+            fmt = _requested_export_format(main_goal) or "md"
+            settings = get_settings()
+            query = (title or main_goal or "легальные сервисы").strip()
+            _fname, notice = _save_web_results_as_file(task_id, settings.database_url, query=query, results=templ_results, fmt=fmt)
+            ans = _format_web_results_answer_ru(addr, templ_results, max_items=_WEB_SEARCH_MAX_RESULTS)
+            if notice:
+                ans = ans.rstrip() + "\n\n" + notice
+            else:
+                ans = ans.rstrip() + "\n\n" + "Если хочешь — скажи страну/платформу, и я сузю поиск."
+            return _enforce_feminine_ru(ans)
+        except Exception:
+            pass
 
     _clear_last_llm_error()
 
@@ -3022,13 +3187,17 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     if heur:
         return heur
 
-    parts = [f"Готово. Я подготовила решение по задаче: {main_goal}."]
-    if screen and screen != "Не указано":
-        parts.append(f"Область: {screen}.")
-    if target_columns:
-        parts.append(f"Целевые элементы: {', '.join(target_columns)}.")
-    parts.append("Я собрала артефакты и передала их на проверку AK.")
-    return " ".join(parts)
+    # На крайний случай — без внутренних статусов.
+    if isinstance(_LAST_LLM_ERROR, dict) and _LAST_LLM_ERROR.get("kind") in {"rate_limit", "request_too_large"}:
+        return _enforce_feminine_ru(
+            f"{addr}, сейчас я упёрлась в лимит провайдера и не могу развернуть ответ. " 
+            "Если это запрос на ссылки — напиши название (или возьми из предыдущего сообщения) и добавь слово ‘ссылки’, и я дам их сразу."
+        )
+
+    return _enforce_feminine_ru(
+        f"{addr}, я не смогла корректно сформировать ответ из текущего запроса. " 
+        "Попробуй уточнить, что именно нужно получить (ссылки, таблицу, расчёт, файл для скачивания), и я сделаю."
+    )
 
 
 def _build_as_artifacts(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
