@@ -47,17 +47,12 @@ CREATE_RETRIES = 2
 HTTP_TIMEOUT = int(os.getenv("OZONATOR_HTTP_TIMEOUT") or 90)
 UPLOAD_TIMEOUT = int(os.getenv("OZONATOR_UPLOAD_TIMEOUT") or max(180, HTTP_TIMEOUT))
 UPLOAD_RETRIES = int(os.getenv("OZONATOR_UPLOAD_RETRIES") or 2)
-SEND_TIMEOUT_SEC = 75  # ожидание получения task_id (create_task)
+SEND_TIMEOUT_SEC = 75
 FAST_POLL_MS = 250
 NORMAL_POLL_MS = 1000
 FAST_POLL_WINDOW_SEC = 12
 
-
-
-# Радикально иной подход к вложениям: по умолчанию отправляем не оригинал фото,
-# а "превью" (ресайз + JPEG), чтобы не ловить write timeout на медленных каналах.
-# Оригинал при этом остаётся локально у пользователя.
-CLIENT_IMAGE_MAX_BYTES = int(os.getenv("OZONATOR_CLIENT_IMAGE_MAX_BYTES") or 900_000)  # ~0.9MB
+CLIENT_IMAGE_MAX_BYTES = int(os.getenv("OZONATOR_CLIENT_IMAGE_MAX_BYTES") or 900_000)
 CLIENT_IMAGE_MAX_DIM = int(os.getenv("OZONATOR_CLIENT_IMAGE_MAX_DIM") or 1600)
 CLIENT_IMAGE_PREVIEW_ONLY = (os.getenv("OZONATOR_CLIENT_IMAGE_PREVIEW_ONLY") or "1").strip().lower() not in ("0", "false", "no")
 
@@ -76,7 +71,15 @@ STATE_FILE_NAME = "chat_state_v1.json"
 CONFIG_FILE_NAME = "client_config_v1.json"
 
 GEO_STATE_FILE_NAME = "geo_state_v1.json"
-GEO_TTL_SEC = max(300, int(os.getenv("OZONATOR_GEO_TTL_SEC") or str(6 * 60 * 60)))  # 6 часов
+GEO_TTL_SEC = max(300, int(os.getenv("OZONATOR_GEO_TTL_SEC") or str(6 * 60 * 60)))
+
+HISTORY_MAX_ITEMS = int(os.getenv("OZONATOR_HISTORY_MAX_ITEMS") or 80)
+HISTORY_MAX_CHARS = int(os.getenv("OZONATOR_HISTORY_MAX_CHARS") or 30000)
+HISTORY_MAX_EACH = int(os.getenv("OZONATOR_HISTORY_MAX_EACH") or 1400)
+HISTORY_HARD_MAX = int(os.getenv("OZONATOR_HISTORY_HARD_MAX") or 400)
+
+AA_DISPLAY_NAME = "Екатерина"
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -86,10 +89,6 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _app_data_dir() -> str:
-    """Папка для пользовательских данных клиента.
-
-    В Windows обычно переживает переустановку программы (если не чистить профиль).
-    """
     try:
         if os.name == "nt":
             base = os.getenv("APPDATA") or os.path.expanduser("~")
@@ -100,7 +99,6 @@ def _app_data_dir() -> str:
         os.makedirs(path, exist_ok=True)
         return path
     except Exception:
-        # fallback
         path = os.path.join(os.path.expanduser("~"), "ozonator_agents")
         try:
             os.makedirs(path, exist_ok=True)
@@ -118,7 +116,6 @@ def _read_json_file(path: str) -> dict | None:
 
 
 def _write_json_atomic(path: str, data: dict) -> None:
-    """Атомарная запись, чтобы не убить историю при внезапном закрытии."""
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -133,13 +130,6 @@ def _write_json_atomic(path: str, data: dict) -> None:
 
 
 def _load_or_create_user_key(config_path: str, bearer: str, admin_token: str) -> str:
-    """Стабильный ключ пользователя для восстановления истории.
-
-    Приоритет:
-    1) OZONATOR_USER_KEY (если задан)
-    2) sha256 от OZONATOR_AA_BEARER / OZONATOR_AA_ADMIN_TOKEN (ключи не светим)
-    3) сохранённый в config (uuid)
-    """
     env_key = (os.getenv("OZONATOR_USER_KEY") or "").strip()
     if env_key:
         return env_key
@@ -173,7 +163,6 @@ def _is_image_name(file_name: str, content_type: str) -> bool:
 
 
 def _make_image_preview(raw: bytes, max_dim: int, max_bytes: int):
-    """Делает JPEG-превью <= max_bytes. Требует Pillow. Возвращает (bytes, content_type) или (None, None)."""
     if not PIL_AVAILABLE or Image is None:
         return (None, None)
     try:
@@ -216,9 +205,8 @@ def _make_image_preview(raw: bytes, max_dim: int, max_bytes: int):
 
 
 def _prepare_file_for_upload(file_path: str):
-    """Возвращает (upload_name, content_type, content_bytes, note)."""
     file_name = os.path.basename(file_path) or "file"
-    ctype = __import__('mimetypes').guess_type(file_name)[0] or "application/octet-stream"
+    ctype = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
 
     with open(file_path, "rb") as f:
         raw = f.read() or b""
@@ -236,12 +224,6 @@ def _prepare_file_for_upload(file_path: str):
             return file_name, ctype, raw, note
 
     return file_name, ctype, raw, "отправлен оригинал"
-HISTORY_MAX_ITEMS = int(os.getenv("OZONATOR_HISTORY_MAX_ITEMS") or 80)
-HISTORY_MAX_CHARS = int(os.getenv("OZONATOR_HISTORY_MAX_CHARS") or 30000)
-HISTORY_MAX_EACH = int(os.getenv("OZONATOR_HISTORY_MAX_EACH") or 1400)
-HISTORY_HARD_MAX = int(os.getenv("OZONATOR_HISTORY_HARD_MAX") or 400)
-
-AA_DISPLAY_NAME = "Екатерина"
 
 
 @dataclass
@@ -258,571 +240,319 @@ class AAClient:
         self.api_prefix = ""
 
     def _prefixes(self):
-        # пробуем несколько вариантов (у тебя на деплоях бывает /api)
-        return ["", "/api"]
+        return [self.api_prefix] if self.api_prefix else ["", "/api/v1"]
 
-    def _mk(self, path: str) -> str:
-        return f"{self.base_url}{self.api_prefix}{path}"
+    def _full_url(self, path: str, prefix: str = "") -> str:
+        return f"{self.base_url}{prefix}{path}"
 
-    def _headers(self) -> dict:
-        h = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json",
-            "User-Agent": "OzonatorAgentsClient/1.0",
-        }
+    def _headers_json(self) -> dict:
+        h = {"Accept": "application/json", "Content-Type": "application/json"}
         if AA_BEARER:
             h["Authorization"] = f"Bearer {AA_BEARER}"
         if AA_ADMIN_TOKEN:
             h["X-Admin-Token"] = AA_ADMIN_TOKEN
         return h
 
-    def _request_raw(self, method: str, url: str, body: bytes | None, headers: dict, timeout: int = HTTP_TIMEOUT) -> ApiResponse:
-        req = urllib_request.Request(url, data=body, headers=headers, method=method)
-        try:
-            with urllib_request.urlopen(req, timeout=timeout) as r:
-                raw = r.read()
-                txt = raw.decode("utf-8") if raw else ""
-                return ApiResponse(True, r.status, json.loads(txt) if txt else {}, None)
-        except urllib_error.HTTPError as e:
-            status = int(getattr(e, "code", 0) or 0)
-            try:
-                raw = e.read()
-                txt = raw.decode("utf-8") if raw else ""
-                payload = json.loads(txt) if txt else {}
-            except Exception:
-                payload = None
-            return ApiResponse(False, status, payload, f"HTTPError {status}")
-        except urllib_error.URLError as e:
-            return ApiResponse(False, 0, None, f"URLError: {e}")
-        except Exception as e:
-            return ApiResponse(False, 0, None, f"{e.__class__.__name__}: {e}")
+    def _headers_plain(self) -> dict:
+        h = {"Accept": "application/json"}
+        if AA_BEARER:
+            h["Authorization"] = f"Bearer {AA_BEARER}"
+        if AA_ADMIN_TOKEN:
+            h["X-Admin-Token"] = AA_ADMIN_TOKEN
+        return h
 
-    def _request_json(self, method: str, url: str, body: dict | None, timeout: int = HTTP_TIMEOUT) -> ApiResponse:
-        data = None
-        if body is not None:
-            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    def _request(self, method: str, path: str, payload: dict | None = None, timeout: int | None = None) -> ApiResponse:
+        body = None
+        headers = self._headers_json() if payload is not None else self._headers_plain()
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-        req = urllib_request.Request(url, data=data, headers=self._headers(), method=method)
-        try:
-            with urllib_request.urlopen(req, timeout=timeout) as r:
-                raw = r.read()
-                txt = raw.decode("utf-8") if raw else ""
-                return ApiResponse(True, r.status, json.loads(txt) if txt else {}, None)
-        except urllib_error.HTTPError as e:
-            status = int(getattr(e, "code", 0) or 0)
+        last_err = None
+        for prefix in self._prefixes():
+            url = self._full_url(path, prefix)
+            req = urllib_request.Request(url, method=method.upper(), data=body, headers=headers)
             try:
-                raw = e.read()
-                txt = raw.decode("utf-8") if raw else ""
-                payload = json.loads(txt) if txt else {}
-            except Exception:
-                payload = None
-            return ApiResponse(False, status, payload, f"HTTPError {status}")
-        except urllib_error.URLError as e:
-            return ApiResponse(False, 0, None, f"URLError: {e}")
-        except Exception as e:
-            return ApiResponse(False, 0, None, f"{e.__class__.__name__}: {e}")
+                with urllib_request.urlopen(req, timeout=timeout or HTTP_TIMEOUT) as resp:
+                    raw = resp.read().decode("utf-8")
+                    data = json.loads(raw) if raw else {}
+                    self.api_prefix = prefix
+                    return ApiResponse(True, getattr(resp, "status", 200), data, None)
+            except urllib_error.HTTPError as e:
+                raw = ""
+                try:
+                    raw = e.read().decode("utf-8")
+                except Exception:
+                    pass
+                try:
+                    data = json.loads(raw) if raw else {}
+                except Exception:
+                    data = None
+                if getattr(e, "code", None) == 404:
+                    last_err = ApiResponse(False, e.code, data, raw or str(e))
+                    continue
+                return ApiResponse(False, e.code, data, raw or str(e))
+            except Exception as e:
+                last_err = ApiResponse(False, 0, None, str(e))
+                continue
+        return last_err or ApiResponse(False, 0, None, "unknown error")
 
     def create_task(self, payload: dict) -> int:
-        body = {
-            "target_agent": "AA",
-            "task_type": "user_task",
-            "priority": 100,
-            "payload": payload,
+        last_error = None
+        for attempt in range(CREATE_RETRIES + 1):
+            r = self._request("POST", "/tasks/create", payload)
+            if r.ok:
+                task = (r.data or {}).get("task") or {}
+                task_id = task.get("id")
+                if not task_id:
+                    raise RuntimeError("AA не вернул task.id")
+                return int(task_id)
+            last_error = r.error or f"HTTP {r.status}"
+            if r.status and 400 <= r.status < 500:
+                break
+            if attempt < CREATE_RETRIES:
+                time.sleep(0.8 * (attempt + 1))
+        raise RuntimeError(f"Не удалось создать задачу: {last_error}")
+            def upload_file(self, task_id: int, file_path: str) -> dict:
+        url = self._full_url(f"{self.api_prefix}/tasks/{task_id}/files/upload")
+
+        try:
+            file_name, content_type, file_bytes, note = _prepare_file_for_upload(file_path)
+        except Exception as e:
+            raise RuntimeError(f"Не удалось подготовить файл к отправке: {e}")
+
+        boundary = f"----OzonatorBoundary{uuid.uuid4().hex}"
+        body = build_multipart_form_data(boundary, "file", file_name, content_type, file_bytes)
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
         }
-
-        last_err = None
-        for _ in range(CREATE_RETRIES + 1):
-            for pref in self._prefixes():
-                self.api_prefix = pref
-                url = self._mk("/tasks/create")
-                resp = self._request_json("POST", url, body)
-                if resp.ok and resp.data and resp.data.get("task") and resp.data["task"].get("id"):
-                    return int(resp.data["task"]["id"])
-                last_err = resp.error or "create_task_failed"
-        raise RuntimeError(last_err or "create_task_failed")
-
-    def run_task(self, task_id: int) -> None:
-        """"Пинок" оркестрации.
-
-        Важно: на Render возможен таймаут на cold start — это НЕ ошибка, polling продолжится.
-        Также на части деплоев маршрут запуска может отличаться или временно отдавать 404,
-        хотя сама задача уже создана и доступна для дальнейшего polling.
-        """
-        had_timeout = False
-        last_auth_error: ApiResponse | None = None
-        last_4xx: ApiResponse | None = None
-        saw_404 = False
-
-        route_candidates = [
-            f"/aa/run-task/{task_id}",
-            f"/run-task/{task_id}",
-        ]
-
-        for pref in self._prefixes():
-            self.api_prefix = pref
-            for route in route_candidates:
-                url = self._mk(route)
-                resp = self._request_json("POST", url, {})
-                if resp.ok:
-                    return
-
-                if resp.status == 0:
-                    had_timeout = True
-                    continue
-
-                if resp.status in {401, 403}:
-                    last_auth_error = resp
-                    continue
-
-                if resp.status == 404:
-                    saw_404 = True
-                    continue
-
-                if 400 <= resp.status < 500:
-                    last_4xx = resp
-
-        # Если были только таймауты/сетевые ошибки — считаем, что "пинок" мог сработать.
-        if had_timeout and last_auth_error is None and last_4xx is None:
-            return
-
-        # После успешного create_task 404 не должен блокировать пользователя:
-        # задача уже создана, и клиент может продолжать обычный polling.
-        if saw_404:
-            return
-
-        if last_auth_error is not None:
-            raise RuntimeError(last_auth_error.error or f"run_task_failed ({last_auth_error.status})")
-
-        if last_4xx is not None:
-            raise RuntimeError(last_4xx.error or f"run_task_failed ({last_4xx.status})")
-
-
-    def get_task(self, task_id: int) -> dict | None:
-        for pref in self._prefixes():
-            self.api_prefix = pref
-            url = self._mk(f"/tasks/{task_id}")
-            resp = self._request_json("GET", url, None)
-            if resp.ok and resp.data and resp.data.get("task"):
-                return resp.data["task"]
-        return None
-
-    def get_logs(self, task_id: int) -> list[dict]:
-        for pref in self._prefixes():
-            self.api_prefix = pref
-            url = self._mk(f"/tasks/{task_id}/logs")
-            resp = self._request_json("GET", url, None)
-            if resp.ok and resp.data and isinstance(resp.data.get("logs"), list):
-                return resp.data["logs"]
-        return []
-
-    def list_task_files(self, task_id: int) -> list[dict]:
-        for pref in self._prefixes():
-            self.api_prefix = pref
-            url = self._mk(f"/tasks/{task_id}/files")
-            resp = self._request_json("GET", url, None)
-            if resp.ok and resp.data and isinstance(resp.data.get("files"), list):
-                return resp.data.get("files") or []
-        return []
-
-    def download_task_file(self, task_id: int, file_id: int) -> bytes:
-        headers = self._headers().copy()
-        headers.pop("Content-Type", None)
-        headers["Accept"] = "*/*"
-
-        last_err = None
-        for pref in self._prefixes():
-            self.api_prefix = pref
-            url = self._mk(f"/tasks/{task_id}/files/{file_id}/download")
-            req = urllib_request.Request(url, headers=headers, method="GET")
-            try:
-                with urllib_request.urlopen(req, timeout=max(HTTP_TIMEOUT, 180)) as r:
-                    return r.read() or b""
-            except urllib_error.HTTPError as e:
-                last_err = f"HTTPError {int(getattr(e, 'code', 0) or 0)}"
-            except urllib_error.URLError as e:
-                last_err = f"URLError: {e}"
-            except Exception as e:
-                last_err = f"{e.__class__.__name__}: {e}"
-
-        raise RuntimeError(last_err or "download_failed")
-
-    def upload_file_bytes(self, task_id: int, file_name: str, content_type: str, content: bytes, note: str = "отправлен оригинал") -> None:
-        boundary = "----ozonatorboundary" + uuid.uuid4().hex
-        head = (
-            f"--{boundary}\r\n"
-            f"Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n"
-            f"Content-Type: {content_type}\r\n\r\n"
-        ).encode("utf-8")
-        tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
-        body = head + (content or b"") + tail
-
-        dyn = int(len(body) / 180_000) + 45
-        upload_timeout = max(UPLOAD_TIMEOUT, dyn)
-        upload_timeout = min(upload_timeout, 900)
+        if AA_BEARER:
+            headers["Authorization"] = f"Bearer {AA_BEARER}"
+        if AA_ADMIN_TOKEN:
+            headers["X-Admin-Token"] = AA_ADMIN_TOKEN
 
         last_err = None
         for attempt in range(UPLOAD_RETRIES + 1):
-            for pref in self._prefixes():
-                self.api_prefix = pref
-                url = self._mk(f"/tasks/{task_id}/files/upload")
-                headers = self._headers().copy()
-                headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
-                headers["Accept"] = "application/json"
+            req = urllib_request.Request(url, method="POST", data=body, headers=headers)
+            try:
+                with urllib_request.urlopen(req, timeout=UPLOAD_TIMEOUT) as resp:
+                    raw = resp.read().decode("utf-8")
+                    data = json.loads(raw) if raw else {}
+                    file_obj = (data or {}).get("file") or {}
+                    if isinstance(file_obj, dict):
+                        file_obj.setdefault("client_note", note)
+                    return file_obj
+            except urllib_error.HTTPError as e:
+                raw = ""
+                try:
+                    raw = e.read().decode("utf-8")
+                except Exception:
+                    pass
+                last_err = raw or str(e)
+                if getattr(e, "code", 0) and 400 <= e.code < 500:
+                    break
+            except Exception as e:
+                last_err = str(e)
+            if attempt < UPLOAD_RETRIES:
+                time.sleep(1.0 * (attempt + 1))
+        raise RuntimeError(f"Не удалось загрузить файл: {last_err}")
 
-                resp = self._request_raw("POST", url, body, headers, timeout=upload_timeout)
-                if resp.ok:
-                    return
+    def run_task(self, task_id: int) -> dict:
+        r = self._request("POST", f"/aa/run-task/{task_id}", {})
+        if not r.ok:
+            raise RuntimeError(f"Не удалось запустить задачу: {r.error or r.status}")
+        return r.data or {}
 
-                detail = ""
-                if isinstance(resp.data, dict):
-                    detail = str(resp.data.get("detail") or resp.data.get("message") or "").strip()
-                last_err = (f"{resp.error or 'upload_failed'} (status={resp.status}) {detail}").strip()
+    def get_task(self, task_id: int) -> dict | None:
+        r = self._request("GET", f"/tasks/{task_id}")
+        if not r.ok:
+            return None
+        return (r.data or {}).get("task")
 
-            time.sleep(0.9 * (attempt + 1))
+    def get_logs(self, task_id: int) -> list[dict]:
+        r = self._request("GET", f"/tasks/{task_id}/logs")
+        if not r.ok:
+            return []
+        return list((r.data or {}).get("logs") or [])
 
-        raise RuntimeError((last_err or "upload_failed") + f"; note={note}")
+    def list_task_files(self, task_id: int) -> list[dict]:
+        r = self._request("GET", f"/tasks/{task_id}/files")
+        if not r.ok:
+            raise RuntimeError(r.error or f"HTTP {r.status}")
+        return list((r.data or {}).get("files") or [])
 
-    def get_recent_history(self, user_key: str, user_name: str | None = None, limit: int = 30) -> list[dict]:
-        """Пытается восстановить историю с сервера (если локальный файл отсутствует).
+    def download_task_file(self, task_id: int, file_id: int) -> bytes:
+        url = self._full_url(f"{self.api_prefix}/tasks/{task_id}/files/{file_id}/download")
+        headers = self._headers_plain()
+        req = urllib_request.Request(url, method="GET", headers=headers)
+        with urllib_request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return resp.read()
 
-        Возвращает список элементов (в обратном хронологическом порядке на сервере),
-        поэтому клиент дальше разворачивает в нормальный порядок.
-        """
-        limit = max(1, min(int(limit or 30), 200))
-        q = {
-            "limit": str(limit),
-        }
+    def history_recent(self, user_key: str | None, user_name: str | None, limit: int = 30) -> list[dict]:
+        params = {}
         if user_key:
-            q["user_key"] = user_key
+            params["user_key"] = user_key
         if user_name:
-            q["user_name"] = str(user_name)
+            params["user_name"] = user_name
+        params["limit"] = str(limit)
+        qs = urllib_parse.urlencode(params)
+        path = "/history/recent"
+        if qs:
+            path += "?" + qs
+        r = self._request("GET", path)
+        if not r.ok:
+            return []
+        return list((r.data or {}).get("items") or [])
 
-        query = urllib_parse.urlencode(q)
 
-        for pref in self._prefixes():
-            self.api_prefix = pref
-            url = self._mk(f"/history/recent?{query}")
-            resp = self._request_json("GET", url, None)
-            if resp.ok and resp.data and isinstance(resp.data.get("items"), list):
-                return resp.data.get("items") or []
-        return []
+def build_multipart_form_data(boundary: str, field_name: str, file_name: str, content_type: str, file_bytes: bytes) -> bytes:
+    b = io.BytesIO()
+    sep = f"--{boundary}\r\n".encode("utf-8")
+    b.write(sep)
+    b.write(
+        f'Content-Disposition: form-data; name="{field_name}"; filename="{file_name}"\r\n'.encode("utf-8")
+    )
+    b.write(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
+    b.write(file_bytes)
+    b.write(b"\r\n")
+    b.write(f"--{boundary}--\r\n".encode("utf-8"))
+    return b.getvalue()
 
 
-    def upload_file(self, task_id: int, file_path: str) -> None:
+def now_hhmm() -> str:
+    return time.strftime("%H:%M")
 
-        upload_name, ctype, content, note = _prepare_file_for_upload(file_path)
-        self.upload_file_bytes(task_id, upload_name, ctype, content, note=note)
+
+def _safe_text(s) -> str:
+    if s is None:
+        return ""
+    return str(s)
+
+
+def _clip_text(s: str, max_len: int) -> str:
+    s = _safe_text(s)
+    return s if len(s) <= max_len else s[: max_len - 1] + "…"
+
+
+def _sanitize_for_context(role: str, author: str, text: str) -> str:
+    role = _safe_text(role).strip().lower()
+    author = _safe_text(author).strip() or ("Ты" if role == "user" else AA_DISPLAY_NAME)
+    text = _safe_text(text).replace("\r\n", "\n").strip()
+    text = _clip_text(text, HISTORY_MAX_EACH)
+    return f"{author}: {text}"
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-
         self.title("Ozonator Agents Client")
-        self.geometry("940x680")
-        self.minsize(840, 600)
+        self.geometry("980x620")
+        self.minsize(760, 520)
 
         self.client = AAClient(DEFAULT_AA_BASE_URL)
 
         self.current_task_id: int | None = None
-        self._polling = False
-        self._poll_fast_until = 0.0
-        self._poll_inflight = False
-
-        self._typing_range = None
-        self._conversation_history: list[dict[str, str]] = []
-        self._transcript: list[dict[str, str]] = []
-        self._state_path = os.path.join(_app_data_dir(), STATE_FILE_NAME)
-        self._config_path = os.path.join(_app_data_dir(), CONFIG_FILE_NAME)
-        self.user_key = _load_or_create_user_key(self._config_path, AA_BEARER, AA_ADMIN_TOKEN)
-        self._share_geo = self._load_share_geo_flag()
-        self._attached_files: list[str] = []
         self._last_task_status: str = ""
-        self._poll_started_at: float = 0.0
-
-        # send/create_task tracking (чтобы не зависать без task_id)
-        self._sending: bool = False
-        self._sending_started_at: float | None = None
-        self._send_stage: str = ""
+        self._typing_item_id = None
+        self._attached_files: list[str] = []
+        self._message_items: list[dict] = []
+        self._polling = False
+        self._poll_inflight = False
+        self._poll_started_at = 0.0
+        self._poll_fast_until = 0.0
+        self._sending = False
+        self._sending_started_at = 0.0
+        self._send_stage = ""
         self._last_send_error: str | None = None
-        self._send_nonce: str = uuid.uuid4().hex
+        self._send_nonce = uuid.uuid4().hex
+
+        self._config_path = os.path.join(_app_data_dir(), CONFIG_FILE_NAME)
+        self._state_path = os.path.join(_app_data_dir(), STATE_FILE_NAME)
+        self._user_key = _load_or_create_user_key(self._config_path, AA_BEARER, AA_ADMIN_TOKEN)
+        self._share_geo = _env_bool("OZONATOR_SHARE_GEO", True)
+        self._share_geo_prefs = _read_json_file(self._config_path) or {}
+        if isinstance(self._share_geo_prefs, dict) and "share_geo" in self._share_geo_prefs:
+            try:
+                self._share_geo = bool(self._share_geo_prefs.get("share_geo"))
+            except Exception:
+                pass
 
         self._build_ui()
-        self._bind_hotkeys()
-
-        self._restore_on_startup()
-
-        self.after(FAST_POLL_MS, self._tick)
-
-    def _bind_hotkeys(self):
-        self.bind_all("<Control-l>", lambda _e: self._clear_input())
-        self.bind_all("<Control-L>", lambda _e: self._clear_input())
-        self.bind_all("<Return>", lambda _e: self._on_send())
-
-    def _build_ui(self):
-        # Header
-        header = tk.Frame(self, padx=10, pady=10)
-        header.pack(side=tk.TOP, fill=tk.X)
-
-        # Avatar (simple circle)
-        self.avatar = tk.Canvas(header, width=44, height=44, highlightthickness=0)
-        self.avatar.pack(side=tk.LEFT)
-        self._draw_avatar()
-
-        name_frame = tk.Frame(header)
-        name_frame.pack(side=tk.LEFT, padx=10)
-
-        self.lbl_name = tk.Label(name_frame, text=AA_DISPLAY_NAME, font=("Segoe UI", 14, "bold"))
-        self.lbl_name.pack(anchor="w")
-        self.lbl_status = tk.Label(name_frame, text="● online", font=("Segoe UI", 10))
-        self.lbl_status.pack(anchor="w")
-
-        self.btn_logs = tk.Button(header, text="Логи", command=self._open_logs)
-        self.btn_logs.pack(side=tk.RIGHT)
-
-        self.btn_downloads = tk.Button(header, text="Скачать", command=self._open_task_files)
-        self.btn_downloads.pack(side=tk.RIGHT, padx=(0, 8))
-
-        self.btn_settings = tk.Button(header, text="Настройки", command=self._open_settings)
-        self.btn_settings.pack(side=tk.RIGHT, padx=(0, 8))
-
-        # Chat area
-        body = tk.Frame(self, padx=10, pady=6)
-        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        self.chat = tk.Text(body, wrap="word", state="disabled", font=("Segoe UI", 11))
-        self.chat.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        scroll = tk.Scrollbar(body, command=self.chat.yview)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.chat.configure(yscrollcommand=scroll.set)
-
-        self.chat.tag_configure("ts", foreground="#666666")
-        self.chat.tag_configure("user", font=("Segoe UI", 11, "bold"))
-        self.chat.tag_configure("aa", font=("Segoe UI", 11, "bold"))
-
-        # Input row
-        bottom = tk.Frame(self, padx=10, pady=10)
-        bottom.pack(side=tk.BOTTOM, fill=tk.X)
-
-        self.btn_files = tk.Button(bottom, text="Файлы", command=self._pick_files)
-        self.btn_files.pack(side=tk.LEFT)
-
-        self.var_share_geo = tk.BooleanVar(value=bool(getattr(self, "_share_geo", True)))
-
-        input_wrap = tk.Frame(bottom)
-        input_wrap.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
-
-        self.entry = tk.Text(input_wrap, font=("Segoe UI", 12), height=3, wrap="word")
-        self.entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        in_scroll = tk.Scrollbar(input_wrap, command=self.entry.yview)
-        in_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.entry.configure(yscrollcommand=in_scroll.set)
-        self.entry.focus_set()
-
-        # Ctrl+Enter — отправить (Enter оставляем как в блокноте: новая строка)
-        self.entry.bind("<Control-Return>", lambda _e: self._on_send() or "break")
-        self.entry.bind("<Control-KP_Enter>", lambda _e: self._on_send() or "break")
-        self.entry.bind("<Control-v>", self._on_paste_into_input)
-        self.entry.bind("<<Paste>>", self._on_paste_into_input)
-
-        self.btn_send = tk.Canvas(bottom, width=46, height=46, highlightthickness=0)
-        self.btn_send.pack(side=tk.RIGHT, padx=(10, 0))
-        self._draw_send_button()
-        self.btn_send.bind("<Button-1>", lambda _e: self._on_send())
-
         self._install_context_menus()
-
-    def _draw_avatar(self):
-        self.avatar.delete("all")
-        self.avatar.create_oval(2, 2, 42, 42, fill="#2b2b2b", outline="")
-        self.avatar.create_text(22, 22, text="Е", fill="white", font=("Segoe UI", 16, "bold"))
-
-    def _draw_send_button(self):
-        self.btn_send.delete("all")
-        self.btn_send.create_oval(2, 2, 44, 44, fill="#2b2b2b", outline="")
-        # small arrow
-        self.btn_send.create_polygon(20, 15, 32, 23, 20, 31, 22, 23, fill="white", outline="white")
-
-
-    def _clean_aa_text(self, text: str) -> str:
-
-        """Убираем служебные маркеры из ответа Екатерины, чтобы не показывать пользователю."""
-
-        if not isinstance(text, str):
-
-            return ""
-
-        t = text
-
-        # Полный блок
-
-        t = re.sub(r"\[\[EK_SELF_PROFILE_UPDATE\]\].*?(\[\[/EK_SELF_PROFILE_UPDATE\]\])", "", t, flags=re.S)
-
-        # Если блок обрезан и закрывающий тег не пришёл
-
-        t = re.sub(r"\[\[EK_SELF_PROFILE_UPDATE\]\].*$", "", t, flags=re.S)
-
-        return t.strip()
-
-
-    def _append_with_stamp(self, stamp: str, who: str, text: str):
-        self.chat.configure(state="normal")
-        if self.chat.index("end-1c") != "1.0":
-            self.chat.insert(tk.END, "\n")
-        self.chat.insert(tk.END, f"{stamp}\n", ("ts",))
-        tag = "user" if who == "Ты" else "aa"
-        self.chat.insert(tk.END, f"{who}\n", (tag,))
-        self.chat.insert(tk.END, f"{text.strip()}\n")
-        self.chat.see(tk.END)
-        self.chat.configure(state="disabled")
-
-    def _append(self, who: str, text: str):
-        self._append_with_stamp(datetime.now().strftime("%H:%M"), who, text)
-
-    def _add_message(
-        self,
-        role: str,
-        who: str,
-        text: str,
-        include_in_context: bool = True,
-        stamp: str | None = None,
-    ):
-        stamp = stamp or datetime.now().strftime("%H:%M")
-        self._append_with_stamp(stamp, who, text)
-
-        # В LLM-контекст кладём только user/assistant.
-        if include_in_context and role in {"user", "assistant"}:
-            self._push_history(role, text)
-
-        # Полный лог для восстановления UI
-        self._transcript.append({
-            "stamp": stamp,
-            "role": role,
-            "who": who,
-            "content": text,
-        })
-        if len(self._transcript) > STATE_MAX_ITEMS:
-            self._transcript = self._transcript[-STATE_MAX_ITEMS:]
-        self._save_state()
-
-    def _save_state(self):
-        data = {
-            "version": STATE_VERSION,
-            "user_key": self.user_key,
-            "updated_at": datetime.utcnow().isoformat(),
-            "transcript": self._transcript[-STATE_MAX_ITEMS:],
-        }
-        _write_json_atomic(self._state_path, data)
-
-    def _load_state(self) -> dict | None:
-        st = _read_json_file(self._state_path)
-        if not isinstance(st, dict):
-            return None
-        if int(st.get("version") or 0) != STATE_VERSION:
-            return None
-        tr = st.get("transcript")
-        if not isinstance(tr, list):
-            return None
-        return st
+        self._restore_history()
+        self._tick()
 
     def _geo_state_path(self) -> str:
         return os.path.join(_app_data_dir(), GEO_STATE_FILE_NAME)
 
-    def _load_share_geo_flag(self) -> bool:
-        cfg = _read_json_file(self._config_path) or {}
-        if not isinstance(cfg, dict):
-            cfg = {}
-        if "share_geo" in cfg:
-            default_val = bool(cfg.get("share_geo"))
-        else:
-            default_val = True
-        return _env_bool("OZONATOR_SHARE_GEO", default_val)
-
-    def _save_share_geo_flag(self, value: bool) -> None:
-        cfg = _read_json_file(self._config_path) or {}
-        if not isinstance(cfg, dict):
-            cfg = {}
-        cfg["version"] = int(cfg.get("version") or 1)
-        cfg["user_key"] = str(cfg.get("user_key") or self.user_key)
-        cfg["share_geo"] = bool(value)
-        _write_json_atomic(self._config_path, cfg)
+    def _load_geo_cache(self) -> dict | None:
+        data = _read_json_file(self._geo_state_path())
+        if not isinstance(data, dict):
+            return None
+        try:
+            fetched_at = data.get("fetched_at")
+            if fetched_at:
+                dt = datetime.fromisoformat(str(fetched_at).replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
+                if age > GEO_TTL_SEC:
+                    return None
+        except Exception:
+            return None
+        geo = data.get("geo")
+        return geo if isinstance(geo, dict) else None
 
     def _fetch_geo_by_ip(self) -> dict | None:
-        """Геопозиция по IP (примерная): город + координаты."""
-        urls = [
+        candidates = [
             "https://ipapi.co/json/",
-            "https://ipinfo.io/json",
+            "https://ipwho.is/",
         ]
-        for url in urls:
+        headers = {"User-Agent": "ozonator-agents-client/1.0", "Accept": "application/json"}
+
+        for url in candidates:
             try:
-                req = urllib_request.Request(
-                    url,
-                    headers={"Accept": "application/json", "User-Agent": "OzonatorAgentsClient/geo"},
-                    method="GET",
-                )
-                with urllib_request.urlopen(req, timeout=4) as r:
-                    raw = r.read()
-                data = json.loads(raw.decode("utf-8", "ignore"))
+                req = urllib_request.Request(url, headers=headers, method="GET")
+                with urllib_request.urlopen(req, timeout=8) as resp:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                    data = json.loads(raw)
 
-                geo = {"source": "ip"}
+                geo = {
+                    "ip": data.get("ip"),
+                    "lat": data.get("latitude") if data.get("latitude") is not None else data.get("latitude_decimal"),
+                    "lon": data.get("longitude") if data.get("longitude") is not None else data.get("longitude_decimal"),
+                    "city": data.get("city"),
+                    "region": data.get("region") or data.get("region_name"),
+                    "country": data.get("country_name") or data.get("country"),
+                    "source": "ip",
+                    "timezone": data.get("timezone") if isinstance(data.get("timezone"), str) else (data.get("timezone", {}) or {}).get("id"),
+                }
 
-                if "ipapi.co" in url:
-                    geo["ip"] = data.get("ip")
-                    geo["city"] = data.get("city")
-                    geo["region"] = data.get("region")
-                    geo["country"] = data.get("country_name") or data.get("country")
-                    geo["timezone"] = data.get("timezone")
-                    lat = data.get("latitude")
-                    lon = data.get("longitude")
-                else:
-                    geo["ip"] = data.get("ip")
-                    geo["city"] = data.get("city")
-                    geo["region"] = data.get("region")
-                    geo["country"] = data.get("country")
-                    geo["timezone"] = data.get("timezone")
-                    loc = (data.get("loc") or "").strip()  # "lat,lon"
-                    lat, lon = (None, None)
-                    if "," in loc:
-                        a, b = loc.split(",", 1)
-                        lat, lon = a.strip(), b.strip()
+                success = data.get("success")
+                if success is False:
+                    continue
 
+                lat = geo.get("lat")
+                lon = geo.get("lon")
+                if lat is None or lon is None:
+                    continue
                 try:
-                    geo["lat"] = float(lat) if lat is not None and str(lat).strip() else None
-                    geo["lon"] = float(lon) if lon is not None and str(lon).strip() else None
+                    geo["lat"] = float(lat)
+                    geo["lon"] = float(lon)
                 except Exception:
-                    geo["lat"], geo["lon"] = (None, None)
-
-                if geo.get("lat") is not None and geo.get("lon") is not None:
-                    return geo
-            except (urllib_error.HTTPError, urllib_error.URLError, json.JSONDecodeError):
-                continue
+                    continue
+                return geo
             except Exception:
                 continue
         return None
-
-    def _get_geo(self) -> dict | None:
-        if not getattr(self, "_share_geo", False):
+            def _get_geo(self) -> dict | None:
+        if not self._share_geo:
             return None
-
-        path = self._geo_state_path()
-        st = _read_json_file(path) or {}
-        if isinstance(st, dict):
-            geo = st.get("geo")
-            ts = st.get("fetched_at")
-            if isinstance(geo, dict) and ts:
-                try:
-                    fetched = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-                    age = (datetime.now(timezone.utc) - fetched).total_seconds()
-                    if age < GEO_TTL_SEC:
-                        return geo
-                except Exception:
-                    pass
-
+        cached = self._load_geo_cache()
+        if cached:
+            return cached
         geo = self._fetch_geo_by_ip()
         if geo:
             _write_json_atomic(
-                path,
+                self._geo_state_path(),
                 {
                     "version": 1,
                     "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -833,300 +563,288 @@ class App(tk.Tk):
 
     def _on_toggle_geo(self):
         self._share_geo = bool(self.var_share_geo.get())
-        self._save_share_geo_flag(self._share_geo)
+        cfg = _read_json_file(self._config_path) or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        cfg["version"] = 1
+        cfg["user_key"] = self._user_key
+        cfg["share_geo"] = self._share_geo
+        _write_json_atomic(self._config_path, cfg)
         try:
-            self._update_status()
+            if getattr(self, "_geo_status_var", None) is not None:
+                self._geo_status_var.set(self._format_geo_status())
         except Exception:
             pass
 
-    def _restore_on_startup(self):
-        # 1) локальная история
-        st = self._load_state()
-        if st:
-            tr = st.get("transcript") or []
-            if isinstance(tr, list) and tr:
-                self._transcript = []
-                self._conversation_history = []
-                for item in tr:
-                    if not isinstance(item, dict):
-                        continue
-                    stamp = str(item.get("stamp") or "").strip() or "--:--"
-                    who = str(item.get("who") or "").strip() or AA_DISPLAY_NAME
-                    role = str(item.get("role") or "").strip() or "meta"
-                    content = str(item.get("content") or "").strip()
-                    if not content:
-                        continue
-                    self._append_with_stamp(stamp, who, content)
-                    self._transcript.append({"stamp": stamp, "role": role, "who": who, "content": content})
-                    if role in {"user", "assistant"}:
-                        self._conversation_history.append({"role": role, "content": content})
+    def _build_ui(self):
+        top = tk.Frame(self, padx=10, pady=10)
+        top.pack(fill=tk.X)
 
-        # 2) если локально пусто — пытаемся подтянуть с сервера
-        if not self._transcript:
-            self._restore_from_server_async()
+        left = tk.Frame(top)
+        left.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-    def _stamp_from_iso(self, iso_ts: str | None) -> str:
-        if not iso_ts:
-            return "--:--"
-        try:
-            # ожидаем формат вида 2026-03-04T12:34:56+00:00
-            dt = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
-            return dt.astimezone().strftime("%H:%M")
-        except Exception:
-            return "--:--"
+        tk.Label(left, text="Екатерина", font=("Segoe UI", 16, "bold")).pack(anchor="w")
 
-    def _restore_from_server_async(self):
-        def worker():
-            try:
-                items = self.client.get_recent_history(self.user_key, user_name="Александр", limit=24)
-            except Exception:
-                items = []
+        self.status_var = tk.StringVar(value="online")
+        self.status_label = tk.Label(left, textvariable=self.status_var, font=("Segoe UI", 10))
+        self.status_label.pack(anchor="w", pady=(2, 0))
 
-            if not items:
-                return
+        right = tk.Frame(top)
+        right.pack(side=tk.RIGHT)
 
-            # сервер отдаёт DESC — разворачиваем в нормальный порядок
-            items = list(reversed(items))
+        tk.Button(right, text="Настройки", command=self._open_settings).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(right, text="Скачать", command=self._open_task_files).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(right, text="Логи", command=self._open_logs).pack(side=tk.LEFT)
 
-            def ui_apply():
-                if self._transcript:
-                    return
-                self._apply_server_history(items)
+        mid = tk.Frame(self, padx=10)
+        mid.pack(fill=tk.BOTH, expand=True)
 
-            self.after(0, ui_apply)
+        self.chat = tk.Text(mid, wrap="word", state="disabled", font=("Segoe UI", 11))
+        self.chat.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        threading.Thread(target=worker, daemon=True).start()
+        scroll = tk.Scrollbar(mid, command=self.chat.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.chat.configure(yscrollcommand=scroll.set)
 
-    def _apply_server_history(self, items: list[dict]):
-        if not items:
-            return
+        bottom = tk.Frame(self, padx=10, pady=10)
+        bottom.pack(fill=tk.X)
 
-        self._transcript = []
-        self._conversation_history = []
+        self.files_btn = tk.Button(bottom, text="Файлы", command=self._pick_files)
+        self.files_btn.pack(side=tk.LEFT)
 
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            stamp = self._stamp_from_iso(it.get("created_at"))
-            user_text = str(it.get("user_request") or "").strip()
-            aa_text = str(it.get("final_answer") or "").strip()
+        self.entry = tk.Text(bottom, height=4, wrap="word", font=("Segoe UI", 11))
+        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 10))
+        self.entry.bind("<Return>", self._on_enter_pressed)
+        self.entry.bind("<Shift-Return>", self._on_shift_enter_pressed)
+        self.entry.bind("<Control-v>", self._on_paste)
+        self.entry.bind("<Control-V>", self._on_paste)
 
-            if user_text:
-                self._append_with_stamp(stamp, "Ты", user_text)
-                self._transcript.append({"stamp": stamp, "role": "user", "who": "Ты", "content": user_text})
-                self._conversation_history.append({"role": "user", "content": user_text})
+        send_wrap = tk.Frame(bottom, width=56, height=56)
+        send_wrap.pack(side=tk.RIGHT)
+        send_wrap.pack_propagate(False)
 
-            if aa_text:
-                self._append_with_stamp(stamp, AA_DISPLAY_NAME, aa_text)
-                self._transcript.append({"stamp": stamp, "role": "assistant", "who": AA_DISPLAY_NAME, "content": aa_text})
-                self._conversation_history.append({"role": "assistant", "content": aa_text})
+        self.send_btn = tk.Button(send_wrap, text="➤", font=("Segoe UI", 18), command=self._on_send)
+        self.send_btn.pack(fill=tk.BOTH, expand=True)
 
-        if len(self._conversation_history) > HISTORY_HARD_MAX:
-            self._conversation_history = self._conversation_history[-HISTORY_HARD_MAX:]
-        if len(self._transcript) > STATE_MAX_ITEMS:
-            self._transcript = self._transcript[-STATE_MAX_ITEMS:]
-        self._save_state()
+        self.var_share_geo = tk.BooleanVar(value=self._share_geo)
+        self._update_status()
+
+    def _update_status(self):
+        parts = ["online"]
+
+        if self.current_task_id is not None:
+            task_part = f"задача #{self.current_task_id}"
+            if self._last_task_status:
+                task_part += f" · {self._last_task_status}"
+            parts.append(task_part)
+        elif self._sending:
+            stage_map = {
+                "create_task": "создание задачи",
+                "upload_files": "загрузка файлов",
+                "run_task": "запуск задачи",
+            }
+            parts.append(stage_map.get(self._send_stage, self._send_stage or "отправка"))
+
+        if self._attached_files:
+            parts.append(f"файлов: {len(self._attached_files)}")
+
+        self.status_var.set(" • ".join(parts))
+
+    def _insert_chat(self, text: str, tag: str | None = None):
+        self.chat.configure(state="normal")
+        self.chat.insert("end", text, tag if tag else ())
+        self.chat.see("end")
+        self.chat.configure(state="disabled")
+
+    def _add_message(self, role: str, author: str, text: str, include_in_context: bool = True):
+        ts = now_hhmm()
+        header = f"\n{ts}\n{author}\n"
+        self._insert_chat(header, "hdr")
+        self._insert_chat(text + "\n", "msg")
+
+        item = {
+            "role": role,
+            "author": author,
+            "text": text,
+            "ts": ts,
+            "include_in_context": bool(include_in_context),
+        }
+        self._message_items.append(item)
+        self._trim_message_items()
+        self._persist_state()
+
+    def _trim_message_items(self):
+        if len(self._message_items) > HISTORY_HARD_MAX:
+            self._message_items = self._message_items[-HISTORY_HARD_MAX:]
 
     def _show_typing(self):
-        # мгновенный отклик
-        try:
-            self._clear_typing_if_any()
-            stamp = datetime.now().strftime("%H:%M")
-            self.chat.configure(state="normal")
-            if self.chat.index("end-1c") != "1.0":
-                self.chat.insert(tk.END, "\n")
-            start = self.chat.index(tk.END)
-            self.chat.insert(tk.END, f"{stamp}\n", ("ts",))
-            self.chat.insert(tk.END, f"{AA_DISPLAY_NAME}\n", ("aa",))
-            self.chat.insert(tk.END, "…\n")
-            end = self.chat.index(tk.END)
-            self.chat.see(tk.END)
-            self.chat.configure(state="disabled")
-            self._typing_range = (start, end)
-        except Exception:
-            self._typing_range = None
+        if self._typing_item_id is not None:
+            return
+        self.chat.configure(state="normal")
+        self._typing_item_id = self.chat.index("end-1c")
+        self.chat.insert("end", f"\n{AA_DISPLAY_NAME}\n…\n", "typing")
+        self.chat.see("end")
+        self.chat.configure(state="disabled")
 
     def _clear_typing_if_any(self):
-        rng = getattr(self, "_typing_range", None)
-        if not rng:
+        if self._typing_item_id is None:
             return
+        self.chat.configure(state="normal")
         try:
-            start, end = rng
-            self.chat.configure(state="normal")
-            self.chat.delete(start, end)
-            self.chat.configure(state="disabled")
+            self.chat.delete(self._typing_item_id, "end-1c")
         except Exception:
             pass
-        self._typing_range = None
-
-    def _clear_input(self):
-        self.entry.delete("1.0", tk.END)
+        self.chat.configure(state="disabled")
+        self._typing_item_id = None
 
     def _pick_files(self):
         paths = filedialog.askopenfilenames(title="Выбери файлы")
         if not paths:
             return
-        self._attached_files = [str(p) for p in paths if p]
+        for p in paths:
+            if p not in self._attached_files:
+                self._attached_files.append(p)
         self._update_status()
 
     def _clear_files(self):
-        self._attached_files = []
+        self._attached_files.clear()
         self._update_status()
 
-    def _update_status(self):
-        parts = ["● online"]
-        if self._attached_files:
-            parts.append(f"файлов: {len(self._attached_files)}")
-        if self.current_task_id is not None:
-            parts.append(f"задача #{self.current_task_id}")
-        if self._last_task_status:
-            parts.append(f"{self._last_task_status}")
-        if self._sending and self._send_stage:
-            parts.append(f"отправка: {self._send_stage}")
-        self.lbl_status.config(text=" · ".join(parts))
+    def _clear_input(self):
+        self.entry.delete("1.0", "end")
 
+    def _on_enter_pressed(self, event):
+        self._on_send()
+        return "break"
+
+    def _on_shift_enter_pressed(self, event):
+        self.entry.insert("insert", "\n")
+        return "break"
+
+    def _state_payload(self) -> dict:
+        items = self._message_items[-STATE_MAX_ITEMS:]
+        return {
+            "version": STATE_VERSION,
+            "user_key": self._user_key,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "items": items,
+        }
+
+    def _persist_state(self):
+        try:
+            _write_json_atomic(self._state_path, self._state_payload())
+        except Exception:
+            pass
+
+    def _restore_history(self):
+        restored_any = False
+
+        data = _read_json_file(self._state_path)
+        if isinstance(data, dict) and data.get("version") == STATE_VERSION:
+            items = data.get("items") or []
+            if isinstance(items, list):
+                for item in items[-STATE_MAX_ITEMS:]:
+                    if not isinstance(item, dict):
+                        continue
+                    role = _safe_text(item.get("role")) or "assistant"
+                    author = _safe_text(item.get("author")) or ("Ты" if role == "user" else AA_DISPLAY_NAME)
+                    text = _safe_text(item.get("text"))
+                    ts = _safe_text(item.get("ts")) or now_hhmm()
+                    include_in_context = bool(item.get("include_in_context", True))
+                    self.chat.configure(state="normal")
+                    self.chat.insert("end", f"\n{ts}\n{author}\n", "hdr")
+                    self.chat.insert("end", text + "\n", "msg")
+                    self.chat.configure(state="disabled")
+                    self._message_items.append(
+                        {
+                            "role": role,
+                            "author": author,
+                            "text": text,
+                            "ts": ts,
+                            "include_in_context": include_in_context,
+                        }
+                    )
+                self.chat.see("end")
+                restored_any = bool(items)
+
+        if restored_any:
+            return
+
+        try:
+            items = self.client.history_recent(self._user_key, None, limit=20)
+        except Exception:
+            items = []
+
+        if not items:
+            return
+
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            user_text = _safe_text(row.get("content"))
+            final_answer = ""
+            result = row.get("result") if isinstance(row.get("result"), dict) else {}
+            if isinstance(result, dict):
+                final_answer = _safe_text(result.get("final_answer"))
+
+            if user_text:
+                self._add_message("user", "Ты", user_text)
+            if final_answer:
+                self._add_message("assistant", AA_DISPLAY_NAME, final_answer)
+
+    def _context_messages(self) -> list[str]:
+        items = [x for x in self._message_items if x.get("include_in_context", True)]
+        items = items[-HISTORY_MAX_ITEMS:]
+
+        chunks: list[str] = []
+        total = 0
+        for item in items:
+            line = _sanitize_for_context(item.get("role", ""), item.get("author", ""), item.get("text", ""))
+            if not line:
+                continue
+            add_len = len(line) + 1
+            if total + add_len > HISTORY_MAX_CHARS:
+                break
+            chunks.append(line)
+            total += add_len
+        return chunks
 
     def _build_task_payload(self, user_text: str) -> dict:
-        # user_prefs (как ты попросил)
-        user_prefs = {
-            "user_name": "Александр",
-            "pronoun": "ты",
-            "addressing_default": "Саша",
-            "addressing_variants": ["Александр", "Саша", "Сашечка", "Александр Николаевич"],
-            "never_discuss_ai": True,
+        prompt = user_text.strip()
+        context = self._context_messages()
+
+        payload = {
+            "external_task_id": f"client-{uuid.uuid4().hex}",
+            "task_type": "user_task",
+            "source_agent": "USER",
+            "target_agent": "AA",
+            "priority": 100,
+            "payload": {
+                "geo": self._get_geo(),
+                "user_key": self._user_key,
+                "llm_model": DEFAULT_LLM_MODEL,
+                "user_prefs": {
+                    "pronoun": "ты",
+                    "user_name": "Александр",
+                    "assistant_name": AA_DISPLAY_NAME,
+                },
+                "user_name": "Александр",
+                "prompt": prompt,
+                "conversation_history": context,
+            },
         }
-
-        # history (берём хвост + укладываемся в лимит по символам)
-        history = self._select_history_for_context()
-        pins = self._build_conversation_pins(history)
-
-        attachments_meta = []
-        for p in self._attached_files:
-            try:
-                attachments_meta.append({
-                    "name": os.path.basename(p) or "file",
-                    "size_bytes": int(os.path.getsize(p)),
-                })
-            except Exception:
-                attachments_meta.append({"name": os.path.basename(p) or "file"})
-
-        geo = self._get_geo()
-
-        return {
-            "user_request": user_text,
-            "llm_provider": DEFAULT_LLM_PROVIDER,
-            "llm_model": DEFAULT_LLM_MODEL,
-            "client_meta": {"source": "desktop", "client": "OzonatorAgentsClient"},
-            "user_key": self.user_key,
-            "geo": geo,
-            "user_prefs": user_prefs,
-            "conversation_history": history,
-            "conversation_pins": pins,
-            "attachments": attachments_meta,
-        }
-
-    def _push_history(self, role: str, content: str):
-        self._conversation_history.append({"role": role, "content": content})
-        if len(self._conversation_history) > HISTORY_HARD_MAX:
-            self._conversation_history = self._conversation_history[-HISTORY_HARD_MAX:]
-
-
-    def _select_history_for_context(self) -> list[dict]:
-        """Готовим историю для LLM:
-        - берём самые последние сообщения
-        - ограничиваем суммарный размер, чтобы не терять нить диалога
-        """
-        prepared: list[dict[str, str]] = []
-        total = 0
-
-        # идём с конца (самое новое), потом разворачиваем обратно
-        for item in reversed(self._conversation_history):
-            if not isinstance(item, dict):
-                continue
-            role = str(item.get("role") or "").strip().lower()
-            if role not in {"user", "assistant"}:
-                continue
-            content = str(item.get("content") or "").strip()
-            content = re.sub(r"\s+", " ", content)
-            if not content:
-                continue
-            if len(content) > HISTORY_MAX_EACH:
-                content = content[:HISTORY_MAX_EACH]
-
-            # лимит по суммарным символам
-            if prepared and (total + len(content)) > HISTORY_MAX_CHARS:
-                break
-
-            prepared.append({"role": role, "content": content})
-            total += len(content)
-
-            if len(prepared) >= HISTORY_MAX_ITEMS:
-                break
-
-        prepared.reverse()
-        return prepared
-
-    def _build_conversation_pins(self, history: list[dict]) -> list[dict]:
-        """Пины — короткие «якоря», чтобы Екатерина не путалась в начале диалога.
-        Особенно важно для вопросов типа «какой был первый вопрос».
-        """
-        history_set = {(str(x.get("role")), str(x.get("content"))) for x in (history or []) if isinstance(x, dict)}
-        pins: list[dict[str, str]] = []
-
-        # берём первые 3 сообщения user/assistant из полного транскрипта
-        for it in self._transcript:
-            if not isinstance(it, dict):
-                continue
-            role = str(it.get("role") or "").strip().lower()
-            if role not in {"user", "assistant"}:
-                continue
-            content = str(it.get("content") or "").strip()
-            if not content:
-                continue
-            content_norm = re.sub(r"\s+", " ", content)
-            if len(content_norm) > HISTORY_MAX_EACH:
-                content_norm = content_norm[:HISTORY_MAX_EACH]
-            key = (role, content_norm)
-            if key in history_set:
-                continue
-            pins.append({"role": role, "content": content_norm})
-            if len(pins) >= 3:
-                break
-
-        return pins
-
-    def _on_paste_into_input(self, _event=None):
-        """Вставка из буфера:
-        - текст вставится как обычно
-        - если в буфере картинка/файлы — добавим как вложения
-        """
-        if not PIL_AVAILABLE or ImageGrab is None:
-            return None
-
+        return payload
+            def _on_paste(self, event=None):
         try:
-            clip = ImageGrab.grabclipboard()
-        except Exception:
-            clip = None
-
-        # 1) если в буфере список файлов — прикрепляем
-        if isinstance(clip, list):
-            added = []
-            for p in clip:
-                try:
-                    p = str(p)
-                    if os.path.isfile(p):
-                        self._attached_files.append(p)
-                        added.append(os.path.basename(p) or "file")
-                except Exception:
-                    continue
-            if added:
-                self._add_message("meta", "Ты", "Добавлено из буфера: " + ", ".join(added), include_in_context=False)
-                self._update_status()
+            txt = self.clipboard_get()
+            if isinstance(txt, str) and txt != "":
+                self.entry.insert("insert", txt)
                 return "break"
-            return None
+        except Exception:
+            pass
 
-        # 2) если в буфере картинка — сохраняем во временный файл и прикрепляем
         try:
+            clip = ImageGrab.grabclipboard() if ImageGrab is not None else None
             if Image is not None and isinstance(clip, Image.Image):  # type: ignore[attr-defined]
                 base_dir = os.path.join(_app_data_dir(), "clipboard")
                 os.makedirs(base_dir, exist_ok=True)
@@ -1142,9 +860,7 @@ class App(tk.Tk):
 
         return None
 
-
     def _open_settings(self):
-        # Одно окно настроек
         try:
             if getattr(self, "_settings_win", None) is not None and self._settings_win.winfo_exists():
                 self._settings_win.lift()
@@ -1232,7 +948,6 @@ class App(tk.Tk):
         try:
             path = self._geo_state_path()
             try:
-                import os
                 if os.path.exists(path):
                     os.remove(path)
             except Exception:
@@ -1243,7 +958,6 @@ class App(tk.Tk):
             pass
 
     def _install_context_menus(self):
-        # Контекстное меню для поля ввода
         self._menu_input = tk.Menu(self, tearoff=0)
         self._menu_input.add_command(label="Вырезать", command=lambda: self.entry.event_generate("<<Cut>>"))
         self._menu_input.add_command(label="Копировать", command=lambda: self.entry.event_generate("<<Copy>>"))
@@ -1264,11 +978,9 @@ class App(tk.Tk):
         self.entry.bind("<Button-3>", popup_input)
         self.entry.bind("<Button-2>", popup_input)
 
-        # Горячие клавиши как в блокноте
         self.entry.bind("<Control-a>", lambda e: (self._select_all(self.entry), "break")[1])
         self.entry.bind("<Control-A>", lambda e: (self._select_all(self.entry), "break")[1])
 
-        # Контекстное меню для чата (только копирование)
         self._menu_chat = tk.Menu(self, tearoff=0)
         self._menu_chat.add_command(label="Копировать", command=lambda: self._copy_selection(self.chat))
         self._menu_chat.add_separator()
@@ -1327,13 +1039,11 @@ class App(tk.Tk):
 
         payload = self._build_task_payload(user_text)
 
-        # reset per-send state
         self._polling = False
         self._poll_inflight = False
         self._last_task_status = ""
         self.current_task_id = None
 
-        # start send tracking
         self._sending = True
         self._sending_started_at = time.time()
         self._send_stage = "create_task"
@@ -1355,7 +1065,6 @@ class App(tk.Tk):
 
                 self.after(0, ui_set_task_id)
 
-                # upload attachments before orchestration
                 for p in list(self._attached_files):
                     self.client.upload_file(task_id, p)
 
@@ -1411,10 +1120,8 @@ class App(tk.Tk):
     def _tick(self):
         interval = self._current_poll_interval_ms()
 
-        # Если task_id не приходит (create_task завис/сеть/таймаут) — не зависаем в "…".
         if self._sending and self.current_task_id is None and self._sending_started_at:
             if (time.time() - float(self._sending_started_at)) > SEND_TIMEOUT_SEC:
-                # инвалидируем поздние ответы фонового потока
                 self._send_nonce = uuid.uuid4().hex
                 self._sending = False
                 self._send_stage = ""
@@ -1452,7 +1159,6 @@ class App(tk.Tk):
             self._update_status()
         result = task.get("result") if isinstance(task.get("result"), dict) else {}
 
-        # финальный ответ всегда из task.result.final_answer
         final_answer = ""
         if isinstance(result, dict):
             final_answer = str(result.get("final_answer") or "").strip()
@@ -1463,7 +1169,6 @@ class App(tk.Tk):
             self._add_message("assistant", AA_DISPLAY_NAME, final_answer)
             return
 
-        # Если статус финальный, но финальный ответ пустой — выводим понятное сообщение и останавливаемся.
         if status in {"DONE", "REVIEW_NEEDS_ATTENTION"}:
             self._polling = False
             self._clear_typing_if_any()
@@ -1471,7 +1176,6 @@ class App(tk.Tk):
             self._add_message("assistant", AA_DISPLAY_NAME, msg)
             return
 
-        # Защита от бесконечного ожидания: если больше 90 секунд нет результата — подскажем открыть логи.
         if self._poll_started_at and (time.time() - self._poll_started_at) > 90:
             self._polling = False
             self._clear_typing_if_any()
@@ -1556,7 +1260,6 @@ class App(tk.Tk):
         lb.bind("<Double-Button-1>", lambda _e: do_download())
 
     def _open_logs(self):
-        # Если task_id ещё нет — показываем диагностику отправки (иначе пользователь не может понять, что сломалось).
         if self.current_task_id is None:
             win = tk.Toplevel(self)
             win.title("Логи — диагностика отправки")
@@ -1591,14 +1294,22 @@ class App(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title(f"Логи задачи #{self.current_task_id}")
-        win.geometry("900x600")
+        win.geometry("1100x650")
 
-        txt = tk.Text(win, wrap="word", font=("Consolas", 10))
+        body = tk.Frame(win)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        txt = tk.Text(body, wrap="none", font=("Consolas", 10))
         txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        sc = tk.Scrollbar(win, command=txt.yview)
-        sc.pack(side=tk.RIGHT, fill=tk.Y)
-        txt.configure(yscrollcommand=sc.set)
+        sc_y = tk.Scrollbar(body, command=txt.yview)
+        sc_y.pack(side=tk.RIGHT, fill=tk.Y)
+        sc_x = tk.Scrollbar(win, orient=tk.HORIZONTAL, command=txt.xview)
+        sc_x.pack(side=tk.BOTTOM, fill=tk.X)
+        txt.configure(yscrollcommand=sc_y.set, xscrollcommand=sc_x.set)
+
+        if not logs:
+            txt.insert(tk.END, "Логи не найдены.\n")
 
         for item in logs:
             ts = item.get("created_at") or ""
@@ -1606,7 +1317,14 @@ class App(tk.Tk):
             ev = item.get("event_type") or ""
             lvl = item.get("level") or ""
             msg = item.get("message") or ""
+            meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+
             txt.insert(tk.END, f"{ts} [{lvl}] {actor} {ev} — {msg}\n")
+            if meta:
+                meta_text = json.dumps(meta, ensure_ascii=False, indent=2)
+                for line in meta_text.splitlines():
+                    txt.insert(tk.END, f"    {line}\n")
+            txt.insert(tk.END, "\n")
 
         txt.configure(state="disabled")
 
