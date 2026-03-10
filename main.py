@@ -44,11 +44,6 @@ def _is_image_file(file_name: str, content_type: str) -> bool:
 
 
 def _shrink_image_to_max_bytes(raw: bytes, file_name: str, content_type: str, max_bytes: int) -> tuple[bytes, str]:
-    """Best-effort ужатие изображения, чтобы пролезло в лимит загрузки.
-
-    Возвращает (bytes, content_type). Если Pillow недоступен или ужать не получилось —
-    возвращает исходные данные.
-    """
     if not raw or len(raw) <= max_bytes:
         return raw, (content_type or "application/octet-stream")
 
@@ -59,7 +54,6 @@ def _shrink_image_to_max_bytes(raw: bytes, file_name: str, content_type: str, ma
 
     try:
         img = Image.open(io.BytesIO(raw))
-        # приводим к RGB (прозрачность на белый фон)
         if img.mode == "RGBA":
             bg = Image.new("RGB", img.size, (255, 255, 255))
             bg.paste(img, mask=img.split()[-1])
@@ -287,9 +281,7 @@ def tasks_create(body: TaskCreateRequest):
             "task": task if ok else None,
         },
     )
-
-
-@app.get("/history/recent")
+    @app.get("/history/recent")
 def history_recent(user_key: str | None = None, user_name: str | None = None, limit: int = 30):
     """История для клиента: последние user_task.
 
@@ -326,165 +318,109 @@ def history_recent(user_key: str | None = None, user_name: str | None = None, li
     )
 
 
-
 @app.post("/tasks/{task_id}/files/upload")
 async def upload_task_file(task_id: int, file: UploadFile = File(...)):
     settings = get_settings()
 
-    ok_task, _task, message_task = get_task_record(settings.database_url, task_id)
-    if not ok_task:
-        return _json_response(
-            404 if message_task == "Задача не найдена" else 503,
-            {
+    ok_task, task, task_message = get_task_record(settings.database_url, task_id)
+    if not ok_task or not task:
+        return JSONResponse(
+            status_code=404,
+            content={
                 "service": "AA",
                 "operation": "upload_task_file",
                 "status": "error",
-                "message": message_task,
-                "task_id": task_id,
+                "message": task_message or "Задача не найдена",
             },
         )
 
     raw = await file.read()
-    max_bytes = int(getattr(settings, "aa_max_upload_bytes", 10 * 1024 * 1024) or (10 * 1024 * 1024))
-    if raw is None:
-        raw = b""
+    original_size = len(raw or b"")
+    content_type = file.content_type or "application/octet-stream"
+    file_name = file.filename or "file"
 
-    file_name = (file.filename or "file").strip() or "file"
-    content_type = (file.content_type or "application/octet-stream").strip()
-
-    # Если файл больше лимита — пробуем ужать изображения (типовые фото с телефона)
-    if len(raw) > max_bytes and _is_image_file(file_name, content_type):
-        shrunk, new_ct = _shrink_image_to_max_bytes(raw, file_name, content_type, max_bytes)
-        if shrunk is not None and len(shrunk) <= max_bytes:
+    upload_limit = int(os.getenv("AA_UPLOAD_FILE_MAX_BYTES") or "4500000")
+    if raw and original_size > upload_limit and _is_image_file(file_name, content_type):
+        shrunk, new_ct = _shrink_image_to_max_bytes(raw, file_name, content_type, upload_limit)
+        if len(shrunk or b"") < original_size:
             raw = shrunk
             content_type = new_ct
+            file_name_root = file_name.rsplit(".", 1)[0]
+            if not file_name.lower().endswith(".jpg") and not file_name.lower().endswith(".jpeg"):
+                file_name = f"{file_name_root}_server.jpg"
 
-    if len(raw) > max_bytes:
-        return _json_response(
-            413,
-            {
-                "service": "AA",
-                "operation": "upload_task_file",
-                "status": "error",
-                "message": f"Файл слишком большой. Лимит {max_bytes} bytes",
-                "task_id": task_id,
-            },
-        )
-
-
-
-    ok, meta, message = add_task_file(
+    ok_file, file_row, message = add_task_file(
         settings.database_url,
         task_id=task_id,
         file_name=file_name,
         content_type=content_type,
         content=raw,
     )
-    if not ok and message == "schema_not_initialized":
-        # Подстраховка для старых деплоев: создаём схему (включая task_files) и повторяем
-        init_schema(settings.database_url)
-        ok, meta, message = add_task_file(
-            settings.database_url,
-            task_id=task_id,
-            file_name=file_name,
-            content_type=content_type,
-            content=raw,
-        )
 
-    if not ok:
-        return _json_response(
-            503,
-            {
-                "service": "AA",
-                "operation": "upload_task_file",
-                "status": "error",
-                "message": message,
-                "task_id": task_id,
-            },
-        )
-
+    level = "info" if ok_file else "error"
     write_orchestration_log(
         settings.database_url,
         task_id=task_id,
         actor_agent="AA",
-        event_type="file_uploaded",
-        level="info",
-        message="Пользователь загрузил файл во вложения задачи",
+        event_type="file_uploaded" if ok_file else "file_upload_failed",
+        level=level,
+        message=(
+            "Пользователь загрузил файл во вложения задачи"
+            if ok_file
+            else "Не удалось сохранить файл во вложения задачи"
+        ),
         meta={
-            "file_id": meta.get("id") if isinstance(meta, dict) else None,
             "file_name": file_name,
             "content_type": content_type,
-            "size_bytes": len(raw),
-            "sha256": hashlib.sha256(raw).hexdigest(),
+            "original_size_bytes": original_size,
+            "stored_size_bytes": len(raw or b""),
+            "shrunk": len(raw or b"") < original_size,
+            "task_type": task.get("task_type"),
+            "user_key": task.get("user_key"),
+            "user_name": task.get("user_name"),
+            "file": file_row if ok_file else None,
+            "error": None if ok_file else message,
         },
     )
 
-    return _json_response(
-        200,
-        {
+    return JSONResponse(
+        status_code=200 if ok_file else 503,
+        content={
             "service": "AA",
             "operation": "upload_task_file",
-            "status": "ok",
-            "message": "Файл сохранён",
-            "task_id": task_id,
-            "file": meta,
+            "status": "ok" if ok_file else "error",
+            "message": message,
+            "file": file_row if ok_file else None,
         },
     )
 
 
 @app.get("/tasks/{task_id}/files")
-def list_task_files_endpoint(task_id: int):
+def get_task_files(task_id: int):
     settings = get_settings()
 
-    ok_task, _task, message_task = get_task_record(settings.database_url, task_id)
-    if not ok_task:
-        return _json_response(
-            404 if message_task == "Задача не найдена" else 503,
-            {
+    ok_task, task, task_message = get_task_record(settings.database_url, task_id)
+    if not ok_task or not task:
+        return JSONResponse(
+            status_code=404,
+            content={
                 "service": "AA",
                 "operation": "list_task_files",
                 "status": "error",
-                "message": message_task,
-                "task_id": task_id,
-                "files": None,
-            },
-        )
-
-    ok, files, message = list_task_files(settings.database_url, task_id)
-    if not ok and message == "schema_not_initialized":
-        return _json_response(
-            200,
-            {
-                "service": "AA",
-                "operation": "list_task_files",
-                "status": "ok",
-                "message": "OK",
-                "task_id": task_id,
+                "message": task_message or "Задача не найдена",
                 "files": [],
             },
         )
-    if not ok:
-        return _json_response(
-            503,
-            {
-                "service": "AA",
-                "operation": "list_task_files",
-                "status": "error",
-                "message": message,
-                "task_id": task_id,
-                "files": None,
-            },
-        )
 
-    return _json_response(
-        200,
-        {
+    ok_files, files, message = list_task_files(settings.database_url, task_id)
+    return JSONResponse(
+        status_code=200 if ok_files else 503,
+        content={
             "service": "AA",
             "operation": "list_task_files",
-            "status": "ok",
-            "message": "OK",
-            "task_id": task_id,
-            "files": files or [],
+            "status": "ok" if ok_files else "error",
+            "message": message,
+            "files": files if ok_files else [],
         },
     )
 
@@ -492,381 +428,309 @@ def list_task_files_endpoint(task_id: int):
 @app.get("/tasks/{task_id}/files/{file_id}/download")
 def download_task_file(task_id: int, file_id: int):
     settings = get_settings()
-    ok, meta, content, message = get_task_file_content(settings.database_url, task_id, file_id)
-    if not ok:
-        return _json_response(
-            404 if message in {"Файл не найден", "Задача не найдена"} else 503,
-            {
-                "service": "AA",
-                "operation": "download_task_file",
-                "status": "error",
-                "message": message,
-                "task_id": task_id,
-                "file_id": file_id,
-            },
-        )
 
-    file_name = (meta.get("file_name") if isinstance(meta, dict) else None) or f"file_{file_id}"
-    content_type = (meta.get("content_type") if isinstance(meta, dict) else None) or "application/octet-stream"
+    ok_task, task, task_message = get_task_record(settings.database_url, task_id)
+    if not ok_task or not task:
+        raise HTTPException(status_code=404, detail=task_message or "Задача не найдена")
 
-    headers = {"Content-Disposition": f"attachment; filename=\"{file_name}\""}
-    return Response(content=content or b"", media_type=content_type, headers=headers)
+    ok_file, item, message = get_task_file_content(settings.database_url, task_id, file_id)
+    if not ok_file or not item:
+        raise HTTPException(status_code=404, detail=message or "Файл не найден")
+
+    filename = item.get("file_name") or f"file_{file_id}"
+    content_type = item.get("content_type") or "application/octet-stream"
+    content = item.get("content") or b""
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    }
+    return Response(content=content, media_type=content_type, headers=headers)
 
 
-
-def _build_az_brief_for_inventory_locations_fix(task_id: int, payload: dict[str, Any] | None) -> dict[str, Any]:
-    payload = payload or {}
-    screen = payload.get("screen") or "Остатки"
-    title = payload.get("title") or "Вывод склада и зоны размещения на вкладке Остатки"
-    user_request = str(payload.get("user_request") or "").strip()
-    target_columns = payload.get("target_columns") or ["Склад", "Зона размещения"]
-    acceptance_criteria = payload.get("acceptance_criteria") or []
-    notes_for_az = payload.get("notes_for_az") or []
-
-    if not isinstance(target_columns, list):
-        target_columns = [str(target_columns)]
-    target_columns = [str(x) for x in target_columns]
-
-    if not isinstance(acceptance_criteria, list):
-        acceptance_criteria = [str(acceptance_criteria)]
-    acceptance_criteria = [str(x) for x in acceptance_criteria]
-
-    if not isinstance(notes_for_az, list):
-        notes_for_az = [str(notes_for_az)]
-    notes_for_az = [str(x) for x in notes_for_az]
-
-    az_brief = {
-        "brief_version": "v1",
-        "task_id": task_id,
-        "task_type": "ozonator_inventory_locations_fix",
-        "screen": screen,
-        "title": title,
-        "problem_summary": user_request,
-        "target_columns": target_columns,
-        "acceptance_criteria": acceptance_criteria,
-        "notes_for_az": notes_for_az,
-        "expected_output_from_az": {
-            "must_define": [
-                "Источник данных для поля 'Зона размещения' в текущем коде",
-                "Источник данных для поля 'Склад' в текущем коде",
-                "Место в коде, где формируются строки вкладки 'Остатки'",
-                "Логика группировки строк, если у товара несколько зон размещения",
-            ],
-            "must_return": [
-                "Короткий технический план исправления",
-                "Список файлов/модулей, которые нужно менять",
-                "Риски и что проверить после правки",
-            ],
+@app.get("/tasks/{task_id}")
+def get_task(task_id: int):
+    settings = get_settings()
+    ok, task, message = get_task_record(settings.database_url, task_id)
+    return JSONResponse(
+        status_code=200 if ok else 404,
+        content={
+            "service": "AA",
+            "operation": "get_task",
+            "status": "ok" if ok else "error",
+            "message": message,
+            "task": task if ok else None,
         },
-    }
-
-    return {
-        "routed_to": "AZ",
-        "mode": "az_brief_v1",
-        "task_type": "ozonator_inventory_locations_fix",
-        "task_id": task_id,
-        "az_brief": az_brief,
-        "next_action": "az_prepare_fix_plan",
-    }
-
-
-
-def _json_response(status_code: int, content: dict[str, Any]) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content=content)
-
-
-
-def _read_json_response(raw_bytes: bytes) -> Any:
-    if not raw_bytes:
-        return None
-    try:
-        return json.loads(raw_bytes.decode("utf-8"))
-    except Exception:
-        return None
-
-
-
-def _post_json(url: str, payload: dict[str, Any] | None = None) -> tuple[bool, int, Any, str | None]:
-    body = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
-    req = urllib_request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        method="POST",
     )
-    try:
-        with urllib_request.urlopen(req, timeout=120) as response:
-            raw = response.read()
-            return True, response.getcode(), _read_json_response(raw), None
-    except urllib_error.HTTPError as e:
-        raw = e.read()
-        return False, e.code, _read_json_response(raw), f"HTTPError {e.code}"
-    except urllib_error.URLError as e:
-        return False, 0, None, f"URLError: {e.reason}"
-    except Exception as e:
-        return False, 0, None, f"{e.__class__.__name__}: {e}"
 
+
+@app.get("/tasks/{task_id}/logs")
+def task_logs(task_id: int):
+    settings = get_settings()
+    ok, logs, message = get_task_logs(settings.database_url, task_id)
+    return JSONResponse(
+        status_code=200 if ok else 404,
+        content={
+            "service": "AA",
+            "operation": "get_task_logs",
+            "status": "ok" if ok else "error",
+            "message": message,
+            "task_id": task_id,
+            "count": len(logs) if ok else 0,
+            "logs": logs if ok else [],
+        },
+    )
+
+
+def _json_response(status_code: int, payload: dict[str, Any]) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 def _agent_base_url(settings, agent_code: str) -> str:
-    agent_code = agent_code.upper()
     if agent_code == "AZ":
-        return settings.az_run_task_base_url
+        return settings.az_run_task_base_url.rstrip("/")
     if agent_code == "AS":
-        return settings.as_run_task_base_url
+        return settings.as_run_task_base_url.rstrip("/")
     if agent_code == "AK":
-        return settings.ak_run_task_base_url
-    raise ValueError(f"Неизвестный агент: {agent_code}")
+        return settings.ak_run_task_base_url.rstrip("/")
+    raise ValueError(f"Неизвестный агент для оркестрации: {agent_code}")
 
 
+def _normalize_execution_response(agent_code: str, payload: dict[str, Any]) -> dict[str, Any]:
+    task = payload.get("task") if isinstance(payload.get("task"), dict) else None
+    execution_result = payload.get("execution_result") if isinstance(payload.get("execution_result"), dict) else None
+    response_status = str(payload.get("status") or "").lower()
 
-def _agent_route(agent_code: str, task_id: int) -> str:
-    agent_code = agent_code.lower()
-    return f"/{agent_code}/run-task/{task_id}"
+    handoff_ready = bool(execution_result and execution_result.get("handoff_ready"))
+    next_agent = str(execution_result.get("next_agent") or "").upper() if execution_result else ""
+    task_status = str(task.get("status") or "").upper() if task else ""
 
+    ok = False
+    if response_status == "ok":
+        if agent_code == "AZ":
+            ok = handoff_ready and next_agent == "AS" and task_status == "AZ_DONE"
+        elif agent_code == "AS":
+            ok = handoff_ready and next_agent == "AK" and task_status == "AS_DONE"
+        elif agent_code == "AK":
+            ok = task_status == "DONE"
 
-
-def _call_agent(settings, task_id: int, agent_code: str) -> tuple[bool, dict[str, Any]]:
-    base_url = _agent_base_url(settings, agent_code)
-    url = f"{base_url}{_agent_route(agent_code, task_id)}"
-
-    retries = max(0, int(os.getenv("AA_AGENT_CALL_RETRIES") or "2"))
-    backoff = float(os.getenv("AA_AGENT_CALL_BACKOFF_SEC") or "1.5")
-
-    last_ok = False
-    last_status_code = 0
-    last_body = None
-    last_error_message = None
-
-    for attempt in range(retries + 1):
-        ok, status_code, body, error_message = _post_json(url, {})
-        last_ok = ok
-        last_status_code = status_code
-        last_body = body
-        last_error_message = error_message
-
-        if ok:
-            break
-
-        if attempt < retries:
-            time.sleep(backoff * (attempt + 1))
-
-    return (
-        last_ok,
-        {
-            "agent": agent_code.upper(),
-            "url": url,
-            "http_status": last_status_code,
-            "attempts": retries + 1,
-            "response": last_body if isinstance(last_body, dict) else None,
-            "error": last_error_message,
-        },
-    )
-
-
-
-def _normalize_execution_response(data: dict[str, Any] | None) -> tuple[str | None, str | None]:
-    if not isinstance(data, dict):
-        return None, None
-
-    task_data = data.get("task") if isinstance(data.get("task"), dict) else {}
-    execution_result = data.get("execution_result") if isinstance(data.get("execution_result"), dict) else {}
-    task_result = task_data.get("result") if isinstance(task_data.get("result"), dict) else {}
-
-    next_agent = (
-        execution_result.get("next_agent")
-        or task_result.get("next_agent")
-        or data.get("next_agent")
-    )
-    task_status = (
-        execution_result.get("task_status")
-        or task_data.get("status")
-        or data.get("task_status")
-    )
-
-    return (
-        str(next_agent).upper() if next_agent else None,
-        str(task_status).upper() if task_status else None,
-    )
-
-
-
-def _merge_result_for_rework(settings, task_id: int) -> tuple[bool, str]:
-    ok, task, message = get_task_record(settings.database_url, task_id)
-    if not ok:
-        return False, message
-
-    current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
-    current_result = current_result if isinstance(current_result, dict) else {}
-    rework_result = {
-        **current_result,
-        "handoff_ready": True,
-        "next_agent": "AS",
-        "next_action": "ak_return_to_as",
+    return {
+        "ok": ok,
+        "response": payload,
+        "task": task,
+        "execution_result": execution_result,
+        "task_status": task_status,
+        "next_agent": next_agent or None,
+        "handoff_ready": handoff_ready,
     }
 
-    ok_set, _, message_set = set_task_result(
+
+def _build_step_meta(payload: dict[str, Any] | None) -> dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+    execution_result = response.get("execution_result") if isinstance(response.get("execution_result"), dict) else {}
+    task = response.get("task") if isinstance(response.get("task"), dict) else {}
+
+    return {
+        "agent": payload.get("agent"),
+        "url": payload.get("url"),
+        "http_status": payload.get("http_status"),
+        "attempts": payload.get("attempts"),
+        "transport_error": payload.get("error"),
+        "response_status": response.get("status"),
+        "response_message": response.get("message"),
+        "task_status": task.get("status"),
+        "next_agent": execution_result.get("next_agent"),
+        "response": response if response else None,
+    }
+
+
+def _log_agent_call(settings, task_id: int, cycle_no: int, agent_code: str, ok: bool, payload: dict[str, Any]) -> None:
+    meta = {"cycle_no": cycle_no, **_build_step_meta(payload)}
+    level = "info" if ok else "error"
+    if ok and meta.get("response_status") not in {None, "ok"}:
+        level = "warning"
+
+    write_orchestration_log(
         settings.database_url,
         task_id=task_id,
-        result=rework_result,
-        error_message=None,
+        actor_agent="AA",
+        event_type="aa_agent_call_completed",
+        level=level,
+        message=f"AA вызвал {agent_code.upper()}",
+        meta=meta,
     )
-    return ok_set, message_set
+    def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 3, initial_delay_sec: float = 0.8) -> tuple[bool, dict[str, Any]]:
+    base_url = _agent_base_url(settings, agent_code)
+    url = f"{base_url}/{task_id}"
+    delay = max(0.1, initial_delay_sec)
+    last_payload: dict[str, Any] | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib_request.Request(
+                url,
+                method="POST",
+                data=b"",
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "ozonator-aa/1.0",
+                },
+            )
+            with urllib_request.urlopen(req, timeout=120) as resp:
+                raw = resp.read().decode("utf-8")
+                parsed = json.loads(raw)
+                normalized = _normalize_execution_response(agent_code, parsed)
+                payload = {
+                    "agent": agent_code,
+                    "url": url,
+                    "attempts": attempt,
+                    "http_status": getattr(resp, "status", 200),
+                    "response": parsed,
+                    **normalized,
+                }
+                if normalized["ok"]:
+                    return True, payload
+                last_payload = payload
+        except urllib_error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
+            parsed: dict[str, Any] | None = None
+            if body:
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError:
+                    parsed = {"raw": body}
+            payload = {
+                "agent": agent_code,
+                "url": url,
+                "attempts": attempt,
+                "http_status": getattr(exc, "code", None),
+                "error": f"HTTPError: {exc}",
+                "response": parsed,
+                **(_normalize_execution_response(agent_code, parsed) if isinstance(parsed, dict) else {
+                    "ok": False,
+                    "task": None,
+                    "execution_result": None,
+                    "task_status": None,
+                    "next_agent": None,
+                    "handoff_ready": False,
+                }),
+            }
+            last_payload = payload
+        except (urllib_error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_payload = {
+                "agent": agent_code,
+                "url": url,
+                "attempts": attempt,
+                "error": f"{type(exc).__name__}: {exc}",
+                "ok": False,
+                "response": None,
+                "task": None,
+                "execution_result": None,
+                "task_status": None,
+                "next_agent": None,
+                "handoff_ready": False,
+            }
+
+        if attempt < max_retries:
+            time.sleep(delay)
+            delay = min(delay * 2, 5.0)
+
+    return False, last_payload or {
+        "agent": agent_code,
+        "url": url,
+        "attempts": 0,
+        "error": "Неизвестная ошибка вызова агента",
+        "ok": False,
+        "response": None,
+        "task": None,
+        "execution_result": None,
+        "task_status": None,
+        "next_agent": None,
+        "handoff_ready": False,
+    }
 
 
-
-def _run_single_cycle(settings, task_id: int, cycle_no: int) -> dict[str, Any]:
+def _run_single_cycle(settings, task_id: int, cycle_no: int) -> tuple[bool, dict[str, Any]]:
     step_results: list[dict[str, Any]] = []
 
     ok_az, az_payload = _call_agent(settings, task_id, "AZ")
     step_results.append(az_payload)
+    _log_agent_call(settings, task_id, cycle_no, "AZ", ok_az, az_payload)
     if not ok_az:
-        return {
-            "ok": False,
+        return False, {
             "failed_at": "AZ",
-            "cycle_no": cycle_no,
             "steps": step_results,
             "message": "AA не смог автоматически вызвать AZ",
         }
 
-    az_response = az_payload.get("response") if isinstance(az_payload.get("response"), dict) else {}
-    next_agent, _task_status = _normalize_execution_response(az_response)
-    if (az_response.get("status") != "ok") or next_agent not in {"AS", None}:
-        return {
-            "ok": False,
-            "failed_at": "AZ",
-            "cycle_no": cycle_no,
-            "steps": step_results,
-            "message": "AZ не сформировал корректный handoff в AS",
-        }
-
     ok_as, as_payload = _call_agent(settings, task_id, "AS")
     step_results.append(as_payload)
+    _log_agent_call(settings, task_id, cycle_no, "AS", ok_as, as_payload)
     if not ok_as:
-        return {
-            "ok": False,
+        return False, {
             "failed_at": "AS",
-            "cycle_no": cycle_no,
             "steps": step_results,
             "message": "AA не смог автоматически вызвать AS",
         }
 
-    as_response = as_payload.get("response") if isinstance(as_payload.get("response"), dict) else {}
-    next_agent, _task_status = _normalize_execution_response(as_response)
-    if (as_response.get("status") != "ok") or next_agent not in {"AK", None}:
-        return {
-            "ok": False,
-            "failed_at": "AS",
-            "cycle_no": cycle_no,
-            "steps": step_results,
-            "message": "AS не сформировал корректный handoff в AK",
-        }
-
     ok_ak, ak_payload = _call_agent(settings, task_id, "AK")
     step_results.append(ak_payload)
+    _log_agent_call(settings, task_id, cycle_no, "AK", ok_ak, ak_payload)
     if not ok_ak:
-        return {
-            "ok": False,
+        return False, {
             "failed_at": "AK",
-            "cycle_no": cycle_no,
             "steps": step_results,
             "message": "AA не смог автоматически вызвать AK",
         }
 
-    ak_response = ak_payload.get("response") if isinstance(ak_payload.get("response"), dict) else {}
-    _next_agent, task_status = _normalize_execution_response(ak_response)
-    if ak_response.get("status") != "ok":
-        return {
-            "ok": False,
+    final_task = ak_payload.get("task") or {}
+    final_status = str(final_task.get("status") or "").upper()
+    if final_status != "DONE":
+        return False, {
             "failed_at": "AK",
-            "cycle_no": cycle_no,
             "steps": step_results,
-            "message": "AK вернул ошибку при проверке",
+            "message": "AA завершил цепочку, но финальный статус задачи не DONE",
         }
 
-    return {
-        "ok": True,
-        "cycle_no": cycle_no,
+    return True, {
+        "failed_at": None,
         "steps": step_results,
-        "final_status": task_status,
-        "decision": (
-            ((ak_response.get("execution_result") or {}).get("decision"))
-            if isinstance(ak_response.get("execution_result"), dict)
-            else None
-        ),
+        "message": "Цепочка AA → AZ → AS → AK завершена",
     }
 
 
-
-def _run_full_orchestration(settings, task_id: int) -> dict[str, Any]:
+def _run_auto_orchestration(settings, task_id: int, max_cycles: int = 2) -> dict[str, Any]:
     cycles: list[dict[str, Any]] = []
-    max_cycles = max(1, int(settings.aa_max_rework_cycles))
 
     for cycle_no in range(1, max_cycles + 1):
-        cycle_result = _run_single_cycle(settings, task_id, cycle_no)
-        cycles.append(cycle_result)
+        ok, cycle_result = _run_single_cycle(settings, task_id, cycle_no)
+        cycle_payload = {
+            "cycle_no": cycle_no,
+            **cycle_result,
+        }
+        cycles.append(cycle_payload)
 
-        if not cycle_result.get("ok"):
-            return {
-                "orchestration_status": "failed",
-                "failed_at": cycle_result.get("failed_at"),
-                "message": cycle_result.get("message"),
-                "cycles": cycles,
-            }
-
-        final_status = (cycle_result.get("final_status") or "").upper()
-        if final_status == "DONE":
+        if ok:
             return {
                 "orchestration_status": "done",
-                "message": "AA автоматически провел задачу по цепочке AZ -> AS -> AK",
+                "message": "AA завершил автоматическую оркестрацию цепочки",
                 "cycles": cycles,
+                "failed_at": None,
             }
 
-        if final_status == "REVIEW_NEEDS_ATTENTION":
-            if cycle_no >= max_cycles:
-                return {
-                    "orchestration_status": "review_needs_attention",
-                    "message": "AA выполнил автоматический цикл, но задача осталась на доработке",
-                    "cycles": cycles,
-                }
+        failed_at = str(cycle_result.get("failed_at") or "").upper()
+        if failed_at == "AZ":
+            break
 
-            ok_rework, rework_message = _merge_result_for_rework(settings, task_id)
-            write_orchestration_log(
-                settings.database_url,
-                task_id=task_id,
-                actor_agent="AA",
-                event_type="aa_rework_requested",
-                level="warning" if ok_rework else "error",
-                message=(
-                    "AA подготовил автоматический возврат в AS после замечаний AK"
-                    if ok_rework
-                    else "AA не смог подготовить автоматический возврат в AS"
-                ),
-                meta={
-                    "cycle_no": cycle_no,
-                    "rework_result": "ok" if ok_rework else "error",
-                    "message": rework_message,
-                },
-            )
-            if not ok_rework:
-                return {
-                    "orchestration_status": "failed",
-                    "failed_at": "AA_REWORK",
-                    "message": rework_message,
-                    "cycles": cycles,
-                }
-            continue
+        time.sleep(0.5)
 
-        return {
-            "orchestration_status": "unknown_final_status",
-            "message": f"AA получил неожиданный финальный статус: {final_status or 'None'}",
-            "cycles": cycles,
-        }
-
+    failed_at = str(cycles[-1].get("failed_at") or "").upper() if cycles else "UNKNOWN"
     return {
-        "orchestration_status": "review_needs_attention",
-        "message": "AA исчерпал лимит автоматических циклов доработки",
+        "orchestration_status": "failed",
+        "message": cycles[-1].get("message") if cycles else "AA не смог завершить автоматическую оркестрацию",
         "cycles": cycles,
+        "failed_at": failed_at,
     }
 
 
@@ -887,7 +751,15 @@ def _finalize_orchestration_result(settings, task_id: int, orchestration_result:
     if existing_final:
         return
 
-    failed_at = orchestration_result.get("failed_at")
+    failed_at = str(orchestration_result.get("failed_at") or "").upper() or None
+    preserve_az_handoff = (
+        status_raw == "failed"
+        and failed_at == "AZ"
+        and (
+            str(current_result.get("next_agent") or "").upper() == "AZ"
+            or str(current_result.get("routed_to") or "").upper() == "AZ"
+        )
+    )
 
     if status_raw == "review_needs_attention":
         user_msg = (
@@ -896,11 +768,18 @@ def _finalize_orchestration_result(settings, task_id: int, orchestration_result:
         )
         new_status = "REVIEW_NEEDS_ATTENTION"
     elif status_raw == "failed":
-        user_msg = (
-            f"Задача не завершилась: не удалось выполнить следующий шаг ({failed_at or 'неизвестно'}). "
-            "Нажми ‘Логи’ в клиенте — там причина и детали."
-        )
-        new_status = "FAILED"
+        if preserve_az_handoff:
+            user_msg = (
+                "Задача не завершилась автоматически на шаге AZ. "
+                "Handoff в AZ сохранён: нажми ‘Логи’ и при необходимости повтори запуск AZ."
+            )
+            new_status = "AA_ROUTED"
+        else:
+            user_msg = (
+                f"Задача не завершилась: не удалось выполнить следующий шаг ({failed_at or 'неизвестно'}). "
+                "Нажми ‘Логи’ в клиенте — там причина и детали."
+            )
+            new_status = "FAILED"
     else:
         user_msg = (
             "Задача не завершилась автоматически (неожиданный финальный статус). "
@@ -911,14 +790,25 @@ def _finalize_orchestration_result(settings, task_id: int, orchestration_result:
     merged = {
         **current_result,
         "final_answer": user_msg,
-        "aa_orchestration": {
-            "orchestration_status": orchestration_result.get("orchestration_status"),
-            "failed_at": orchestration_result.get("failed_at"),
-            "message": orchestration_result.get("message"),
-        },
-        "handoff_ready": False,
-        "next_agent": None,
+        "aa_orchestration": orchestration_result,
     }
+
+    if preserve_az_handoff:
+        merged.update(
+            {
+                "handoff_ready": True,
+                "next_agent": current_result.get("next_agent") or "AZ",
+                "routed_to": current_result.get("routed_to") or "AZ",
+                "aa_retry_available": "AZ",
+            }
+        )
+    else:
+        merged.update(
+            {
+                "handoff_ready": False,
+                "next_agent": None,
+            }
+        )
 
     set_task_result(
         settings.database_url,
@@ -929,21 +819,37 @@ def _finalize_orchestration_result(settings, task_id: int, orchestration_result:
     update_task_status(settings.database_url, task_id, new_status)
 
 
-
 @app.post("/aa/run-task/{task_id}")
-@app.post("/run-task/{task_id}")
 def aa_run_task(task_id: int):
     settings = get_settings()
-    ok, task, message = get_task_record(settings.database_url, task_id)
-    if not ok:
+
+    ok_task, task, task_message = get_task_record(settings.database_url, task_id)
+    if not ok_task or not task:
         return _json_response(
-            404 if message == "Задача не найдена" else 503,
+            404,
             {
                 "service": "AA",
                 "operation": "aa_run_task",
                 "status": "error",
-                "message": message,
+                "message": task_message or "Задача не найдена",
                 "task": None,
+                "execution_result": None,
+            },
+        )
+
+    current_status = str(task.get("status") or "").upper()
+    if current_status not in {"NEW", "IN_PROGRESS", "FAILED", "AA_ROUTED", "AZ_DONE", "AS_DONE"}:
+        return _json_response(
+            400,
+            {
+                "service": "AA",
+                "operation": "aa_run_task",
+                "status": "error",
+                "message": (
+                    "AA может принимать задачу только в статусах NEW/IN_PROGRESS/FAILED/AA_ROUTED/AZ_DONE/AS_DONE"
+                ),
+                "task": task,
+                "execution_result": None,
             },
         )
 
@@ -955,73 +861,60 @@ def aa_run_task(task_id: int):
         level="info",
         message="AA начал обработку задачи",
         meta={
-            "target_agent": task["target_agent"],
-            "task_type": task["task_type"],
+            "task_type": task.get("task_type"),
+            "user_key": task.get("user_key"),
+            "user_name": task.get("user_name"),
+            "current_status": current_status,
         },
     )
 
-    ok, task, message = update_task_status(settings.database_url, task_id, "in_progress")
-    if not ok:
-        return _json_response(
-            503,
-            {
-                "service": "AA",
-                "operation": "aa_run_task",
-                "status": "error",
-                "message": message,
-                "task": None,
-            },
+    payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    attachments: list[dict[str, Any]] = []
+    ok_files, files, files_message = list_task_files(settings.database_url, task_id)
+    if ok_files:
+        attachments = files or []
+    else:
+        write_orchestration_log(
+            settings.database_url,
+            task_id=task_id,
+            actor_agent="AA",
+            event_type="task_files_unavailable",
+            level="warning",
+            message="AA не смог получить список файлов задачи перед handoff",
+            meta={"error": files_message},
         )
 
-    payload = task.get("payload") or {}
-    if task.get("task_type") == "ozonator_inventory_locations_fix":
-        execution_result = _build_az_brief_for_inventory_locations_fix(task_id, payload)
-    else:
-        execution_result = {
-            "routed_to": "AZ",
-            "mode": "aa_handoff_v1",
-            "task_id": task_id,
-            "task_type": task.get("task_type"),
-            "handoff_ready": True,
-            "next_agent": "AZ",
-            "aa_status": "routed_to_az",
-            "note": "AA подготовил задачу и передал handoff в AZ",
-        }
+    handoff = {
+        "mode": "aa_handoff_v1",
+        "note": "AA подготовил задачу и передал handoff в AZ",
+        "attachments": [
+            {
+                "file_id": item.get("id"),
+                "file_name": item.get("file_name"),
+                "content_type": item.get("content_type"),
+                "size_bytes": item.get("size_bytes"),
+            }
+            for item in attachments
+        ],
+    }
 
-    execution_result["handoff_ready"] = True
-    execution_result["next_agent"] = "AZ"
-    execution_result["aa_executor"] = "AA"
-
-    ok_set, task, message_set = set_task_result(
+    execution_result = {
+        "source_agent": "AA",
+        "target_agent": "AA",
+        "task_type": task.get("task_type"),
+        "status": "routed_to_az",
+        "next_agent": "AZ",
+        "aa_executor": "AA",
+        "handoff_ready": True,
+        "handoff": handoff,
+    }
+        set_task_result(
         settings.database_url,
         task_id=task_id,
         result=execution_result,
         error_message=None,
     )
-    if not ok_set:
-        return _json_response(
-            503,
-            {
-                "service": "AA",
-                "operation": "aa_run_task",
-                "status": "error",
-                "message": message_set,
-                "task": None,
-            },
-        )
-
-    ok, task, message = update_task_status(settings.database_url, task_id, "AA_ROUTED")
-    if not ok:
-        return _json_response(
-            503,
-            {
-                "service": "AA",
-                "operation": "aa_run_task",
-                "status": "error",
-                "message": message,
-                "task": None,
-            },
-        )
+    update_task_status(settings.database_url, task_id, "AA_ROUTED")
 
     write_orchestration_log(
         settings.database_url,
@@ -1030,157 +923,265 @@ def aa_run_task(task_id: int):
         event_type="task_routed_to_az",
         level="info",
         message="AA подготовил handoff и маршрутизировал задачу в AZ",
-        meta=execution_result,
+        meta={
+            "mode": handoff.get("mode"),
+            "attachments_count": len(attachments),
+            "next_agent": "AZ",
+            "handoff_ready": True,
+        },
     )
 
     if not settings.aa_auto_orchestration_enabled:
         disabled_msg = (
             "Автоматическая оркестрация отключена на сервере (AA_AUTO_ORCHESTRATION_ENABLED=false). "
-            "Включи её на сервисе AA, чтобы клиент получал ответ автоматически."
+            "Handoff в AZ сохранён: задачу можно запустить вручную."
         )
-        merged = {**execution_result, "final_answer": disabled_msg, "handoff_ready": False, "next_agent": None}
-        set_task_result(settings.database_url, task_id=task_id, result=merged, error_message=disabled_msg)
-        update_task_status(settings.database_url, task_id, "FAILED")
-
-        ok, final_task, final_message = get_task_record(settings.database_url, task_id)
-        if not ok:
-            return _json_response(
-                503,
-                {
-                    "service": "AA",
-                    "operation": "aa_run_task",
-                    "status": "error",
-                    "message": final_message,
-                    "task": None,
-                },
-            )
-
+        merged = {
+            **execution_result,
+            "final_answer": disabled_msg,
+            "handoff_ready": True,
+            "next_agent": "AZ",
+            "routed_to": "AZ",
+            "aa_retry_available": "AZ",
+        }
+        set_task_result(settings.database_url, task_id=task_id, result=merged, error_message=None)
+        write_orchestration_log(
+            settings.database_url,
+            task_id=task_id,
+            actor_agent="AA",
+            event_type="aa_auto_orchestration_skipped",
+            level="warning",
+            message="AA пропустил автоматическую оркестрацию: она отключена на сервисе",
+            meta={"handoff_preserved": True, "next_agent": "AZ"},
+        )
         return _json_response(
             200,
             {
                 "service": "AA",
                 "operation": "aa_run_task",
                 "status": "ok",
-                "message": "AA подготовил handoff (авто-оркестрация отключена)",
-                "task": final_task,
+                "message": disabled_msg,
+                "task": {
+                    **task,
+                    "status": "AA_ROUTED",
+                    "result": merged,
+                },
                 "execution_result": merged,
             },
         )
 
-    orchestration_result = _run_full_orchestration(settings, task_id)
-    _finalize_orchestration_result(settings, task_id, orchestration_result)
-    level = "info" if orchestration_result.get("orchestration_status") == "done" else "warning"
+    orchestration_result = _run_auto_orchestration(settings, task_id)
+
     write_orchestration_log(
         settings.database_url,
         task_id=task_id,
         actor_agent="AA",
         event_type="aa_auto_orchestration_completed",
-        level=level,
-        message="AA завершил автоматическую оркестрацию цепочки",
+        level="info" if orchestration_result.get("orchestration_status") == "done" else "warning",
+        message=orchestration_result.get("message") or "AA завершил автоматическую оркестрацию",
         meta={
             "orchestration_status": orchestration_result.get("orchestration_status"),
-            "cycles": len(orchestration_result.get("cycles") or []),
+            "failed_at": orchestration_result.get("failed_at"),
+            "message": orchestration_result.get("message"),
+            "cycles_count": len(orchestration_result.get("cycles") or []),
+            "cycles": orchestration_result.get("cycles") or [],
         },
     )
 
-    ok, final_task, final_message = get_task_record(settings.database_url, task_id)
-    if not ok:
-        return _json_response(
-            503,
-            {
-                "service": "AA",
-                "operation": "aa_run_task",
-                "status": "error",
-                "message": final_message,
-                "task": None,
-                "execution_result": orchestration_result,
-            },
-        )
+    _finalize_orchestration_result(settings, task_id, orchestration_result)
 
+    ok_final, final_task, _final_message = get_task_record(settings.database_url, task_id)
     return _json_response(
         200,
         {
             "service": "AA",
             "operation": "aa_run_task",
-            "status": "ok",
-            "message": "AA выполнил автоматический прогон цепочки",
-            "task": final_task,
+            "status": "ok" if ok_final else "error",
+            "message": orchestration_result.get("message") or "OK",
+            "task": final_task if ok_final else None,
             "execution_result": {
                 **execution_result,
-                "orchestration": orchestration_result,
+                "aa_orchestration": orchestration_result,
             },
         },
     )
 
 
-@app.get("/tasks/{task_id}")
-def get_task(task_id: int):
+@app.post("/debug/fill-task/{task_id}", dependencies=[Depends(require_admin_token)])
+def debug_fill_task(task_id: int):
     settings = get_settings()
     ok, task, message = get_task_record(settings.database_url, task_id)
-    if not ok:
-        return _json_response(
-            404 if message == "Задача не найдена" else 503,
-            {
+    if not ok or not task:
+        return JSONResponse(
+            status_code=404,
+            content={
                 "service": "AA",
-                "operation": "get_task",
+                "operation": "debug_fill_task",
                 "status": "error",
                 "message": message,
                 "task": None,
             },
         )
 
-    return _json_response(
-        200,
-        {
+    task_type = str(task.get("task_type") or "")
+    allowed_task_types = {"user_task", "project_task", "review_task", "system_task"}
+    if task_type not in allowed_task_types:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "service": "AA",
+                "operation": "debug_fill_task",
+                "status": "error",
+                "message": f"debug_fill_task поддерживает только task_type из {sorted(allowed_task_types)}",
+                "task": task,
+            },
+        )
+
+    payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    user_name = payload.get("user_name") or task.get("user_name") or "Пользователь"
+    prompt = payload.get("prompt") or task.get("content") or ""
+
+    base_preview = (
+        f"Привет, {user_name}!\n\n"
+        "Это тестовый ответ DEBUG режима AA.\n"
+        "Я заполнила финальный результат задачи без вызова внешних агентов.\n\n"
+        f"Кратко по запросу: {str(prompt)[:500]}"
+    ).strip()
+
+    synthetic_result = {
+        "source_agent": "AA",
+        "target_agent": "AA",
+        "status": "filled_by_debug",
+        "debug_mode": True,
+        "task_type": task_type,
+        "final_answer": base_preview,
+        "draft_result": {
+            "summary": str(prompt)[:300],
+            "note": "Результат сгенерирован debug endpoint /debug/fill-task/{task_id}",
+        },
+    }
+
+    set_task_result(
+        settings.database_url,
+        task_id=task_id,
+        result=synthetic_result,
+        error_message=None,
+    )
+    update_task_status(settings.database_url, task_id, "DONE")
+
+    write_orchestration_log(
+        settings.database_url,
+        task_id=task_id,
+        actor_agent="AA",
+        event_type="debug_fill_task",
+        level="warning",
+        message="DEBUG endpoint заполнил финальный результат задачи без запуска оркестрации",
+        meta={
+            "task_type": task_type,
+            "task_status": "DONE",
+            "debug_mode": True,
+        },
+    )
+
+    ok_final, final_task, final_message = get_task_record(settings.database_url, task_id)
+    return JSONResponse(
+        status_code=200 if ok_final else 503,
+        content={
             "service": "AA",
-            "operation": "get_task",
-            "status": "ok",
-            "message": "OK",
-            "task": task,
+            "operation": "debug_fill_task",
+            "status": "ok" if ok_final else "error",
+            "message": final_message,
+            "task": final_task if ok_final else None,
         },
     )
 
 
-@app.get("/tasks/{task_id}/logs")
-def get_task_logs_endpoint(task_id: int):
+@app.post("/debug/test-outbound/{agent_code}", dependencies=[Depends(require_admin_token)])
+def debug_test_outbound(agent_code: str):
+    settings = get_settings()
+    code = str(agent_code or "").upper().strip()
+    if code not in {"AZ", "AS", "AK"}:
+        return _json_response(
+            400,
+            {
+                "service": "AA",
+                "operation": "debug_test_outbound",
+                "status": "error",
+                "message": "Поддерживаются только agent_code: AZ, AS, AK",
+                "agent": code,
+            },
+        )
+
+    base_url = _agent_base_url(settings, code)
+    health_url = base_url.rsplit("/", 1)[0] + "/health"
+
+    try:
+        req = urllib_request.Request(
+            health_url,
+            method="GET",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "ozonator-aa/1.0",
+            },
+        )
+        with urllib_request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+            parsed = json.loads(raw)
+            return _json_response(
+                200,
+                {
+                    "service": "AA",
+                    "operation": "debug_test_outbound",
+                    "status": "ok",
+                    "message": "AA успешно достучался до внешнего агента",
+                    "agent": code,
+                    "health_url": health_url,
+                    "http_status": getattr(resp, "status", 200),
+                    "response": parsed,
+                },
+            )
+    except urllib_error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
+        return _json_response(
+            502,
+            {
+                "service": "AA",
+                "operation": "debug_test_outbound",
+                "status": "error",
+                "message": "Внешний агент ответил ошибкой HTTP",
+                "agent": code,
+                "health_url": health_url,
+                "http_status": getattr(exc, "code", None),
+                "body": body,
+            },
+        )
+    except Exception as exc:
+        return _json_response(
+            502,
+            {
+                "service": "AA",
+                "operation": "debug_test_outbound",
+                "status": "error",
+                "message": "AA не смог достучаться до внешнего агента",
+                "agent": code,
+                "health_url": health_url,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+
+
+@app.get("/debug/task-status/{task_id}", dependencies=[Depends(require_admin_token)])
+def debug_task_status(task_id: int):
     settings = get_settings()
     ok, task, message = get_task_record(settings.database_url, task_id)
-    if not ok:
-        return _json_response(
-            404 if message == "Задача не найдена" else 503,
-            {
-                "service": "AA",
-                "operation": "get_task_logs",
-                "status": "error",
-                "message": message,
-                "task_id": task_id,
-                "logs": None,
-            },
-        )
-
-    ok, logs, message = get_task_logs(settings.database_url, task_id)
-    if not ok:
-        return _json_response(
-            503,
-            {
-                "service": "AA",
-                "operation": "get_task_logs",
-                "status": "error",
-                "message": message,
-                "task_id": task_id,
-                "logs": None,
-            },
-        )
-
-    return _json_response(
-        200,
-        {
+    return JSONResponse(
+        status_code=200 if ok else 404,
+        content={
             "service": "AA",
-            "operation": "get_task_logs",
-            "status": "ok",
-            "message": "OK",
-            "task_id": task_id,
-            "count": len(logs),
-            "logs": logs,
+            "operation": "debug_task_status",
+            "status": "ok" if ok else "error",
+            "message": message,
+            "task": task if ok else None,
         },
     )
