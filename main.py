@@ -281,7 +281,7 @@ def tasks_create(body: TaskCreateRequest):
             "task": task if ok else None,
         },
     )
-    @app.get("/history/recent")
+@app.get("/history/recent")
 def history_recent(user_key: str | None = None, user_name: str | None = None, limit: int = 30):
     """История для клиента: последние user_task.
 
@@ -559,7 +559,7 @@ def _log_agent_call(settings, task_id: int, cycle_no: int, agent_code: str, ok: 
         message=f"AA вызвал {agent_code.upper()}",
         meta=meta,
     )
-    def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 3, initial_delay_sec: float = 0.8) -> tuple[bool, dict[str, Any]]:
+def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 3, initial_delay_sec: float = 0.8) -> tuple[bool, dict[str, Any]]:
     base_url = _agent_base_url(settings, agent_code)
     url = f"{base_url}/{task_id}"
     delay = max(0.1, initial_delay_sec)
@@ -908,7 +908,7 @@ def aa_run_task(task_id: int):
         "handoff_ready": True,
         "handoff": handoff,
     }
-        set_task_result(
+    set_task_result(
         settings.database_url,
         task_id=task_id,
         result=execution_result,

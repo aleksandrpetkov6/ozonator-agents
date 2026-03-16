@@ -312,7 +312,8 @@ class AAClient:
             if attempt < CREATE_RETRIES:
                 time.sleep(0.8 * (attempt + 1))
         raise RuntimeError(f"Не удалось создать задачу: {last_error}")
-            def upload_file(self, task_id: int, file_path: str) -> dict:
+
+    def upload_file(self, task_id: int, file_path: str) -> dict:
         url = self._full_url(f"{self.api_prefix}/tasks/{task_id}/files/upload")
 
         try:
@@ -543,7 +544,8 @@ class App(tk.Tk):
             except Exception:
                 continue
         return None
-            def _get_geo(self) -> dict | None:
+
+    def _get_geo(self) -> dict | None:
         if not self._share_geo:
             return None
         cached = self._load_geo_cache()
@@ -834,7 +836,8 @@ class App(tk.Tk):
             },
         }
         return payload
-            def _on_paste(self, event=None):
+
+    def _on_paste(self, event=None):
         try:
             txt = self.clipboard_get()
             if isinstance(txt, str) and txt != "":
