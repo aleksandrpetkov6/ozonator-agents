@@ -481,6 +481,7 @@ class App(tk.Tk):
                 pass
 
         self._build_ui()
+        self._install_global_shortcuts()
         self._install_context_menus()
         self._restore_history()
         self._tick()
@@ -632,6 +633,155 @@ class App(tk.Tk):
 
         self.var_share_geo = tk.BooleanVar(value=self._share_geo)
         self._update_status()
+
+    def _install_global_shortcuts(self):
+        for seq in ("<Control-a>", "<Control-A>"):
+            self.bind_all(seq, self._handle_global_select_all, add="+")
+        for seq in ("<Control-c>", "<Control-C>", "<Control-Insert>"):
+            self.bind_all(seq, self._handle_global_copy, add="+")
+        for seq in ("<Control-x>", "<Control-X>", "<Shift-Delete>"):
+            self.bind_all(seq, self._handle_global_cut, add="+")
+        for seq in ("<Control-v>", "<Control-V>", "<Shift-Insert>"):
+            self.bind_all(seq, self._handle_global_paste, add="+")
+
+    def _focused_widget(self):
+        try:
+            return self.focus_get()
+        except Exception:
+            return None
+
+    def _widget_state(self, widget) -> str:
+        try:
+            return str(widget.cget("state") or "").strip().lower()
+        except Exception:
+            return ""
+
+    def _is_widget_editable(self, widget) -> bool:
+        return self._widget_state(widget) not in {"disabled", "readonly"}
+
+    def _handle_global_select_all(self, event=None):
+        widget = event.widget if event is not None and getattr(event, "widget", None) is not None else self._focused_widget()
+        if self._select_all_widget(widget):
+            return "break"
+        return None
+
+    def _handle_global_copy(self, event=None):
+        widget = event.widget if event is not None and getattr(event, "widget", None) is not None else self._focused_widget()
+        if self._copy_widget_selection(widget):
+            return "break"
+        return None
+
+    def _handle_global_cut(self, event=None):
+        widget = event.widget if event is not None and getattr(event, "widget", None) is not None else self._focused_widget()
+        if self._cut_widget_selection(widget):
+            return "break"
+        return None
+
+    def _handle_global_paste(self, event=None):
+        widget = event.widget if event is not None and getattr(event, "widget", None) is not None else self._focused_widget()
+        if widget is self.entry:
+            return self._on_paste(event)
+        if self._paste_into_widget(widget):
+            return "break"
+        return None
+
+    def _select_all_widget(self, widget) -> bool:
+        if widget is None:
+            return False
+        try:
+            if isinstance(widget, tk.Text):
+                prev_state = self._widget_state(widget)
+                if prev_state == "disabled":
+                    widget.configure(state="normal")
+                try:
+                    widget.tag_add("sel", "1.0", "end-1c")
+                    widget.mark_set("insert", "1.0")
+                    widget.see("insert")
+                    widget.focus_set()
+                finally:
+                    if prev_state == "disabled":
+                        widget.configure(state="disabled")
+                return True
+            if isinstance(widget, tk.Entry):
+                widget.selection_range(0, tk.END)
+                widget.icursor(tk.END)
+                widget.focus_set()
+                return True
+            if isinstance(widget, tk.Listbox):
+                if widget.size() <= 0:
+                    return True
+                widget.selection_clear(0, tk.END)
+                widget.selection_set(0, tk.END)
+                widget.activate(0)
+                widget.see(0)
+                widget.focus_set()
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _copy_widget_selection(self, widget) -> bool:
+        if widget is None:
+            return False
+        try:
+            if isinstance(widget, tk.Text):
+                try:
+                    data = widget.get("sel.first", "sel.last")
+                except Exception:
+                    data = widget.get("1.0", "end-1c")
+                data = str(data or "")
+                if data == "":
+                    return True
+                self.clipboard_clear()
+                self.clipboard_append(data)
+                return True
+            if isinstance(widget, tk.Entry):
+                try:
+                    data = widget.selection_get()
+                except Exception:
+                    data = widget.get()
+                data = str(data or "")
+                if data == "":
+                    return True
+                self.clipboard_clear()
+                self.clipboard_append(data)
+                return True
+            if isinstance(widget, tk.Listbox):
+                sels = widget.curselection()
+                if sels:
+                    data = "\n".join(str(widget.get(i)) for i in sels)
+                else:
+                    data = "\n".join(str(widget.get(i)) for i in range(widget.size()))
+                if data == "":
+                    return True
+                self.clipboard_clear()
+                self.clipboard_append(data)
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _cut_widget_selection(self, widget) -> bool:
+        if widget is None or not self._is_widget_editable(widget):
+            return False
+        try:
+            if isinstance(widget, (tk.Text, tk.Entry)):
+                widget.event_generate("<<Cut>>")
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _paste_into_widget(self, widget) -> bool:
+        if widget is None or not self._is_widget_editable(widget):
+            return False
+        try:
+            if isinstance(widget, (tk.Text, tk.Entry)):
+                widget.event_generate("<<Paste>>")
+                return True
+        except Exception:
+            return False
+        return False
 
     def _update_status(self):
         parts = ["online"]
@@ -1190,24 +1340,11 @@ class App(tk.Tk):
         self.chat.bind("<Control-a>", lambda e: (self._select_all(self.chat), "break")[1])
         self.chat.bind("<Control-A>", lambda e: (self._select_all(self.chat), "break")[1])
 
-    def _select_all(self, widget: tk.Text):
-        try:
-            widget.tag_add("sel", "1.0", "end-1c")
-            widget.mark_set("insert", "1.0")
-            widget.see("insert")
-        except Exception:
-            pass
+    def _select_all(self, widget):
+        self._select_all_widget(widget)
 
-    def _copy_selection(self, widget: tk.Text):
-        try:
-            sel = widget.get("sel.first", "sel.last")
-        except Exception:
-            return
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(sel)
-        except Exception:
-            pass
+    def _copy_selection(self, widget):
+        self._copy_widget_selection(widget)
 
     def _on_send(self):
         user_text = self.entry.get("1.0", "end-1c").strip()
@@ -1393,6 +1530,7 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title(f"Файлы задачи #{self.current_task_id}")
         win.geometry("760x420")
+        win.bind("<Escape>", lambda _e: win.destroy())
 
         btns = tk.Frame(win, padx=10, pady=(10, 10))
         btns.pack(side=tk.BOTTOM, fill=tk.X)
@@ -1400,7 +1538,7 @@ class App(tk.Tk):
         frm = tk.Frame(win, padx=10, pady=(10, 0))
         frm.pack(fill=tk.BOTH, expand=True)
 
-        lb = tk.Listbox(frm, font=("Segoe UI", 10))
+        lb = tk.Listbox(frm, font=("Segoe UI", 10), selectmode=tk.EXTENDED, activestyle="dotbox", exportselection=False)
         lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         sc = tk.Scrollbar(frm, command=lb.yview)
@@ -1456,9 +1594,11 @@ class App(tk.Tk):
 
         tk.Button(btns, text="Скачать выбранное", command=do_download_selected).pack(side=tk.LEFT)
         tk.Button(btns, text="Скачать всё", command=do_download_all).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(btns, text="Копировать имена", command=lambda: self._copy_widget_selection(lb)).pack(side=tk.LEFT, padx=(8, 0))
         tk.Button(btns, text="Обновить", command=lambda: (win.destroy(), self._open_task_files())).pack(side=tk.LEFT, padx=(8, 0))
         tk.Button(btns, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
 
+        lb.focus_set()
         lb.bind("<Double-Button-1>", lambda _e: do_download_selected())
         lb.bind("<Return>", lambda _e: do_download_selected())
 
@@ -1467,8 +1607,9 @@ class App(tk.Tk):
             win = tk.Toplevel(self)
             win.title("Логи — диагностика отправки")
             win.geometry("900x420")
+            win.bind("<Escape>", lambda _e: win.destroy())
 
-            txt = tk.Text(win, wrap="word", font=("Consolas", 10))
+            txt = tk.Text(win, wrap="word", font=("Consolas", 10), takefocus=1)
             txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
             sc = tk.Scrollbar(win, command=txt.yview)
@@ -1490,6 +1631,11 @@ class App(tk.Tk):
                 txt.insert(tk.END, f"last_error: {self._last_send_error}\n")
 
             txt.insert(tk.END, "\nПодсказка: если stage=create_task и elapsed_sec растёт — это сеть/DNS/таймаут или сервер недоступен.\n")
+            btns = tk.Frame(win, padx=10, pady=8)
+            btns.pack(fill=tk.X)
+            tk.Button(btns, text="Копировать всё", command=lambda: (self._select_all_widget(txt), self._copy_widget_selection(txt))).pack(side=tk.LEFT)
+            tk.Button(btns, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+            txt.focus_set()
             txt.configure(state="disabled")
             return
 
@@ -1498,11 +1644,12 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title(f"Логи задачи #{self.current_task_id}")
         win.geometry("1100x650")
+        win.bind("<Escape>", lambda _e: win.destroy())
 
         body = tk.Frame(win)
         body.pack(fill=tk.BOTH, expand=True)
 
-        txt = tk.Text(body, wrap="none", font=("Consolas", 10))
+        txt = tk.Text(body, wrap="none", font=("Consolas", 10), takefocus=1)
         txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         sc_y = tk.Scrollbar(body, command=txt.yview)

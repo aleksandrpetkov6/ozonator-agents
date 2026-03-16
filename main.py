@@ -5,6 +5,7 @@ import os
 import time
 from typing import Annotated, Any
 from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
@@ -500,18 +501,19 @@ def download_task_file(task_id: int, file_id: int):
     if not ok_task or not task:
         raise HTTPException(status_code=404, detail=task_message or "Задача не найдена")
 
-    ok_file, item, message = get_task_file_content(settings.database_url, task_id, file_id)
+    ok_file, item, content, message = get_task_file_content(settings.database_url, task_id, file_id)
     if not ok_file or not item:
         raise HTTPException(status_code=404, detail=message or "Файл не найден")
 
-    filename = item.get("file_name") or f"file_{file_id}"
-    content_type = item.get("content_type") or "application/octet-stream"
-    content = item.get("content") or b""
+    filename = str(item.get("file_name") or f"file_{file_id}")
+    content_type = str(item.get("content_type") or "application/octet-stream")
+    safe_ascii_name = ''.join(ch if 32 <= ord(ch) < 127 and ch not in {'"', '\\'} else '_' for ch in filename) or f"file_{file_id}"
+    encoded_name = urllib_parse.quote(filename)
 
     headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"'
+        "Content-Disposition": f'attachment; filename="{safe_ascii_name}"; filename*=UTF-8''{encoded_name}'
     }
-    return Response(content=content, media_type=content_type, headers=headers)
+    return Response(content=content or b"", media_type=content_type, headers=headers)
 
 
 @app.get("/tasks/{task_id}")
