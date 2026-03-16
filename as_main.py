@@ -49,6 +49,57 @@ def _normalize_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _compact_file_meta(file_row: dict[str, Any] | None) -> dict[str, Any]:
+    meta = file_row if isinstance(file_row, dict) else {}
+    return {
+        "id": int(meta.get("id") or 0),
+        "file_name": str(meta.get("file_name") or ""),
+        "content_type": str(meta.get("content_type") or "application/octet-stream"),
+        "size_bytes": int(meta.get("size_bytes") or 0),
+        "created_at": meta.get("created_at"),
+    }
+
+
+def _remember_download_file(task_id: int, file_row: dict[str, Any] | None) -> None:
+    settings = get_settings()
+    compact = _compact_file_meta(file_row)
+    file_id = int(compact.get("id") or 0)
+    if not settings.database_url or not file_id:
+        return
+
+    ok_task, task, _msg = get_task_record(settings.database_url, task_id)
+    if not ok_task or not isinstance(task, dict):
+        return
+
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    result = dict(result) if isinstance(result, dict) else {}
+
+    existing = result.get("download_files") if isinstance(result.get("download_files"), list) else []
+    merged: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for item in existing:
+        if not isinstance(item, dict):
+            continue
+        item_id = int(item.get("id") or 0)
+        if not item_id or item_id in seen_ids:
+            continue
+        seen_ids.add(item_id)
+        merged.append(_compact_file_meta(item))
+
+    if file_id not in seen_ids:
+        merged.append(compact)
+
+    result["download_files"] = merged
+    result["download_file_ids"] = [int(x.get("id") or 0) for x in merged if int(x.get("id") or 0)]
+
+    set_task_result(
+        settings.database_url,
+        task_id=task_id,
+        result=result,
+        error_message=task.get("error_message"),
+    )
+
+
 _ATT_MAX_FILES = 8
 _ATT_MAX_TOTAL_BYTES = 2 * 1024 * 1024
 _ATT_MAX_CHARS_PER_FILE = 20000
@@ -556,7 +607,10 @@ def _save_web_results_as_file(task_id: int, database_url: str | None, query: str
     if not ok:
         return "", ""
 
-    note = f"Я подготовила файл «{file_name}» для скачивания (кнопка «Скачать»)."
+    if isinstance(meta, dict):
+        _remember_download_file(task_id, meta)
+
+    note = f"Я подготовила файл «{file_name}» для скачивания (в чате и по кнопке «Скачать»)."
     return file_name, note
 
 
@@ -822,7 +876,10 @@ def _maybe_download_url_to_task(task_id: int, payload: dict[str, Any], user_text
     if not ok:
         return "Саша, я скачала файл, но не смогла сохранить его для выдачи."
 
-    return f"Саша, я скачала файл по ссылке и подготовила его для тебя: «{name}». Нажми «Скачать» в клиенте."
+    if isinstance(meta, dict):
+        _remember_download_file(task_id, meta)
+
+    return f"Саша, я скачала файл по ссылке и подготовила его для тебя: «{name}». Его можно скачать прямо из чата или по кнопке «Скачать»."
 
 
 def _prepare_image_for_vision(file_name: str, content_type: str, raw: bytes) -> tuple[bytes, str]:
@@ -3620,7 +3677,8 @@ def as_run_task(task_id: int):
         as_artifacts = _build_as_artifacts(task_id, task)
         final_answer = _build_final_answer(task_id, task)
 
-        prev_result = task.get("result") if isinstance(task.get("result"), dict) else {}
+        ok_latest, latest_task, _latest_message = get_task_record(settings.database_url, task_id)
+        prev_result = latest_task.get("result") if ok_latest and isinstance(latest_task, dict) and isinstance(latest_task.get("result"), dict) else task.get("result") if isinstance(task.get("result"), dict) else {}
         prev_result = prev_result if isinstance(prev_result, dict) else {}
 
         current_review_cycle = int(prev_result.get("review_cycle") or 0)

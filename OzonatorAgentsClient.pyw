@@ -680,6 +680,75 @@ class App(tk.Tk):
             return
         self._save_task_file(task_id, file_meta)
 
+    def _normalize_file_meta(self, item: dict | None) -> dict:
+        meta = item if isinstance(item, dict) else {}
+        return {
+            "id": int(meta.get("id") or 0),
+            "file_name": str(meta.get("file_name") or ""),
+            "content_type": str(meta.get("content_type") or "application/octet-stream"),
+            "size_bytes": int(meta.get("size_bytes") or 0),
+            "created_at": meta.get("created_at"),
+        }
+
+    def _downloadable_files_from_task(self, task_id: int, task: dict | None = None) -> list[dict]:
+        task = task if isinstance(task, dict) else None
+        if task is None:
+            try:
+                task = self.client.get_task(task_id)
+            except Exception:
+                task = None
+
+        result = task.get("result") if isinstance(task, dict) and isinstance(task.get("result"), dict) else {}
+        result = result if isinstance(result, dict) else {}
+
+        download_files = result.get("download_files") if isinstance(result.get("download_files"), list) else []
+        normalized_downloads: list[dict] = []
+        seen_download_ids: set[int] = set()
+        for item in download_files:
+            if not isinstance(item, dict):
+                continue
+            meta = self._normalize_file_meta(item)
+            file_id = int(meta.get("id") or 0)
+            if not file_id or file_id in seen_download_ids:
+                continue
+            seen_download_ids.add(file_id)
+            normalized_downloads.append(meta)
+        if normalized_downloads:
+            return normalized_downloads
+
+        try:
+            files = self.client.list_task_files(task_id)
+        except Exception:
+            return []
+
+        upload_ids_raw = result.get("user_upload_file_ids") if isinstance(result.get("user_upload_file_ids"), list) else []
+        upload_ids = {int(x) for x in upload_ids_raw if str(x).isdigit()}
+
+        upload_files = result.get("user_upload_files") if isinstance(result.get("user_upload_files"), list) else []
+        upload_names = {
+            str(item.get("file_name") or "").strip().lower()
+            for item in upload_files
+            if isinstance(item, dict) and str(item.get("file_name") or "").strip()
+        }
+
+        filtered: list[dict] = []
+        seen_ids: set[int] = set()
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            meta = self._normalize_file_meta(item)
+            file_id = int(meta.get("id") or 0)
+            file_name = str(meta.get("file_name") or "").strip().lower()
+            if not file_id or file_id in seen_ids:
+                continue
+            seen_ids.add(file_id)
+            if file_id in upload_ids:
+                continue
+            if file_name and file_name in upload_names:
+                continue
+            filtered.append(meta)
+        return filtered
+
     def _save_task_file(self, task_id: int, meta: dict, parent=None) -> str | None:
         file_id = int(meta.get("id") or 0)
         file_name = str(meta.get("file_name") or f"file_{file_id}")
@@ -703,10 +772,10 @@ class App(tk.Tk):
         messagebox.showinfo("Скачать", f"Файл сохранён:\n{save_path}", parent=parent or self)
         return save_path
 
-    def _announce_task_files_in_chat(self, task_id: int, files: list[dict] | None = None):
+    def _announce_task_files_in_chat(self, task_id: int, files: list[dict] | None = None, task: dict | None = None):
         try:
             if files is None:
-                files = self.client.list_task_files(task_id)
+                files = self._downloadable_files_from_task(task_id, task=task)
         except Exception:
             return
 
@@ -728,7 +797,7 @@ class App(tk.Tk):
         if not new_items:
             return
 
-        self._insert_chat("Файлы для скачивания:\n", "files_hdr")
+        self._insert_chat("Результаты для скачивания:\n", "files_hdr")
         for item in new_items:
             file_id = int(item.get("id") or 0)
             file_name = str(item.get("file_name") or f"file_{file_id}")
@@ -742,17 +811,18 @@ class App(tk.Tk):
 
     def _download_or_open_task_files(self):
         if self.current_task_id is None:
-            messagebox.showinfo("Скачать", "Сначала дождись задачи с файлами.")
+            messagebox.showinfo("Скачать", "Сначала дождись задачи с результатами.")
             return
 
         try:
-            files = self.client.list_task_files(self.current_task_id)
+            task = self.client.get_task(self.current_task_id)
+            files = self._downloadable_files_from_task(self.current_task_id, task=task)
         except Exception as e:
             messagebox.showerror("Скачать", f"Не удалось получить список файлов: {e}")
             return
 
         if not files:
-            messagebox.showinfo("Скачать", "Для этой задачи файлов пока нет.")
+            messagebox.showinfo("Скачать", "Для этой задачи результатов для скачивания пока нет.")
             return
 
         if len(files) == 1:
@@ -1282,7 +1352,7 @@ class App(tk.Tk):
             self._polling = False
             self._clear_typing_if_any()
             self._add_message("assistant", AA_DISPLAY_NAME, final_answer)
-            self._announce_task_files_in_chat(task_id)
+            self._announce_task_files_in_chat(task_id, task=task)
             return
 
         if status in {"DONE", "REVIEW_NEEDS_ATTENTION"}:

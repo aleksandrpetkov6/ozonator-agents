@@ -93,6 +93,65 @@ def _shrink_image_to_max_bytes(raw: bytes, file_name: str, content_type: str, ma
         return raw, (content_type or "application/octet-stream")
 
 
+def _compact_file_meta(file_row: dict[str, Any] | None) -> dict[str, Any]:
+    meta = file_row if isinstance(file_row, dict) else {}
+    return {
+        "id": int(meta.get("id") or 0),
+        "file_name": str(meta.get("file_name") or ""),
+        "content_type": str(meta.get("content_type") or "application/octet-stream"),
+        "size_bytes": int(meta.get("size_bytes") or 0),
+        "created_at": meta.get("created_at"),
+    }
+
+
+def _append_task_result_file_meta(
+    database_url: str | None,
+    task_id: int,
+    *,
+    list_key: str,
+    file_row: dict[str, Any] | None,
+) -> None:
+    compact = _compact_file_meta(file_row)
+    file_id = int(compact.get("id") or 0)
+    if not database_url or not file_id:
+        return
+
+    ok_task, task, _msg = get_task_record(database_url, task_id)
+    if not ok_task or not isinstance(task, dict):
+        return
+
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    result = dict(result) if isinstance(result, dict) else {}
+
+    items = result.get(list_key) if isinstance(result.get(list_key), list) else []
+    merged: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = int(item.get("id") or 0)
+        if not item_id or item_id in seen_ids:
+            continue
+        seen_ids.add(item_id)
+        merged.append(_compact_file_meta(item))
+
+    if file_id not in seen_ids:
+        merged.append(compact)
+
+    result[list_key] = merged
+    if list_key == "user_upload_files":
+        result["user_upload_file_ids"] = [int(x.get("id") or 0) for x in merged if int(x.get("id") or 0)]
+    elif list_key == "download_files":
+        result["download_file_ids"] = [int(x.get("id") or 0) for x in merged if int(x.get("id") or 0)]
+
+    set_task_result(
+        database_url,
+        task_id=task_id,
+        result=result,
+        error_message=task.get("error_message"),
+    )
+
+
 def require_admin_token(
     x_admin_token: Annotated[str | None, Header(alias="X-Admin-Token")] = None,
 ) -> None:
@@ -382,6 +441,14 @@ async def upload_task_file(task_id: int, file: UploadFile = File(...)):
             "error": None if ok_file else message,
         },
     )
+
+    if ok_file and isinstance(file_row, dict):
+        _append_task_result_file_meta(
+            settings.database_url,
+            task_id=task_id,
+            list_key="user_upload_files",
+            file_row=file_row,
+        )
 
     return JSONResponse(
         status_code=200 if ok_file else 503,
@@ -921,7 +988,11 @@ def aa_run_task(task_id: int):
         ],
     }
 
+    current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    current_result = dict(current_result) if isinstance(current_result, dict) else {}
+
     execution_result = {
+        **current_result,
         "source_agent": "AA",
         "target_agent": "AA",
         "task_type": task.get("task_type"),
