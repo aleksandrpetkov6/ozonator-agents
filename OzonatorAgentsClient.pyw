@@ -32,8 +32,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from tkinter import filedialog, messagebox
 from urllib import error as urllib_error
-from urllib import request as urllib_request
 from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 
 DEFAULT_AA_BASE_URL = (os.getenv("OZONATOR_AA_BASE_URL") or "https://ozonator-aa-dev.onrender.com").rstrip("/")
@@ -466,6 +466,8 @@ class App(tk.Tk):
         self._send_stage = ""
         self._last_send_error: str | None = None
         self._send_nonce = uuid.uuid4().hex
+        self._chat_download_links: dict[str, dict] = {}
+        self._announced_file_ids_by_task: dict[int, set[int]] = {}
 
         self._config_path = os.path.join(_app_data_dir(), CONFIG_FILE_NAME)
         self._state_path = os.path.join(_app_data_dir(), STATE_FILE_NAME)
@@ -595,7 +597,7 @@ class App(tk.Tk):
         right.pack(side=tk.RIGHT)
 
         tk.Button(right, text="Настройки", command=self._open_settings).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Button(right, text="Скачать", command=self._open_task_files).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(right, text="Скачать", command=self._download_or_open_task_files).pack(side=tk.LEFT, padx=(0, 8))
         tk.Button(right, text="Логи", command=self._open_logs).pack(side=tk.LEFT)
 
         mid = tk.Frame(self, padx=10)
@@ -657,6 +659,107 @@ class App(tk.Tk):
         self.chat.insert("end", text, tag if tag else ())
         self.chat.see("end")
         self.chat.configure(state="disabled")
+
+    def _register_download_link(self, task_id: int, file_meta: dict) -> str:
+        file_id = int(file_meta.get("id") or 0)
+        tag = f"dl_{task_id}_{file_id}_{uuid.uuid4().hex[:8]}"
+        self._chat_download_links[tag] = {"task_id": task_id, "file": dict(file_meta or {})}
+
+        self.chat.tag_configure(tag, foreground="#0a58ca", underline=True)
+        self.chat.tag_bind(tag, "<Enter>", lambda _e: self.chat.configure(cursor="hand2"))
+        self.chat.tag_bind(tag, "<Leave>", lambda _e: self.chat.configure(cursor="xterm"))
+        self.chat.tag_bind(tag, "<Button-1>", lambda _e, name=tag: self._download_from_chat_tag(name))
+        return tag
+
+    def _download_from_chat_tag(self, tag: str):
+        meta = self._chat_download_links.get(tag) or {}
+        task_id = int(meta.get("task_id") or 0)
+        file_meta = meta.get("file") if isinstance(meta.get("file"), dict) else None
+        if not task_id or not file_meta:
+            messagebox.showerror("Скачать", "Не удалось определить файл для скачивания.")
+            return
+        self._save_task_file(task_id, file_meta)
+
+    def _save_task_file(self, task_id: int, meta: dict, parent=None) -> str | None:
+        file_id = int(meta.get("id") or 0)
+        file_name = str(meta.get("file_name") or f"file_{file_id}")
+
+        save_path = filedialog.asksaveasfilename(
+            initialfile=file_name,
+            title="Куда сохранить файл",
+            parent=parent or self,
+        )
+        if not save_path:
+            return None
+
+        try:
+            content = self.client.download_task_file(task_id, file_id)
+            with open(save_path, "wb") as f:
+                f.write(content or b"")
+        except Exception as e:
+            messagebox.showerror("Скачать", f"Не удалось скачать файл: {e}", parent=parent or self)
+            return None
+
+        messagebox.showinfo("Скачать", f"Файл сохранён:\n{save_path}", parent=parent or self)
+        return save_path
+
+    def _announce_task_files_in_chat(self, task_id: int, files: list[dict] | None = None):
+        try:
+            if files is None:
+                files = self.client.list_task_files(task_id)
+        except Exception:
+            return
+
+        if not files:
+            return
+
+        announced = self._announced_file_ids_by_task.setdefault(int(task_id), set())
+        new_items: list[dict] = []
+        for item in files:
+            try:
+                file_id = int(item.get("id") or 0)
+            except Exception:
+                file_id = 0
+            if not file_id or file_id in announced:
+                continue
+            announced.add(file_id)
+            new_items.append(item)
+
+        if not new_items:
+            return
+
+        self._insert_chat("Файлы для скачивания:\n", "files_hdr")
+        for item in new_items:
+            file_id = int(item.get("id") or 0)
+            file_name = str(item.get("file_name") or f"file_{file_id}")
+            size_bytes = int(item.get("size_bytes") or 0)
+            tag = self._register_download_link(task_id, item)
+            label = f"↓ {file_name}"
+            if size_bytes > 0:
+                label += f"  ({size_bytes} bytes)"
+            self._insert_chat(label + "\n", tag)
+        self._insert_chat("\n")
+
+    def _download_or_open_task_files(self):
+        if self.current_task_id is None:
+            messagebox.showinfo("Скачать", "Сначала дождись задачи с файлами.")
+            return
+
+        try:
+            files = self.client.list_task_files(self.current_task_id)
+        except Exception as e:
+            messagebox.showerror("Скачать", f"Не удалось получить список файлов: {e}")
+            return
+
+        if not files:
+            messagebox.showinfo("Скачать", "Для этой задачи файлов пока нет.")
+            return
+
+        if len(files) == 1:
+            self._save_task_file(self.current_task_id, files[0])
+            return
+
+        self._open_task_files(files=files)
 
     def _add_message(self, role: str, author: str, text: str, include_in_context: bool = True):
         ts = now_hhmm()
@@ -1179,6 +1282,7 @@ class App(tk.Tk):
             self._polling = False
             self._clear_typing_if_any()
             self._add_message("assistant", AA_DISPLAY_NAME, final_answer)
+            self._announce_task_files_in_chat(task_id)
             return
 
         if status in {"DONE", "REVIEW_NEEDS_ATTENTION"}:
@@ -1201,13 +1305,13 @@ class App(tk.Tk):
             err = str(task.get("error_message") or "Задача завершилась с ошибкой").strip()
             self._add_message("assistant", AA_DISPLAY_NAME, err)
 
-    def _open_task_files(self):
+    def _open_task_files(self, files: list[dict] | None = None):
         if self.current_task_id is None:
             messagebox.showinfo("Скачать", "Сначала дождись задачи с файлами.")
             return
 
         try:
-            files = self.client.list_task_files(self.current_task_id)
+            files = files if files is not None else self.client.list_task_files(self.current_task_id)
         except Exception as e:
             messagebox.showerror("Скачать", f"Не удалось получить список файлов: {e}")
             return
@@ -1220,7 +1324,10 @@ class App(tk.Tk):
         win.title(f"Файлы задачи #{self.current_task_id}")
         win.geometry("760x420")
 
-        frm = tk.Frame(win, padx=10, pady=10)
+        btns = tk.Frame(win, padx=10, pady=(10, 10))
+        btns.pack(side=tk.BOTTOM, fill=tk.X)
+
+        frm = tk.Frame(win, padx=10, pady=(10, 0))
         frm.pack(fill=tk.BOTH, expand=True)
 
         lb = tk.Listbox(frm, font=("Segoe UI", 10))
@@ -1239,37 +1346,51 @@ class App(tk.Tk):
             lb.insert(tk.END, label)
             file_map.append(item)
 
-        def do_download():
-            sel = lb.curselection()
-            if not sel:
-                messagebox.showinfo("Скачать", "Выбери файл в списке.")
+        def selected_items() -> list[dict]:
+            sels = lb.curselection()
+            return [file_map[int(i)] for i in sels] if sels else []
+
+        def do_download_selected():
+            items = selected_items()
+            if not items:
+                messagebox.showinfo("Скачать", "Выбери файл в списке.", parent=win)
+                return
+            if len(items) == 1:
+                self._save_task_file(self.current_task_id, items[0], parent=win)
                 return
 
-            meta = file_map[int(sel[0])]
-            file_id = int(meta.get("id") or 0)
-            file_name = str(meta.get("file_name") or f"file_{file_id}")
-
-            save_path = filedialog.asksaveasfilename(initialfile=file_name, title="Куда сохранить файл")
-            if not save_path:
+            target_dir = filedialog.askdirectory(title="Куда сохранить файлы", parent=win)
+            if not target_dir:
                 return
 
-            try:
-                content = self.client.download_task_file(self.current_task_id, file_id)
-                with open(save_path, "wb") as f:
-                    f.write(content or b"")
-            except Exception as e:
-                messagebox.showerror("Скачать", f"Не удалось скачать файл: {e}")
-                return
+            saved = 0
+            for meta in items:
+                file_id = int(meta.get("id") or 0)
+                file_name = str(meta.get("file_name") or f"file_{file_id}")
+                save_path = os.path.join(target_dir, file_name)
+                try:
+                    content = self.client.download_task_file(self.current_task_id, file_id)
+                    with open(save_path, "wb") as f:
+                        f.write(content or b"")
+                    saved += 1
+                except Exception as e:
+                    messagebox.showerror("Скачать", f"Не удалось скачать файл {file_name}: {e}", parent=win)
+                    return
 
-            messagebox.showinfo("Скачать", f"Файл сохранён:\n{save_path}")
+            messagebox.showinfo("Скачать", f"Сохранено файлов: {saved}\nПапка: {target_dir}", parent=win)
 
-        btns = tk.Frame(win, padx=10, pady=(0, 10))
-        btns.pack(fill=tk.X)
-        tk.Button(btns, text="Скачать выбранный", command=do_download).pack(side=tk.LEFT)
+        def do_download_all():
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(0, tk.END)
+            do_download_selected()
+
+        tk.Button(btns, text="Скачать выбранное", command=do_download_selected).pack(side=tk.LEFT)
+        tk.Button(btns, text="Скачать всё", command=do_download_all).pack(side=tk.LEFT, padx=(8, 0))
         tk.Button(btns, text="Обновить", command=lambda: (win.destroy(), self._open_task_files())).pack(side=tk.LEFT, padx=(8, 0))
         tk.Button(btns, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
 
-        lb.bind("<Double-Button-1>", lambda _e: do_download())
+        lb.bind("<Double-Button-1>", lambda _e: do_download_selected())
+        lb.bind("<Return>", lambda _e: do_download_selected())
 
     def _open_logs(self):
         if self.current_task_id is None:
