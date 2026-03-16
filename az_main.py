@@ -37,7 +37,7 @@ def _build_az_brief(task_id: int, task: dict[str, Any]) -> dict[str, Any]:
     screen = str(payload.get("screen") or "Не указано")
     task_type = str(task.get("task_type") or "unknown")
 
-    user_request = str(payload.get("user_request") or "").strip()
+    user_request = str(payload.get("user_request") or payload.get("prompt") or "").strip()
     normalized_user_request = user_request or brief
 
     acceptance_criteria = payload.get("acceptance_criteria") or []

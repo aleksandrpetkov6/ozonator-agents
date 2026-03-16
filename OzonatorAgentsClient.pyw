@@ -783,10 +783,10 @@ class App(tk.Tk):
         for row in items:
             if not isinstance(row, dict):
                 continue
-            user_text = _safe_text(row.get("content"))
-            final_answer = ""
+            user_text = _safe_text(row.get("user_request") or row.get("content"))
+            final_answer = _safe_text(row.get("final_answer"))
             result = row.get("result") if isinstance(row.get("result"), dict) else {}
-            if isinstance(result, dict):
+            if not final_answer and isinstance(result, dict):
                 final_answer = _safe_text(result.get("final_answer"))
 
             if user_text:
@@ -794,20 +794,27 @@ class App(tk.Tk):
             if final_answer:
                 self._add_message("assistant", AA_DISPLAY_NAME, final_answer)
 
-    def _context_messages(self) -> list[str]:
+    def _context_messages(self) -> list[dict[str, str]]:
         items = [x for x in self._message_items if x.get("include_in_context", True)]
         items = items[-HISTORY_MAX_ITEMS:]
 
-        chunks: list[str] = []
+        chunks: list[dict[str, str]] = []
         total = 0
         for item in items:
-            line = _sanitize_for_context(item.get("role", ""), item.get("author", ""), item.get("text", ""))
-            if not line:
+            role = _safe_text(item.get("role")).strip().lower()
+            if role not in {"user", "assistant"}:
                 continue
-            add_len = len(line) + 1
+
+            text = _safe_text(item.get("text")).replace("\r\n", "\n").strip()
+            text = _clip_text(text, HISTORY_MAX_EACH)
+            if not text:
+                continue
+
+            add_len = len(text) + 1
             if total + add_len > HISTORY_MAX_CHARS:
                 break
-            chunks.append(line)
+
+            chunks.append({"role": role, "content": text})
             total += add_len
         return chunks
 
@@ -832,6 +839,8 @@ class App(tk.Tk):
                 },
                 "user_name": "Александр",
                 "prompt": prompt,
+                "user_request": prompt,
+                "brief": prompt,
                 "conversation_history": context,
             },
         }

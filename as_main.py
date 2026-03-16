@@ -1451,6 +1451,43 @@ def _open_meteo_current(lat: float, lon: float) -> dict[str, Any] | None:
 
 
 
+def _legacy_history_item_to_message(item: Any) -> dict[str, str] | None:
+    if isinstance(item, dict):
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            return None
+        content = str(item.get("content") or "").strip()
+        if not content:
+            return None
+        return {"role": role, "content": content}
+
+    if not isinstance(item, str):
+        return None
+
+    line = re.sub(r"\s+", " ", item).strip()
+    if not line:
+        return None
+
+    role = "user"
+    content = line
+
+    if ":" in line:
+        author, rest = line.split(":", 1)
+        author_norm = author.strip().lower()
+        content = rest.strip()
+        if author_norm in {"ты", "пользователь", "user"}:
+            role = "user"
+        elif author_norm in {"екатерина", "assistant", "ассистент"}:
+            role = "assistant"
+        else:
+            role = "user"
+
+    if not content:
+        return None
+
+    return {"role": role, "content": content}
+
+
 def _normalize_conversation_history(
     payload: dict[str, Any] | None,
     *,
@@ -1481,13 +1518,11 @@ def _normalize_conversation_history(
     total = 0
 
     for item in reversed(raw):
-        if not isinstance(item, dict):
+        prepared = _legacy_history_item_to_message(item)
+        if not prepared:
             continue
-        role = str(item.get("role") or "").strip().lower()
-        if role not in {"user", "assistant"}:
-            continue
-        content = str(item.get("content") or "").strip()
-        content = re.sub(r"\s+", " ", content)
+        role = prepared["role"]
+        content = re.sub(r"\s+", " ", prepared["content"]).strip()
         if not content:
             continue
         if len(content) > max_each:
@@ -3137,7 +3172,7 @@ def _build_final_answer(task_id: int, task: dict[str, Any]) -> str:
     current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
     az_fix_plan = current_result.get("az_fix_plan") if isinstance(current_result.get("az_fix_plan"), dict) else {}
 
-    user_request = _normalize_text(payload.get("user_request"))
+    user_request = _normalize_text(payload.get("user_request")) or _normalize_text(payload.get("prompt"))
     payload_brief = _normalize_text(payload.get("brief"))
     goal = _normalize_text(az_fix_plan.get("goal"))
     title = _normalize_text(payload.get("title")) or _normalize_text(az_fix_plan.get("title"))
