@@ -3547,6 +3547,7 @@ def get_task_logs_endpoint(task_id: int):
 # AS runner
 # -------------------------
 @app.post("/as/run-task/{task_id}")
+@app.post("/{task_id}")
 def as_run_task(task_id: int):
     settings = get_settings()
     ok, task, message = get_task_record(settings.database_url, task_id)

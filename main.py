@@ -485,7 +485,7 @@ def _json_response(status_code: int, payload: dict[str, Any]) -> JSONResponse:
     return JSONResponse(status_code=status_code, content=payload)
 
 
-def _agent_base_url(settings, agent_code: str) -> str:
+def _agent_service_url(settings, agent_code: str) -> str:
     if agent_code == "AZ":
         return settings.az_run_task_base_url.rstrip("/")
     if agent_code == "AS":
@@ -495,6 +495,30 @@ def _agent_base_url(settings, agent_code: str) -> str:
     raise ValueError(f"Неизвестный агент для оркестрации: {agent_code}")
 
 
+def _agent_run_task_url(settings, agent_code: str, task_id: int) -> str:
+    service_url = _agent_service_url(settings, agent_code)
+    run_suffix = f"/{agent_code.lower()}/run-task"
+    lower_service_url = service_url.lower()
+
+    if lower_service_url.endswith(run_suffix):
+        return f"{service_url}/{task_id}"
+    if lower_service_url.endswith("/run-task"):
+        return f"{service_url}/{task_id}"
+    return f"{service_url}{run_suffix}/{task_id}"
+
+
+def _agent_health_url(settings, agent_code: str) -> str:
+    service_url = _agent_service_url(settings, agent_code)
+    run_suffix = f"/{agent_code.lower()}/run-task"
+    lower_service_url = service_url.lower()
+
+    if lower_service_url.endswith(run_suffix):
+        return service_url[: -len(run_suffix)] + "/health"
+    if lower_service_url.endswith("/run-task"):
+        return service_url.rsplit("/", 1)[0] + "/health"
+    return f"{service_url}/health"
+
+
 def _normalize_execution_response(agent_code: str, payload: dict[str, Any]) -> dict[str, Any]:
     task = payload.get("task") if isinstance(payload.get("task"), dict) else None
     execution_result = payload.get("execution_result") if isinstance(payload.get("execution_result"), dict) else None
@@ -502,14 +526,14 @@ def _normalize_execution_response(agent_code: str, payload: dict[str, Any]) -> d
 
     handoff_ready = bool(execution_result and execution_result.get("handoff_ready"))
     next_agent = str(execution_result.get("next_agent") or "").upper() if execution_result else ""
-    task_status = str(task.get("status") or "").upper() if task else ""
+    task_status = str((task or {}).get("status") or (execution_result or {}).get("task_status") or "").upper()
 
     ok = False
     if response_status == "ok":
         if agent_code == "AZ":
-            ok = handoff_ready and next_agent == "AS" and task_status == "AZ_DONE"
+            ok = handoff_ready and next_agent == "AS" and task_status in {"BRIEF_READY", "AZ_DONE"}
         elif agent_code == "AS":
-            ok = handoff_ready and next_agent == "AK" and task_status == "AS_DONE"
+            ok = handoff_ready and next_agent == "AK" and task_status in {"ARTIFACTS_READY", "AS_DONE"}
         elif agent_code == "AK":
             ok = task_status == "DONE"
 
@@ -560,8 +584,7 @@ def _log_agent_call(settings, task_id: int, cycle_no: int, agent_code: str, ok: 
         meta=meta,
     )
 def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 3, initial_delay_sec: float = 0.8) -> tuple[bool, dict[str, Any]]:
-    base_url = _agent_base_url(settings, agent_code)
-    url = f"{base_url}/{task_id}"
+    url = _agent_run_task_url(settings, agent_code, task_id)
     delay = max(0.1, initial_delay_sec)
     last_payload: dict[str, Any] | None = None
 
@@ -1112,8 +1135,7 @@ def debug_test_outbound(agent_code: str):
             },
         )
 
-    base_url = _agent_base_url(settings, code)
-    health_url = base_url.rsplit("/", 1)[0] + "/health"
+    health_url = _agent_health_url(settings, code)
 
     try:
         req = urllib_request.Request(

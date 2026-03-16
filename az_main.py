@@ -270,6 +270,7 @@ def get_task_logs_endpoint(task_id: int):
 # AZ runner
 # =========================
 @app.post("/az/run-task/{task_id}")
+@app.post("/{task_id}")
 def az_run_task(task_id: int):
     settings = get_settings()
     ok, task, message = get_task_record(settings.database_url, task_id)
