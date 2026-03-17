@@ -649,7 +649,7 @@ def _retry_after_seconds(headers: Any) -> int | None:
         return None
 
 
-def _warm_agent_service(settings, agent_code: str, timeout: int = 12) -> None:
+def _warm_agent_service(settings, agent_code: str, timeout: int = 12) -> bool:
     url = _agent_health_url(settings, agent_code)
     req = urllib_request.Request(
         url,
@@ -665,8 +665,9 @@ def _warm_agent_service(settings, agent_code: str, timeout: int = 12) -> None:
                 resp.read(256)
             except Exception:
                 pass
+            return int(getattr(resp, "status", 200) or 200) < 500
     except Exception:
-        pass
+        return False
 
 
 def _retry_sleep_seconds(http_status: int | None, attempt: int, delay: float, retry_after: int | None = None) -> float:
@@ -675,10 +676,10 @@ def _retry_sleep_seconds(http_status: int | None, attempt: int, delay: float, re
 
     base = max(0.5, float(delay))
     if http_status == 429:
-        return min(max(base, 4.0) * max(1, attempt), 25.0)
+        return min(max(base, 8.0) * max(1, attempt), 60.0)
     if http_status in {502, 503, 504}:
-        return min(max(base, 2.5) * max(1, attempt), 20.0)
-    return min(base, 8.0)
+        return min(max(base, 4.0) * max(1, attempt), 45.0)
+    return min(max(base, 2.0), 15.0)
 
 
 def _build_step_meta(payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -692,6 +693,11 @@ def _build_step_meta(payload: dict[str, Any] | None) -> dict[str, Any]:
         "url": payload.get("url"),
         "http_status": payload.get("http_status"),
         "attempts": payload.get("attempts"),
+        "elapsed_sec": payload.get("elapsed_sec"),
+        "retry_after_sec": payload.get("retry_after_sec"),
+        "next_sleep_sec": payload.get("next_sleep_sec"),
+        "warmup_attempted": payload.get("warmup_attempted"),
+        "warmup_ok": payload.get("warmup_ok"),
         "transport_error": payload.get("error"),
         "response_status": response.get("status"),
         "response_message": response.get("message"),
@@ -716,17 +722,20 @@ def _log_agent_call(settings, task_id: int, cycle_no: int, agent_code: str, ok: 
         message=f"AA вызвал {agent_code.upper()}",
         meta=meta,
     )
-def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 5, initial_delay_sec: float = 1.5) -> tuple[bool, dict[str, Any]]:
-    url = _agent_run_task_url(settings, agent_code, task_id)
-    delay = max(0.5, initial_delay_sec)
-    last_payload: dict[str, Any] | None = None
 
-    _warm_agent_service(settings, agent_code)
+
+def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 8, initial_delay_sec: float = 4.0) -> tuple[bool, dict[str, Any]]:
+    url = _agent_run_task_url(settings, agent_code, task_id)
+    delay = max(1.0, initial_delay_sec)
+    last_payload: dict[str, Any] | None = None
+    started_at = time.time()
+    total_wait_limit = 180.0
 
     for attempt in range(1, max_retries + 1):
         retry_after: int | None = None
         http_status: int | None = None
         should_warm_before_retry = False
+        warmed = False
 
         try:
             req = urllib_request.Request(
@@ -747,6 +756,7 @@ def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 5, i
                     "agent": agent_code,
                     "url": url,
                     "attempts": attempt,
+                    "elapsed_sec": round(time.time() - started_at, 2),
                     "http_status": getattr(resp, "status", 200),
                     "response": parsed,
                     **normalized,
@@ -754,6 +764,7 @@ def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 5, i
                 if normalized["ok"]:
                     return True, payload
                 last_payload = payload
+                should_warm_before_retry = True
         except urllib_error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
             parsed: dict[str, Any] | None = None
@@ -764,11 +775,12 @@ def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 5, i
                     parsed = {"raw": body}
             http_status = getattr(exc, "code", None)
             retry_after = _retry_after_seconds(getattr(exc, "headers", None))
-            should_warm_before_retry = http_status in {429, 502, 503, 504}
+            should_warm_before_retry = http_status in {502, 503, 504}
             payload = {
                 "agent": agent_code,
                 "url": url,
                 "attempts": attempt,
+                "elapsed_sec": round(time.time() - started_at, 2),
                 "http_status": http_status,
                 "retry_after_sec": retry_after,
                 "error": f"HTTPError: {exc}",
@@ -789,6 +801,7 @@ def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 5, i
                 "agent": agent_code,
                 "url": url,
                 "attempts": attempt,
+                "elapsed_sec": round(time.time() - started_at, 2),
                 "error": f"{type(exc).__name__}: {exc}",
                 "ok": False,
                 "response": None,
@@ -801,15 +814,25 @@ def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 5, i
 
         if attempt < max_retries:
             sleep_for = _retry_sleep_seconds(http_status, attempt, delay, retry_after)
+            elapsed = time.time() - started_at
+            remaining = total_wait_limit - elapsed
+            if remaining <= 0:
+                break
+            sleep_for = min(sleep_for, max(1.0, remaining))
             if should_warm_before_retry:
-                _warm_agent_service(settings, agent_code, timeout=min(int(max(4.0, sleep_for)), 15))
+                warmed = _warm_agent_service(settings, agent_code, timeout=min(int(max(5.0, sleep_for)), 20))
+            if isinstance(last_payload, dict):
+                last_payload["warmup_attempted"] = bool(should_warm_before_retry)
+                last_payload["warmup_ok"] = bool(warmed)
+                last_payload["next_sleep_sec"] = round(float(sleep_for), 2)
             time.sleep(sleep_for)
-            delay = min(max(delay * 1.8, sleep_for), 25.0)
+            delay = min(max(delay * 1.7, sleep_for), 60.0)
 
     return False, last_payload or {
         "agent": agent_code,
         "url": url,
         "attempts": 0,
+        "elapsed_sec": round(time.time() - started_at, 2),
         "error": "Неизвестная ошибка вызова агента",
         "ok": False,
         "response": None,

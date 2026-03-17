@@ -605,7 +605,7 @@ class App(tk.Tk):
         mid = tk.Frame(self, padx=10)
         mid.pack(fill=tk.BOTH, expand=True)
 
-        self.chat = tk.Text(mid, wrap="word", state="disabled", font=("Segoe UI", 11))
+        self.chat = tk.Text(mid, wrap="word", font=("Segoe UI", 11), takefocus=1, insertwidth=0)
         self.chat.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         scroll = tk.Scrollbar(mid, command=self.chat.yview)
@@ -806,10 +806,8 @@ class App(tk.Tk):
         self.status_var.set(" • ".join(parts))
 
     def _insert_chat(self, text: str, tag: str | None = None):
-        self.chat.configure(state="normal")
         self.chat.insert("end", text, tag if tag else ())
         self.chat.see("end")
-        self.chat.configure(state="disabled")
 
     def _register_download_link(self, task_id: int, file_meta: dict) -> str:
         file_id = int(file_meta.get("id") or 0)
@@ -1307,13 +1305,67 @@ class App(tk.Tk):
         try:
             if widget is not None:
                 widget.focus_set()
-            menu.tk_popup(event.x_root, event.y_root)
+            x_root = getattr(event, "x_root", None)
+            y_root = getattr(event, "y_root", None)
+            if x_root is None or y_root is None:
+                try:
+                    x_root = widget.winfo_rootx() + 12
+                    y_root = widget.winfo_rooty() + 12
+                except Exception:
+                    x_root = y_root = 20
+            menu.tk_popup(int(x_root), int(y_root))
         finally:
             try:
                 menu.grab_release()
             except Exception:
                 pass
         return "break"
+
+    def _readonly_key_handler(self, event):
+        keysym = str(getattr(event, "keysym", "") or "")
+        state = int(getattr(event, "state", 0) or 0)
+        ctrl = bool(state & 0x4)
+        alt = bool(state & 0x20000)
+
+        navigation = {
+            "Left", "Right", "Up", "Down", "Home", "End",
+            "Prior", "Next", "Page_Up", "Page_Down",
+            "Shift_L", "Shift_R", "Control_L", "Control_R",
+            "Alt_L", "Alt_R", "Escape", "Tab",
+        }
+        if keysym in navigation:
+            return None
+        if ctrl and keysym.lower() in {"c", "a", "insert"}:
+            return None
+        if alt:
+            return None
+        return "break"
+
+    def _show_widget_menu_from_keyboard(self, widget, menu):
+        try:
+            widget.focus_set()
+            x = widget.winfo_rootx() + min(60, max(12, widget.winfo_width() // 4))
+            y = widget.winfo_rooty() + 24
+        except Exception:
+            class _E:
+                x_root = 20
+                y_root = 20
+            return self._show_popup_menu(menu, widget, _E())
+
+        class _E:
+            x_root = x
+            y_root = y
+
+        return self._show_popup_menu(menu, widget, _E())
+
+    def _make_text_readonly(self, widget):
+        if widget is None:
+            return
+        try:
+            widget.configure(insertwidth=0, undo=False, autoseparators=False)
+        except Exception:
+            pass
+        widget.bind("<Key>", self._readonly_key_handler, add="+")
 
     def _bind_text_actions(self, widget, *, editable: bool, include_copy_all: bool = False):
         menu = tk.Menu(widget, tearoff=0)
@@ -1329,8 +1381,9 @@ class App(tk.Tk):
         self._context_menus.append(menu)
 
         widget.bind("<Button-1>", lambda _e, w=widget: w.focus_set(), add="+")
-        widget.bind("<Button-3>", lambda e, m=menu, w=widget: self._show_popup_menu(m, w, e), add="+")
-        widget.bind("<Button-2>", lambda e, m=menu, w=widget: self._show_popup_menu(m, w, e), add="+")
+        widget.bind("<ButtonRelease-3>", lambda e, m=menu, w=widget: self._show_popup_menu(m, w, e), add="+")
+        widget.bind("<ButtonRelease-2>", lambda e, m=menu, w=widget: self._show_popup_menu(m, w, e), add="+")
+        widget.bind("<Shift-F10>", lambda _e, m=menu, w=widget: self._show_widget_menu_from_keyboard(w, m), add="+")
         widget.bind("<Control-c>", lambda e, w=widget: (self._copy_widget_selection(w), "break")[1], add="+")
         widget.bind("<Control-C>", lambda e, w=widget: (self._copy_widget_selection(w), "break")[1], add="+")
         widget.bind("<Control-Insert>", lambda e, w=widget: (self._copy_widget_selection(w), "break")[1], add="+")
@@ -1343,6 +1396,8 @@ class App(tk.Tk):
             widget.bind("<Control-v>", lambda e, w=widget: (self._paste_into_widget(w), "break")[1], add="+")
             widget.bind("<Control-V>", lambda e, w=widget: (self._paste_into_widget(w), "break")[1], add="+")
             widget.bind("<Shift-Insert>", lambda e, w=widget: (self._paste_into_widget(w), "break")[1], add="+")
+        else:
+            self._make_text_readonly(widget)
         return menu
 
     def _bind_listbox_actions(self, widget, *, on_open=None, on_open_all=None):
@@ -1358,8 +1413,9 @@ class App(tk.Tk):
         self._context_menus.append(menu)
 
         widget.bind("<Button-1>", lambda _e, w=widget: w.focus_set(), add="+")
-        widget.bind("<Button-3>", lambda e, m=menu, w=widget: self._show_popup_menu(m, w, e), add="+")
-        widget.bind("<Button-2>", lambda e, m=menu, w=widget: self._show_popup_menu(m, w, e), add="+")
+        widget.bind("<ButtonRelease-3>", lambda e, m=menu, w=widget: self._show_popup_menu(m, w, e), add="+")
+        widget.bind("<ButtonRelease-2>", lambda e, m=menu, w=widget: self._show_popup_menu(m, w, e), add="+")
+        widget.bind("<Shift-F10>", lambda _e, m=menu, w=widget: self._show_widget_menu_from_keyboard(w, m), add="+")
         widget.bind("<Control-c>", lambda e, w=widget: (self._copy_widget_selection(w), "break")[1], add="+")
         widget.bind("<Control-C>", lambda e, w=widget: (self._copy_widget_selection(w), "break")[1], add="+")
         widget.bind("<Control-Insert>", lambda e, w=widget: (self._copy_widget_selection(w), "break")[1], add="+")
@@ -1660,7 +1716,6 @@ class App(tk.Tk):
             tk.Button(btns, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
             self._bind_text_actions(txt, editable=False, include_copy_all=True)
             txt.focus_set()
-            txt.configure(state="disabled")
             return
 
         logs = self.client.get_logs(self.current_task_id)
@@ -1706,7 +1761,6 @@ class App(tk.Tk):
         tk.Button(btns, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
         self._bind_text_actions(txt, editable=False, include_copy_all=True)
         txt.focus_set()
-        txt.configure(state="disabled")
 
 
 if __name__ == "__main__":
