@@ -468,6 +468,7 @@ class App(tk.Tk):
         self._send_nonce = uuid.uuid4().hex
         self._chat_download_links: dict[str, dict] = {}
         self._announced_file_ids_by_task: dict[int, set[int]] = {}
+        self._context_menus: list[tk.Menu] = []
 
         self._config_path = os.path.join(_app_data_dir(), CONFIG_FILE_NAME)
         self._state_path = os.path.join(_app_data_dir(), STATE_FILE_NAME)
@@ -1293,58 +1294,81 @@ class App(tk.Tk):
             pass
 
     def _install_context_menus(self):
-        self._menu_input = tk.Menu(self, tearoff=0)
-        self._menu_input.add_command(label="Вырезать", command=lambda: self.entry.event_generate("<<Cut>>"))
-        self._menu_input.add_command(label="Копировать", command=lambda: self.entry.event_generate("<<Copy>>"))
-        self._menu_input.add_command(label="Вставить", command=lambda: self.entry.event_generate("<<Paste>>"))
-        self._menu_input.add_separator()
-        self._menu_input.add_command(label="Выделить всё", command=lambda: self._select_all(self.entry))
-
-        def popup_input(e):
-            try:
-                self.entry.focus_set()
-                self._menu_input.tk_popup(e.x_root, e.y_root)
-            finally:
-                try:
-                    self._menu_input.grab_release()
-                except Exception:
-                    pass
-
-        self.entry.bind("<Button-3>", popup_input)
-        self.entry.bind("<Button-2>", popup_input)
-
-        self.entry.bind("<Control-a>", lambda e: (self._select_all(self.entry), "break")[1])
-        self.entry.bind("<Control-A>", lambda e: (self._select_all(self.entry), "break")[1])
-
-        self._menu_chat = tk.Menu(self, tearoff=0)
-        self._menu_chat.add_command(label="Копировать", command=lambda: self._copy_selection(self.chat))
-        self._menu_chat.add_separator()
-        self._menu_chat.add_command(label="Выделить всё", command=lambda: self._select_all(self.chat))
-
-        def popup_chat(e):
-            try:
-                self.chat.focus_set()
-                self._menu_chat.tk_popup(e.x_root, e.y_root)
-            finally:
-                try:
-                    self._menu_chat.grab_release()
-                except Exception:
-                    pass
-
-        self.chat.bind("<Button-3>", popup_chat)
-        self.chat.bind("<Button-2>", popup_chat)
-        self.chat.bind("<Button-1>", lambda _e: self.chat.focus_set())
-
-        self.chat.bind("<Control-c>", lambda e: (self._copy_selection(self.chat), "break")[1])
-        self.chat.bind("<Control-C>", lambda e: (self._copy_selection(self.chat), "break")[1])
-        self.chat.bind("<Control-a>", lambda e: (self._select_all(self.chat), "break")[1])
-        self.chat.bind("<Control-A>", lambda e: (self._select_all(self.chat), "break")[1])
+        self._menu_input = self._bind_text_actions(self.entry, editable=True)
+        self._menu_chat = self._bind_text_actions(self.chat, editable=False, include_copy_all=True)
 
     def _select_all(self, widget):
         self._select_all_widget(widget)
 
     def _copy_selection(self, widget):
         self._copy_widget_selection(widget)
+
+    def _show_popup_menu(self, menu: tk.Menu, widget, event):
+        try:
+            if widget is not None:
+                widget.focus_set()
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+        return "break"
+
+    def _bind_text_actions(self, widget, *, editable: bool, include_copy_all: bool = False):
+        menu = tk.Menu(widget, tearoff=0)
+        if editable:
+            menu.add_command(label="Вырезать", command=lambda w=widget: w.event_generate("<<Cut>>"))
+        menu.add_command(label="Копировать", command=lambda w=widget: self._copy_widget_selection(w))
+        if include_copy_all:
+            menu.add_command(label="Копировать всё", command=lambda w=widget: (self._select_all_widget(w), self._copy_widget_selection(w)))
+        if editable:
+            menu.add_command(label="Вставить", command=lambda w=widget: w.event_generate("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda w=widget: self._select_all_widget(w))
+        self._context_menus.append(menu)
+
+        widget.bind("<Button-1>", lambda _e, w=widget: w.focus_set(), add="+")
+        widget.bind("<Button-3>", lambda e, m=menu, w=widget: self._show_popup_menu(m, w, e), add="+")
+        widget.bind("<Button-2>", lambda e, m=menu, w=widget: self._show_popup_menu(m, w, e), add="+")
+        widget.bind("<Control-c>", lambda e, w=widget: (self._copy_widget_selection(w), "break")[1], add="+")
+        widget.bind("<Control-C>", lambda e, w=widget: (self._copy_widget_selection(w), "break")[1], add="+")
+        widget.bind("<Control-Insert>", lambda e, w=widget: (self._copy_widget_selection(w), "break")[1], add="+")
+        widget.bind("<Control-a>", lambda e, w=widget: (self._select_all_widget(w), "break")[1], add="+")
+        widget.bind("<Control-A>", lambda e, w=widget: (self._select_all_widget(w), "break")[1], add="+")
+        if editable:
+            widget.bind("<Control-x>", lambda e, w=widget: (self._cut_widget_selection(w), "break")[1], add="+")
+            widget.bind("<Control-X>", lambda e, w=widget: (self._cut_widget_selection(w), "break")[1], add="+")
+            widget.bind("<Shift-Delete>", lambda e, w=widget: (self._cut_widget_selection(w), "break")[1], add="+")
+            widget.bind("<Control-v>", lambda e, w=widget: (self._paste_into_widget(w), "break")[1], add="+")
+            widget.bind("<Control-V>", lambda e, w=widget: (self._paste_into_widget(w), "break")[1], add="+")
+            widget.bind("<Shift-Insert>", lambda e, w=widget: (self._paste_into_widget(w), "break")[1], add="+")
+        return menu
+
+    def _bind_listbox_actions(self, widget, *, on_open=None, on_open_all=None):
+        menu = tk.Menu(widget, tearoff=0)
+        if on_open is not None:
+            menu.add_command(label="Скачать выбранное", command=on_open)
+        if on_open_all is not None:
+            menu.add_command(label="Скачать всё", command=on_open_all)
+        if on_open is not None or on_open_all is not None:
+            menu.add_separator()
+        menu.add_command(label="Копировать", command=lambda w=widget: self._copy_widget_selection(w))
+        menu.add_command(label="Выделить всё", command=lambda w=widget: self._select_all_widget(w))
+        self._context_menus.append(menu)
+
+        widget.bind("<Button-1>", lambda _e, w=widget: w.focus_set(), add="+")
+        widget.bind("<Button-3>", lambda e, m=menu, w=widget: self._show_popup_menu(m, w, e), add="+")
+        widget.bind("<Button-2>", lambda e, m=menu, w=widget: self._show_popup_menu(m, w, e), add="+")
+        widget.bind("<Control-c>", lambda e, w=widget: (self._copy_widget_selection(w), "break")[1], add="+")
+        widget.bind("<Control-C>", lambda e, w=widget: (self._copy_widget_selection(w), "break")[1], add="+")
+        widget.bind("<Control-Insert>", lambda e, w=widget: (self._copy_widget_selection(w), "break")[1], add="+")
+        widget.bind("<Control-a>", lambda e, w=widget: (self._select_all_widget(w), "break")[1], add="+")
+        widget.bind("<Control-A>", lambda e, w=widget: (self._select_all_widget(w), "break")[1], add="+")
+        if on_open is not None:
+            widget.bind("<Return>", lambda _e: (on_open(), "break")[1], add="+")
+            widget.bind("<Double-Button-1>", lambda _e: (on_open(), "break")[1], add="+")
+        return menu
 
     def _on_send(self):
         user_text = self.entry.get("1.0", "end-1c").strip()
@@ -1598,9 +1622,8 @@ class App(tk.Tk):
         tk.Button(btns, text="Обновить", command=lambda: (win.destroy(), self._open_task_files())).pack(side=tk.LEFT, padx=(8, 0))
         tk.Button(btns, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
 
+        self._bind_listbox_actions(lb, on_open=do_download_selected, on_open_all=do_download_all)
         lb.focus_set()
-        lb.bind("<Double-Button-1>", lambda _e: do_download_selected())
-        lb.bind("<Return>", lambda _e: do_download_selected())
 
     def _open_logs(self):
         if self.current_task_id is None:
@@ -1635,6 +1658,7 @@ class App(tk.Tk):
             btns.pack(fill=tk.X)
             tk.Button(btns, text="Копировать всё", command=lambda: (self._select_all_widget(txt), self._copy_widget_selection(txt))).pack(side=tk.LEFT)
             tk.Button(btns, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+            self._bind_text_actions(txt, editable=False, include_copy_all=True)
             txt.focus_set()
             txt.configure(state="disabled")
             return
@@ -1676,6 +1700,12 @@ class App(tk.Tk):
                     txt.insert(tk.END, f"    {line}\n")
             txt.insert(tk.END, "\n")
 
+        btns = tk.Frame(win, padx=10, pady=8)
+        btns.pack(fill=tk.X)
+        tk.Button(btns, text="Копировать всё", command=lambda: (self._select_all_widget(txt), self._copy_widget_selection(txt))).pack(side=tk.LEFT)
+        tk.Button(btns, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+        self._bind_text_actions(txt, editable=False, include_copy_all=True)
+        txt.focus_set()
         txt.configure(state="disabled")
 
 

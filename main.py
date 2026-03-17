@@ -3,6 +3,8 @@ import io
 import json
 import os
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Annotated, Any
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
@@ -617,6 +619,68 @@ def _normalize_execution_response(agent_code: str, payload: dict[str, Any]) -> d
     }
 
 
+def _retry_after_seconds(headers: Any) -> int | None:
+    if headers is None:
+        return None
+
+    raw = None
+    try:
+        raw = headers.get("Retry-After")
+    except Exception:
+        raw = None
+
+    if raw is None:
+        return None
+
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    if text.isdigit():
+        return max(1, min(int(text), 60))
+
+    try:
+        dt = parsedate_to_datetime(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = int((dt - datetime.now(timezone.utc)).total_seconds())
+        return max(1, min(delta, 60))
+    except Exception:
+        return None
+
+
+def _warm_agent_service(settings, agent_code: str, timeout: int = 12) -> None:
+    url = _agent_health_url(settings, agent_code)
+    req = urllib_request.Request(
+        url,
+        method="GET",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "ozonator-aa/1.0",
+        },
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=max(2, timeout)) as resp:
+            try:
+                resp.read(256)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _retry_sleep_seconds(http_status: int | None, attempt: int, delay: float, retry_after: int | None = None) -> float:
+    if retry_after is not None:
+        return float(max(1, min(retry_after, 60)))
+
+    base = max(0.5, float(delay))
+    if http_status == 429:
+        return min(max(base, 4.0) * max(1, attempt), 25.0)
+    if http_status in {502, 503, 504}:
+        return min(max(base, 2.5) * max(1, attempt), 20.0)
+    return min(base, 8.0)
+
+
 def _build_step_meta(payload: dict[str, Any] | None) -> dict[str, Any]:
     payload = payload if isinstance(payload, dict) else {}
     response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
@@ -652,12 +716,18 @@ def _log_agent_call(settings, task_id: int, cycle_no: int, agent_code: str, ok: 
         message=f"AA вызвал {agent_code.upper()}",
         meta=meta,
     )
-def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 3, initial_delay_sec: float = 0.8) -> tuple[bool, dict[str, Any]]:
+def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 5, initial_delay_sec: float = 1.5) -> tuple[bool, dict[str, Any]]:
     url = _agent_run_task_url(settings, agent_code, task_id)
-    delay = max(0.1, initial_delay_sec)
+    delay = max(0.5, initial_delay_sec)
     last_payload: dict[str, Any] | None = None
 
+    _warm_agent_service(settings, agent_code)
+
     for attempt in range(1, max_retries + 1):
+        retry_after: int | None = None
+        http_status: int | None = None
+        should_warm_before_retry = False
+
         try:
             req = urllib_request.Request(
                 url,
@@ -692,11 +762,15 @@ def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 3, i
                     parsed = json.loads(body)
                 except json.JSONDecodeError:
                     parsed = {"raw": body}
+            http_status = getattr(exc, "code", None)
+            retry_after = _retry_after_seconds(getattr(exc, "headers", None))
+            should_warm_before_retry = http_status in {429, 502, 503, 504}
             payload = {
                 "agent": agent_code,
                 "url": url,
                 "attempts": attempt,
-                "http_status": getattr(exc, "code", None),
+                "http_status": http_status,
+                "retry_after_sec": retry_after,
                 "error": f"HTTPError: {exc}",
                 "response": parsed,
                 **(_normalize_execution_response(agent_code, parsed) if isinstance(parsed, dict) else {
@@ -710,6 +784,7 @@ def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 3, i
             }
             last_payload = payload
         except (urllib_error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            should_warm_before_retry = True
             last_payload = {
                 "agent": agent_code,
                 "url": url,
@@ -725,8 +800,11 @@ def _call_agent(settings, task_id: int, agent_code: str, max_retries: int = 3, i
             }
 
         if attempt < max_retries:
-            time.sleep(delay)
-            delay = min(delay * 2, 5.0)
+            sleep_for = _retry_sleep_seconds(http_status, attempt, delay, retry_after)
+            if should_warm_before_retry:
+                _warm_agent_service(settings, agent_code, timeout=min(int(max(4.0, sleep_for)), 15))
+            time.sleep(sleep_for)
+            delay = min(max(delay * 1.8, sleep_for), 25.0)
 
     return False, last_payload or {
         "agent": agent_code,
